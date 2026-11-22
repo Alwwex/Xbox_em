@@ -1,0 +1,9 @@
+LIBRARY xgameruntime.dll
+EXPORTS
+  XGameRuntimeInitialize
+  XSystemGetDeviceType
+  XTaskQueueCreate
+  XTaskQueueSubmitCallback
+  XTaskQueueDispatch
+  XTaskQueueCloseHandle
+  XUserAddAsync

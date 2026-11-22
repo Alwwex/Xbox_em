@@ -1,0 +1,6 @@
+LIBRARY gamelib.dll
+EXPORTS
+  gamelib_attach_count
+  gamelib_add
+  ; Export forwarded to an HLE system DLL.
+  gamelib_tick = kernelx.GetTickCount64
