@@ -13,6 +13,7 @@
 #include "common/strings.h"
 #include "hle/guest_types.h"
 #include "hle/heap.h"
+#include "hle/probe_com.h"
 #include "hle/registry.h"
 #include "platform/crash.h"
 #include "platform/memory.h"
@@ -38,6 +39,12 @@ void describe_address(uint64_t address, char* out, size_t out_size) {
   if (!p) return;
   if (p->loader().describe(address, out, out_size)) return;
   if (p->trampolines().contains(address)) std::snprintf(out, out_size, "<xbem import stub>");
+}
+
+// Crash reports and thread dumps: recent emulated-function and probe calls.
+void print_thread_context(void (*write)(const char*)) {
+  TrampolinePool::print_call_history(write);
+  hle::print_probe_history(write);
 }
 
 void describe_virtual_memory(uint64_t address, char* out, size_t out_size) {
@@ -189,7 +196,7 @@ int Process::run() {
   platform::install_thread_dump(&describe_address, &describe_call_site);
   platform::set_memory_describer(&describe_virtual_memory);
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
-  platform::set_thread_context_printer(&TrampolinePool::print_call_history);
+  platform::set_thread_context_printer(&print_thread_context);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

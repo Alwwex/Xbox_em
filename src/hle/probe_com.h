@@ -19,8 +19,11 @@ namespace xbem::hle {
 
 constexpr int kProbeSlots = 512;  // D3D12.X devices have far more methods than the PC interface
 
+constexpr uint64_t kProbeMagic = 0x45424F5250424558ull;  // "XBEPROBE"
+
 struct ProbeObject {
   void* const* vtable;
+  uint64_t magic = kProbeMagic;
   std::string name;
   std::atomic<uint32_t> refs{1};
   std::array<std::atomic<int>, kProbeSlots> calls{};
@@ -34,6 +37,9 @@ const ProbeVtable& default_probe_vtable();
 
 // Creates a probe object; `name` labels its calls in the log ("dstorage.factory").
 void* make_probe_object(const std::string& name, const ProbeVtable* vtable = nullptr, void* state = nullptr);
+
+// Prints the calling thread's recent probe-object calls (crash reports, dumps).
+void print_probe_history(void (*write)(const char*));
 
 // Logs a call of a typed method the way probe slots do (first few calls per slot).
 void probe_log(ProbeObject* self, int slot, const std::string& text, uint64_t return_address);

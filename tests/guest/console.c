@@ -358,6 +358,13 @@ static void test_dstorage_probe(void) {
   CHECK(((ProbeCreate)vt[3])(factory, desc, kQueueIid, &queue) == 0 && queue && queue != factory);
   CHECK(((ProbeSet)vt[8])(factory, 0x2000000) == 0);
   CHECK(((ProbeSet)(*(void***)queue)[5])(queue, 7) == 0);
+  /* An output variable zeroed on the stack receives a new object. */
+  typedef HRESULT (*ProbeOut)(void*, uint64_t, void**);
+  void* out = 0;
+  CHECK(((ProbeOut)vt[20])(factory, 0, &out) == 0 && out && out != factory);
+  /* A probe method reached with a foreign `this` is logged, not trusted. */
+  static uint64_t foreign[8];
+  CHECK(((ProbeSet)vt[5])(foreign, 1) == 0);
 }
 
 /* ------------------------------------------------- headless D3D12 */
