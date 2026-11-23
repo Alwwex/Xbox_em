@@ -103,7 +103,8 @@ class ModuleLoader {
   std::unordered_map<std::string, LoadedModule*> by_name_;
   std::vector<LoadedModule*> pending_init_;
   LoadedModule* main_ = nullptr;
-  int next_tls_index_ = 0;
+  int next_tls_index_ = 1;  // 0 is reserved for the executable
+  bool exe_tls_assigned_ = false;
 
   struct Range {
     uint64_t base;

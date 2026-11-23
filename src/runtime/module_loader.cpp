@@ -230,7 +230,15 @@ void ModuleLoader::setup_tls(LoadedModule& m) {
     XBEM_ERROR("loader", "{}: too many modules with TLS", m.name);
     return;
   }
-  m.tls_index = next_tls_index_++;
+  // The executable always owns TLS index 0, as on Windows: MSVC compiles
+  // thread_local accesses in an .exe as ThreadLocalStoragePointer[0] directly,
+  // without reading _tls_index. DLLs get 1, 2, ...
+  if (!m.is_dll && !exe_tls_assigned_) {
+    m.tls_index = 0;
+    exe_tls_assigned_ = true;
+  } else {
+    m.tls_index = next_tls_index_++;
+  }
   m.tls_template_start = d.StartAddressOfRawData;
   m.tls_template_end = d.EndAddressOfRawData;
   m.tls_zero_fill = d.SizeOfZeroFill;

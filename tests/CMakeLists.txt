@@ -72,13 +72,24 @@ add_custom_command(
   DEPENDS ${GSRC}/plugin.c ${GUEST_COMMON} ${GOUT}/libkernelx.a
   COMMENT "Guest DLL plugin.dll")
 
-set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll)
+add_custom_command(
+  OUTPUT ${GOUT}/tlsdll.dll ${GOUT}/libtlsdll.a
+  COMMAND ${XBEM_MINGW_CC} ${GUEST_FLAGS} -shared -o ${GOUT}/tlsdll.dll ${GSRC}/tlsdll.c ${GSRC}/guest_rt.c
+          -Wl,-e,DllMain -Wl,--out-implib,${GOUT}/libtlsdll.a -L${GOUT} -lkernelx
+  DEPENDS ${GSRC}/tlsdll.c ${GUEST_COMMON} ${GOUT}/libkernelx.a
+  COMMENT "Guest DLL tlsdll.dll")
+
+set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll ${GOUT}/tlsdll.dll)
 foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "system")
     set(extra_libs -ladvapi32 -lbcrypt -loleaut32 -lkernelx)
     list(APPEND extra_deps ${GOUT}/libadvapi32.a ${GOUT}/libbcrypt.a ${GOUT}/liboleaut32.a)
+  endif()
+  if(prog STREQUAL "tls")
+    set(extra_libs -ltlsdll -lkernelx)
+    list(APPEND extra_deps ${GOUT}/libtlsdll.a)
   endif()
   if(prog STREQUAL "dlls")
     set(extra_libs -lgamelib -lkernelx)

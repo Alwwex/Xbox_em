@@ -44,6 +44,9 @@ static char* tls_block(void) {
 
 #define TLS(var) (*(__typeof__(var)*)(tls_block() + ((char*)&(var) - (char*)&_tls_start)))
 
+IMP int tlsdll_value(void);
+IMP unsigned tlsdll_index(void);
+
 static volatile int g_errors;
 
 static DWORD worker(void* arg) {
@@ -58,7 +61,11 @@ static DWORD worker(void* arg) {
 
 DWORD guest_main(void* peb) {
   (void)peb;
-  CHECK(_tls_index == 0); /* the exe is the first module with TLS */
+  /* The exe owns TLS index 0 even though tlsdll.dll was initialised first:
+   * MSVC code in an .exe reads ThreadLocalStoragePointer[0] directly. */
+  CHECK(_tls_index == 0);
+  CHECK(tlsdll_index() != 0);
+  CHECK(tlsdll_value() == 1234);
   CHECK(g_process_attach == 1);
   CHECK(TLS(tls_counter) == 7);
   TLS(tls_counter) = 42;
