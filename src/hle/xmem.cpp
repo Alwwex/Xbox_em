@@ -310,13 +310,9 @@ bool map_page(uint64_t va, uint64_t pfn) {
 // PVOID XMemMapPhysicalPages(PVOID VirtualAddress, SIZE_T NumberOfPages, <page array>, ...)
 void* XBEM_GUEST_ABI hle_XMemMapPhysicalPages(uint64_t va, uint64_t count, uint64_t a2, uint64_t a3, uint64_t a4) {
   const uint64_t caller = XBEM_RETURN_ADDRESS();
-  // The page array is the first pointer-like argument after the count.
-  const uint64_t* pages = nullptr;
-  for (uint64_t cand : {a2, a3, a4})
-    if (cand >= 0x10000 && cand < 0x800000000000ull) {
-      pages = reinterpret_cast<const uint64_t*>(cand);
-      break;
-    }
+  // The page array is the third argument (the title passes it there); NULL
+  // unmaps. Later registers hold unrelated values.
+  const uint64_t* pages = a2 >= 0x10000 && a2 < 0x800000000000ull ? reinterpret_cast<const uint64_t*>(a2) : nullptr;
   bool ok = va != 0 && plausible_count(count) && (va % kPhysPageSize) == 0;
   if (ok) {
     std::lock_guard lock(g_phys.mutex);

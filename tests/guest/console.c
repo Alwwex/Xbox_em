@@ -470,7 +470,8 @@ static void test_headless_d3d12(void) {
   uint8_t* mapped = 0;
   CHECK(((MapFn)VT(buffer)[8])(buffer, 0, 0, (void**)&mapped) == 0 && mapped);
   mapped[4095] = 0x42;
-  CHECK(((GpuVaFn)VT(buffer)[11])(buffer) != 0);
+  /* unified memory: the GPU address is the CPU address */
+  CHECK(((GpuVaFn)VT(buffer)[11])(buffer) == (uint64_t)(uintptr_t)mapped);
 
   /* D3D12_DESCRIPTOR_HEAP_DESC: 64 descriptors; handle returned through a hidden pointer */
   static const uint32_t heap_desc[4] = {0, 64, 1, 0};
@@ -478,6 +479,28 @@ static void test_headless_d3d12(void) {
   CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc, iid, &heap) == 0 && heap);
   uint64_t start = 0;
   CHECK(((HeapStartFn)VT(heap)[9])(heap, &start) == &start && start != 0);
+  uint64_t gpu_start = 0;
+  CHECK(((HeapStartFn)VT(heap)[10])(heap, &gpu_start) == &gpu_start && gpu_start == start);
+  *(volatile uint64_t*)(uintptr_t)(gpu_start + 63 * 32) = 1; /* descriptors are writable memory */
+
+  /* Heaps: CreateHeap (28) and the console's heap over already-mapped memory
+   * (133: address, ..., riid, ppv); placed resources live at heap + offset. */
+  typedef HRESULT (*CreateMemHeapFn)(void*, const void*, const void*, void**);
+  typedef HRESULT (*HeapAtFn)(void*, void*, uint64_t, uint64_t, uint64_t, const void*, void**);
+  typedef HRESULT (*PlacedFn)(void*, void*, uint64_t, const void*, uint32_t, const void*, const void*, void**);
+  static const uint8_t heap_iid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
+                                       0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
+  uint64_t mem_heap_desc[5] = {0x100000, 0, 0, 0, 0};
+  void* mem_heap = 0;
+  CHECK(((CreateMemHeapFn)VT(device)[28])(device, mem_heap_desc, heap_iid, &mem_heap) == 0 && mem_heap);
+  uint8_t* own = VirtualAlloc(0, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  void* at_heap = 0;
+  CHECK(((HeapAtFn)VT(device)[133])(device, own, 0, 0xffffffff, 0, heap_iid, &at_heap) == 0 && at_heap);
+  void* placed = 0;
+  CHECK(((PlacedFn)VT(device)[29])(device, at_heap, 0x10000, desc, 0, 0, iid, &placed) == 0 && placed);
+  CHECK(((GpuVaFn)VT(placed)[11])(placed) == (uint64_t)(uintptr_t)(own + 0x10000));
+  CHECK(((PlacedFn)VT(device)[29])(device, mem_heap, 0x2000, desc, 0, 0, iid, &placed) == 0 && placed);
+  *(volatile uint8_t*)(uintptr_t)((GpuVaFn)VT(placed)[11])(placed) = 7;
 
   /* Compute pipeline: the shader binary is captured (--dump-shaders) */
   static const uint8_t shader[32] = {'X', 'B', 'E', 'M', 's', 'h', 'a', 'd', 'e', 'r'};

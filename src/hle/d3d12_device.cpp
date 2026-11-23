@@ -242,12 +242,55 @@ const ProbeVtable g_resource_vtable = make_vtable({{8, fn(&resource_map)},
                                                    {10, fn(&resource_get_desc)},
                                                    {11, fn(&resource_get_gpu_va)}});
 
-void* new_resource(const std::string& name, const uint8_t* desc) {
+// The console has unified memory: a resource's GPU virtual address is the CPU
+// address of its memory, and titles write through either. `memory` places the
+// resource (heap + offset); otherwise it gets memory of its own.
+void* new_resource(const std::string& name, const uint8_t* desc, uint64_t memory = 0) {
   auto* state = new ResourceState;
   if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), state->desc, 56);
   state->size = resource_size(state->desc);
-  state->gpu_va = allocate_gpu_va(state->size);
+  if (!memory)
+    memory = reinterpret_cast<uint64_t>(
+        virtual_alloc(nullptr, std::max<uint64_t>(state->size, 1), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
+  state->cpu = reinterpret_cast<void*>(memory);
+  state->gpu_va = memory ? memory : allocate_gpu_va(state->size);
   return make_probe_object(name, &g_resource_vtable, state);
+}
+
+// ---------------------------------------------------------------- heap
+
+// ID3D12Heap: memory that placed resources live in.
+struct HeapState {
+  uint64_t base = 0;
+  uint64_t size = 0;
+  uint8_t desc[48] = {};  // D3D12_HEAP_DESC
+};
+
+std::mutex g_heaps_mutex;
+std::unordered_map<const void*, HeapState*> g_heaps;
+
+void* XBEM_GUEST_ABI heap_object_get_desc(ProbeObject* self, uint8_t* out) {
+  std::memcpy(out, static_cast<HeapState*>(self->state)->desc, 40);
+  return out;
+}
+const ProbeVtable g_heap_object_vtable = make_vtable({{8, fn(&heap_object_get_desc)}});
+
+void* new_heap(const std::string& name, uint64_t base, uint64_t size, const uint8_t* desc) {
+  auto* state = new HeapState;
+  state->base = base;
+  state->size = size;
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), state->desc, 40);
+  else std::memcpy(state->desc, &size, 8);
+  void* object = make_probe_object(name, &g_heap_object_vtable, state);
+  std::lock_guard lock(g_heaps_mutex);
+  g_heaps[object] = state;
+  return object;
+}
+
+uint64_t heap_base(const void* heap) {
+  std::lock_guard lock(g_heaps_mutex);
+  auto it = g_heaps.find(heap);
+  return it == g_heaps.end() ? 0 : it->second->base;
 }
 
 // ----------------------------------------------------- descriptor heap
@@ -456,7 +499,7 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   std::memcpy(&count, state->desc + 4, 4);
   const uint64_t bytes = std::max<uint64_t>(count, 1) * kDescriptorSize;
   state->cpu = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
-  state->gpu = allocate_gpu_va(bytes);
+  state->gpu = state->cpu;  // unified memory: shader-visible descriptors are read from the same bytes
   probe_log(self, 14, std::format("CreateDescriptorHeap({} descriptors)", count), XBEM_RETURN_ADDRESS());
   return create_into(make_probe_object(child_name("descriptor_heap"), &g_heap_vtable, state), out);
 }
@@ -470,10 +513,56 @@ HRESULT XBEM_GUEST_ABI device_create_committed_resource(ProbeObject* self, const
   return create_into(new_resource(child_name("resource"), desc), out);
 }
 // 29 CreatePlacedResource(heap, offset, desc, state, clear, riid, ppv)
-HRESULT XBEM_GUEST_ABI device_create_placed_resource(ProbeObject* self, void*, uint64_t, const uint8_t* desc, uint32_t,
-                                                     const void*, const void*, void** out) {
-  probe_log(self, 29, "CreatePlacedResource", XBEM_RETURN_ADDRESS());
-  return create_into(new_resource(child_name("resource"), desc), out);
+HRESULT XBEM_GUEST_ABI device_create_placed_resource(ProbeObject* self, void* heap, uint64_t offset,
+                                                     const uint8_t* desc, uint32_t, const void*, const void*,
+                                                     void** out) {
+  const uint64_t base = heap_base(heap);
+  probe_log(self, 29, std::format("CreatePlacedResource(heap base {:#x} + {:#x})", base, offset),
+            XBEM_RETURN_ADDRESS());
+  return create_into(new_resource(child_name("resource"), desc, base ? base + offset : 0), out);
+}
+// 28 CreateHeap(desc, riid, ppv): D3D12_HEAP_DESC starts with SizeInBytes.
+HRESULT XBEM_GUEST_ABI device_create_heap(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
+  uint64_t size = 0;
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), &size, 8);
+  void* memory = virtual_alloc(nullptr, std::max<uint64_t>(size, 1), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0);
+  probe_log(self, 28, std::format("CreateHeap({:#x} bytes) -> {}", size, memory), XBEM_RETURN_ADDRESS());
+  if (!memory) return E_OUTOFMEMORY;
+  return create_into(new_heap(child_name("heap"), reinterpret_cast<uint64_t>(memory), size, desc), out);
+}
+
+bool read_guid(uint64_t address, uint8_t out[16]) {
+  return address >= 0x10000 && address < 0x800000000000ull && platform::safe_read(address, out, 16);
+}
+
+// 133 (D3D12.X): a heap over memory the title already mapped (XMemMapPhysicalPages),
+// (address, ..., riid, ppv). The arguments after the address are found by
+// shape: the ID3D12Heap IID followed by the output pointer.
+HRESULT XBEM_GUEST_ABI device_create_heap_at_address(ProbeObject* self, uint64_t address, uint64_t a1, uint64_t a2,
+                                                     uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+  static const uint8_t kHeapIid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
+                                       0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
+  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+  void** out = nullptr;
+  for (int i = 0; i + 1 < 6 && !out; ++i) {
+    uint8_t guid[16];
+    if (read_guid(args[i], guid) && std::memcmp(guid, kHeapIid, 16) == 0 && args[i + 1] >= 0x10000)
+      out = reinterpret_cast<void**>(args[i + 1]);
+  }
+  uint8_t mbi[48] = {};
+  uint64_t size = 0;
+  if (virtual_query(reinterpret_cast<void*>(address), mbi, sizeof mbi) == 48) {
+    uint64_t region_base, region_size;
+    std::memcpy(&region_base, mbi, 8);
+    std::memcpy(&region_size, mbi + 24, 8);
+    size = region_base + region_size - address;
+  }
+  probe_log(self, 133,
+            std::format("CreateHeapAtAddress({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) region {:#x} bytes{}", address,
+                        a1, a2, a3, a4, a5, a6, size, out ? "" : " - no ID3D12Heap output found"),
+            XBEM_RETURN_ADDRESS());
+  if (!out) return E_INVALIDARG;
+  return create_into(new_heap(child_name("heap"), address, size, nullptr), out);
 }
 // 30 CreateReservedResource(desc, state, clear, riid, ppv)
 HRESULT XBEM_GUEST_ABI device_create_reserved_resource(ProbeObject* self, const uint8_t* desc, uint32_t, const void*,
@@ -498,10 +587,12 @@ const ProbeVtable g_device_vtable = make_vtable({
     {14, fn(&device_create_descriptor_heap)},
     {15, fn(&device_get_descriptor_increment)},
     {27, fn(&device_create_committed_resource)},
+    {28, fn(&device_create_heap)},
     {29, fn(&device_create_placed_resource)},
     {30, fn(&device_create_reserved_resource)},
     {36, fn(&device_create_fence)},
     {37, fn(&device_get_removed_reason)},
+    {133, fn(&device_create_heap_at_address)},
 });
 
 }  // namespace
