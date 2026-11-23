@@ -38,6 +38,10 @@ const ProbeVtable& default_probe_vtable();
 // Creates a probe object; `name` labels its calls in the log ("dstorage.factory").
 void* make_probe_object(const std::string& name, const ProbeVtable* vtable = nullptr, void* state = nullptr);
 
+// True when `address` points into a read-only data section of a loaded image,
+// where interface IDs (riid arguments) live.
+bool is_interface_id_pointer(uint64_t address);
+
 // Prints the calling thread's recent probe-object calls (crash reports, dumps).
 void print_probe_history(void (*write)(const char*));
 

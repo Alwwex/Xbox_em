@@ -774,9 +774,21 @@ HRESULT XBEM_GUEST_ABI device_deserialize_compute_pso_x(ProbeObject* self, const
 
 // 76 texture creation: CreateCommittedResource's arguments; the desc's layout
 // word is the console's (0x101 = tiled).
-HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void*, uint32_t heap_flags,
-                                               const uint8_t* desc, uint32_t state, const void*, const void*,
-                                               void** out) {
+// The console variants of resource creation carry extra arguments before the
+// (riid, ppv) pair, so the pair is found by shape: a pointer to an interface ID
+// followed by the output pointer, searched from the end.
+void** find_output_after_iid(const uint64_t* args, int n, int first) {
+  for (int i = n - 2; i >= first; --i)
+    if (is_interface_id_pointer(args[i]) && args[i + 1] >= 0x10000 && args[i + 1] < 0x800000000000ull)
+      return reinterpret_cast<void**>(args[i + 1]);
+  return nullptr;
+}
+
+template <int Slot>
+HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* heap_props, uint64_t heap_flags,
+                                               const uint8_t* desc, uint64_t state, uint64_t a4, uint64_t a5,
+                                               uint64_t a6, uint64_t a7) {
+  (void)heap_props;
   uint8_t d[56] = {};
   if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
   uint64_t w;
@@ -784,11 +796,16 @@ HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void*, u
   std::memcpy(&w, d + 16, 8);
   std::memcpy(&h, d + 24, 4);
   std::memcpy(&f, d + 32, 4);
-  void* resource = new_resource(child_name("texture"), desc);
-  probe_log(self, 76,
-            std::format("CreateCommittedResourceX(dim {} {}x{} format {}, heap flags {:#x}, state {:#x}) -> {}", d[0],
-                        w, h, f, heap_flags, state, resource),
+  const uint64_t args[4] = {a4, a5, a6, a7};  // clear value, [extra...], riid, ppv
+  void** out = find_output_after_iid(args, 4, 0);
+  void* resource = out ? new_resource(child_name("texture"), desc) : nullptr;
+  probe_log(self, Slot,
+            std::format("CreateCommittedResourceX(dim {} {}x{} format {}, heap flags {:#x}, state {:#x}; {:#x} {:#x} "
+                        "{:#x} {:#x}) -> {}{}",
+                        d[0], w, h, f, static_cast<uint32_t>(heap_flags), static_cast<uint32_t>(state), a4, a5, a6,
+                        a7, resource, out ? "" : " - no (riid, ppv) pair found"),
             XBEM_RETURN_ADDRESS());
+  if (!out) return E_INVALIDARG;
   return create_into(resource, out);
 }
 
@@ -858,10 +875,10 @@ const ProbeVtable g_device_vtable = make_vtable({
     {48, fn(&device_create_command_queue_x)},
     {62, fn(&device_create_compute_pso_x)},
     {67, fn(&device_deserialize_compute_pso_x)},
-    {76, fn(&device_create_texture_x)},
+    {76, fn(&device_create_texture_x<76>)},
     // 127: the same call shape for display surfaces (heap flag ALLOW_DISPLAY):
     // the title's two 4K back buffers come from here.
-    {127, fn(&device_create_texture_x)},
+    {127, fn(&device_create_texture_x<127>)},
     {78, fn(&device_set_frame_interval_x)},
     {79, fn(&device_schedule_frame_event_x)},
     {80, fn(&device_wait_frame_event_x)},

@@ -187,6 +187,8 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
 
 const ProbeVtable& default_probe_vtable() { return probe_vtable(); }
 
+bool is_interface_id_pointer(uint64_t address) { return in_read_only_image_data(address); }
+
 void* make_probe_object(const std::string& name, const ProbeVtable* vtable, void* state) {
   auto* o = new ProbeObject;  // lives for the whole process
   o->vtable = vtable ? vtable->data() : probe_vtable().data();

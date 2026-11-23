@@ -562,6 +562,12 @@ static void test_headless_d3d12(void) {
   CHECK(((CreateCommittedFn)VT(device)[127])(device, heap_props, 0x8, tex, 0, 0, resource_iid, &back_buffer) == 0 &&
         back_buffer);
   CHECK(((GpuVaFn)VT(back_buffer)[11])(back_buffer) != 0);
+  /* ... and with an extra console argument before (riid, ppv) */
+  typedef HRESULT (*CreateCommitted8Fn)(void*, const void*, uint32_t, const void*, uint32_t, const void*, uint64_t,
+                                         const void*, void**);
+  void* back_buffer2 = 0;
+  CHECK(((CreateCommitted8Fn)VT(device)[127])(device, heap_props, 0x8, tex, 0, 0, 0x1234, resource_iid,
+                                              &back_buffer2) == 0 && back_buffer2 && back_buffer2 != back_buffer);
 
   /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
   typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);
