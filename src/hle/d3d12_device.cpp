@@ -944,6 +944,12 @@ void* create_headless_d3d12_device(const void* iid) {
   return device;
 }
 
+bool signal_d3d12_fence(void* fence, uint64_t value) {
+  if (!is_fence(fence)) return false;
+  fence_signal(fence_of(fence), value);
+  return true;
+}
+
 void* make_d3d_blob(std::vector<uint8_t> bytes) {
   auto* state = new BlobState{std::move(bytes)};
   return make_probe_object("d3d.blob", &g_blob_vtable, state);

@@ -13,6 +13,7 @@ add_executable(xbem_unit_tests
   unit/test_platform.cpp
   unit/test_rdna2.cpp
   unit/test_root_signature.cpp
+  unit/test_inflate.cpp
 )
 target_link_libraries(xbem_unit_tests PRIVATE xbem_core)
 target_include_directories(xbem_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
@@ -225,9 +226,8 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
     xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --dump-shaders ${GOUT}/shaders
-                    EXPECT "PASS console" "HEADLESS device" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage.factory::method3\\(.*created dstorage.factory.m3"
-                           "dstorage.factory.m3::method5\\(0x7"
-                           "created dstorage.factory.m20 into the zeroed output" "method5 called with an unknown this")
+                    EXPECT "PASS console" "HEADLESS device" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #2: 3 requests so far"
+                           "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this")
   endif()
   if(Python3_Interpreter_FOUND)
     add_test(NAME guest_thread_dump

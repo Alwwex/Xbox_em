@@ -31,6 +31,7 @@ Registry::Registry() {
   modules_.push_back(make_bcrypt_module());
   modules_.push_back(make_xmem_module());
   modules_.push_back(make_xg_module());
+  modules_.push_back(make_dstorage_module());
   modules_.push_back(make_user32_module());
   modules_.push_back(make_ws2_32_module());
   modules_.push_back(make_winhttp_module());

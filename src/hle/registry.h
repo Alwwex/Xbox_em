@@ -70,13 +70,14 @@ ModuleDef make_oleaut32_module();
 ModuleDef make_bcrypt_module();
 ModuleDef make_xmem_module();
 ModuleDef make_xg_module();
+ModuleDef make_dstorage_module();
 ModuleDef make_user32_module();
 ModuleDef make_ws2_32_module();
 ModuleDef make_winhttp_module();
 ModuleDef make_crypt32_module();
 std::vector<ModuleDef> make_media_modules();    // mfplat, mfreadwrite, xaudio2_9
 ModuleDef make_gameinput_module();
-std::vector<ModuleDef> make_console_modules();  // acphal, chad, xapu, xcrdapi
+std::vector<ModuleDef> make_console_modules();  // acphal, chad, xapu
 
 // Pieces of kernelx implemented in separate files.
 void add_kernelx_memory_exports(std::vector<ExportDef>& out);

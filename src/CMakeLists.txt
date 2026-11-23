@@ -1,6 +1,7 @@
 add_library(xbem_core STATIC
   common/log.cpp
   common/strings.cpp
+  common/inflate.cpp
   common/file.cpp
   common/xml.cpp
 
@@ -33,6 +34,7 @@ add_library(xbem_core STATIC
   hle/probe_com.cpp
   hle/console_devices.cpp
   hle/xg.cpp
+  hle/dstorage.cpp
   hle/user32.cpp
   hle/ucrt_runtime.cpp
   hle/ucrt_string.cpp

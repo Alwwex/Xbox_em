@@ -426,22 +426,77 @@ static const uint8_t kQueueIid[16] = {0x22, 0x33};
 typedef HRESULT (*ProbeCreate)(void*, const void*, const void*, void**);
 typedef HRESULT (*ProbeSet)(void*, uint64_t);
 
-static void test_dstorage_probe(void) {
+/* zlib stream of "xbem DirectStorage inflate test! " x 8 (264 bytes) */
+static const uint8_t kZlibChunk[48] = {
+    'X', 'B', 'D', 'S', 0x78, 0xda, 0xab, 0x48, 0x4a, 0xcd, 0x55, 0x70, 0xc9, 0x2c, 0x4a, 0x4d,
+    0x2e, 0x09, 0x2e, 0xc9, 0x2f, 0x4a, 0x4c, 0x4f, 0x55, 0xc8, 0xcc, 0x4b, 0xcb, 0x49, 0x2c, 0x49,
+    0x55, 0x28, 0x49, 0x2d, 0x2e, 0x51, 0x54, 0xa8, 0x18, 0x19, 0x0a, 0x00, 0x6b, 0x8e, 0x61, 0x01};
+
+/* Console DirectStorage: open this executable, read its header, then read
+ * and inflate the zlib chunk above from the file, with a status array. */
+static void test_dstorage(void) {
   void* factory = 0;
   CHECK(DStorageGetFactory(kFactoryIid, &factory) == 0 && factory);
   void** vt = *(void***)factory;
-  void* queue = 0;
+  typedef HRESULT (*OpenFileFn)(void*, const void*, const void*, void**);
+  typedef HRESULT (*StatusFn)(void*, uint32_t, const char*, const void*, void**);
+  char path[260];
+  CHECK(GetModuleFileNameA(0, path, sizeof path) > 0);
+  WCHAR wpath[260];
+  int n = 0;
+  for (; path[n]; ++n) wpath[n] = (WCHAR)path[n];
+  wpath[n] = 0;
+  void* file = 0;
+  CHECK(((OpenFileFn)vt[4])(factory, wpath, kQueueIid, &file) == 0 && file);
+  void* missing = (void*)1;
+  CHECK(((OpenFileFn)vt[4])(factory, W("G:\\no-such-file.bin"), kQueueIid, &missing) < 0 && missing == 0);
+  uint8_t info[52] = {0};
+  typedef HRESULT (*InfoFn)(void*, void*);
+  CHECK(((InfoFn)(*(void***)file)[4])(file, info) == 0 && *(uint32_t*)(info + 36) > 0x1000);
+  void* status = 0;
+  CHECK(((StatusFn)vt[5])(factory, 2, "test", kQueueIid, &status) == 0 && status);
   static const uint8_t desc[32] = {1, 2, 3};
-  CHECK(((ProbeCreate)vt[3])(factory, desc, kQueueIid, &queue) == 0 && queue && queue != factory);
-  CHECK(((ProbeSet)vt[8])(factory, 0x2000000) == 0);
-  CHECK(((ProbeSet)(*(void***)queue)[5])(queue, 7) == 0);
-  /* An output variable zeroed on the stack receives a new object. */
-  typedef HRESULT (*ProbeOut)(void*, uint64_t, void**);
-  void* out = 0;
-  CHECK(((ProbeOut)vt[20])(factory, 0, &out) == 0 && out && out != factory);
-  /* A probe method reached with a foreign `this` is logged, not trusted. */
-  static uint64_t foreign[8];
-  CHECK(((ProbeSet)vt[5])(foreign, 1) == 0);
+  void* queue = 0;
+  CHECK(((ProbeCreate)vt[10])(factory, desc, kQueueIid, &queue) == 0 && queue);
+  CHECK(((ProbeSet)vt[8])(factory, 0x2000000) == 0); /* staging size: accepted */
+  void** qv = *(void***)queue;
+  typedef void (*EnqueueFn)(void*, const void*);
+  typedef void (*EnqueueStatusFn)(void*, void*, uint32_t);
+  typedef void (*SubmitFn)(void*);
+  typedef BOOL (*IsCompleteFn)(void*, uint32_t);
+  typedef HRESULT (*GetHrFn)(void*, uint32_t);
+  CHECK(!((IsCompleteFn)(*(void***)status)[3])(status, 0));
+
+  /* console request: options (compression), dest, 0, dest size, file, offset, size | uncompressed << 32 */
+  static uint8_t header[64];
+  uint64_t req[12] = {0, (uint64_t)(uintptr_t)header, 0, sizeof header, (uint64_t)(uintptr_t)file, 0, 64};
+  ((EnqueueFn)qv[3])(queue, req);
+  ((EnqueueStatusFn)qv[4])(queue, status, 0);
+  ((SubmitFn)qv[6])(queue);
+  CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 0) && ((GetHrFn)(*(void***)status)[4])(status, 0) == 0);
+  CHECK(header[0] == 'M' && header[1] == 'Z');
+
+  /* Find the chunk in the file, then read it compressed. */
+  static uint8_t image[0x40000];
+  const uint32_t size = *(uint32_t*)(info + 36) < sizeof image ? *(uint32_t*)(info + 36) : sizeof image;
+  uint64_t whole[12] = {0, (uint64_t)(uintptr_t)image, 0, size, (uint64_t)(uintptr_t)file, 0, size};
+  ((EnqueueFn)qv[3])(queue, whole);
+  uint32_t at = 0;
+  for (uint32_t i = 0; i + 4 <= size; ++i)
+    if (image[i] == 'X' && image[i + 1] == 'B' && image[i + 2] == 'D' && image[i + 3] == 'S' && image[i + 4] == 0x78) {
+      at = i + 4;
+      break;
+    }
+  CHECK(at != 0);
+  static uint8_t text[512];
+  uint64_t zreq[12] = {1, (uint64_t)(uintptr_t)text, 0, sizeof text, (uint64_t)(uintptr_t)file, at,
+                       44 | (uint64_t)264 << 32};
+  ((EnqueueFn)qv[3])(queue, zreq);
+  ((EnqueueStatusFn)qv[4])(queue, status, 1);
+  ((SubmitFn)qv[6])(queue);
+  CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+  CHECK(text[0] == 'x' && text[5] == 'D' && text[263] == ' ' && text[264] == 0);
+  CHECK(*(volatile const uint8_t*)&kZlibChunk[47] == 0x01); /* keeps the chunk in the image */
 }
 
 /* ------------------------------------------------- headless D3D12 */
@@ -495,6 +550,13 @@ static void test_headless_d3d12(void) {
   typedef HRESULT (*AnyFn)(void*, uint64_t);
   CHECK(((AnyFn)VT(device)[200])(device, 0) == 0);
   CHECK(((AnyFn)VT(device)[300])(device, 0) == 0);
+  /* An output variable zeroed on the stack receives a new object... */
+  typedef HRESULT (*ProbeOutFn)(void*, uint64_t, void**);
+  void* probe_out = 0;
+  CHECK(((ProbeOutFn)VT(device)[301])(device, 0, &probe_out) == 0 && probe_out && probe_out != device);
+  /* ...and a probe method reached with a foreign `this` is logged, not trusted. */
+  static uint64_t foreign_this[8];
+  CHECK(((AnyFn)VT(device)[302])(foreign_this, 1) == 0);
 
   void* fence = 0;
   CHECK(((CreateFenceFn)VT(device)[36])(device, 1, 0, iid, &fence) == 0 && fence);
@@ -651,7 +713,7 @@ DWORD guest_main(void* peb) {
   test_zen2_instructions();
   test_xg();
   test_headless_d3d12();
-  test_dstorage_probe();
+  test_dstorage();
   test_gameinput();
   test_locale();
   test_time();

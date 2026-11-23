@@ -9,6 +9,10 @@ struct RootSignature;
 
 namespace xbem::hle {
 
+// Signals a fence created by the headless device (ID3D12Fence); false when
+// `fence` is not one.
+bool signal_d3d12_fence(void* fence, uint64_t value);
+
 // ID3DBlob / ID3D10Blob holding `bytes` (GetBufferPointer = slot 3, GetBufferSize = slot 4).
 void* make_d3d_blob(std::vector<uint8_t> bytes);
 
