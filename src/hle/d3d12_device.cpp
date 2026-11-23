@@ -784,10 +784,23 @@ void** find_output_after_iid(const uint64_t* args, int n, int first) {
   return nullptr;
 }
 
+// Slot 127 (display surfaces) is called with (heap properties, heap flags,
+// description, state, pointer, 0, 0, 0): no (riid, ppv) pair. The pointer is
+// either the output variable (zeroed) or a clear value (it starts with the
+// description's format); with no output the object is returned in RAX.
+std::string hex_bytes(uint64_t address, size_t n) {
+  uint8_t b[32] = {};
+  n = std::min(n, sizeof b);
+  if (address < 0x10000 || address >= 0x800000000000ull || !platform::safe_read(address, b, n)) return "?";
+  std::string out;
+  for (size_t i = 0; i < n; ++i) out += std::format("{:02x}{}", b[i], (i % 8 == 7) ? " " : "");
+  return out;
+}
+
 template <int Slot>
-HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* heap_props, uint64_t heap_flags,
-                                               const uint8_t* desc, uint64_t state, uint64_t a4, uint64_t a5,
-                                               uint64_t a6, uint64_t a7) {
+uint64_t XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* heap_props, uint64_t heap_flags,
+                                                const uint8_t* desc, uint64_t state, uint64_t a4, uint64_t a5,
+                                                uint64_t a6, uint64_t a7) {
   (void)heap_props;
   uint8_t d[56] = {};
   if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
@@ -798,15 +811,29 @@ HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* he
   std::memcpy(&f, d + 32, 4);
   const uint64_t args[4] = {a4, a5, a6, a7};  // clear value, [extra...], riid, ppv
   void** out = find_output_after_iid(args, 4, 0);
-  void* resource = out ? new_resource(child_name("texture"), desc) : nullptr;
+  const char* how = "(riid, ppv)";
+  bool return_object = false;
+  if (!out) {
+    uint64_t first = ~0ull;
+    if (a4 >= 0x10000 && a4 < 0x800000000000ull) platform::safe_read(a4, &first, 8);
+    if (first == 0) {
+      out = reinterpret_cast<void**>(a4);
+      how = "zeroed output after the state";
+    } else {
+      return_object = true;
+      how = "no output: object returned in RAX";
+    }
+  }
+  void* resource = new_resource(child_name("texture"), desc);
   probe_log(self, Slot,
-            std::format("CreateCommittedResourceX(dim {} {}x{} format {}, heap flags {:#x}, state {:#x}; {:#x} {:#x} "
-                        "{:#x} {:#x}) -> {}{}",
-                        d[0], w, h, f, static_cast<uint32_t>(heap_flags), static_cast<uint32_t>(state), a4, a5, a6,
-                        a7, resource, out ? "" : " - no (riid, ppv) pair found"),
+            std::format("CreateCommittedResourceX(dim {} {}x{} format {}, heap flags {:#x}, state {:#x}; {:#x} [{}] "
+                        "{:#x} {:#x} {:#x}) -> {} via {}",
+                        d[0], w, h, f, static_cast<uint32_t>(heap_flags), static_cast<uint32_t>(state), a4,
+                        hex_bytes(a4, 24), a5, a6, a7, resource, how),
             XBEM_RETURN_ADDRESS());
-  if (!out) return E_INVALIDARG;
-  return create_into(resource, out);
+  if (return_object) return reinterpret_cast<uint64_t>(resource);
+  *out = resource;
+  return S_OK;
 }
 
 // 78 SetFrameIntervalX(output, interval_us, latency, flags), 79
