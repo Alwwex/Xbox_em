@@ -47,9 +47,16 @@ void print_thread_context(void (*write)(const char*)) {
   hle::print_probe_history(write);
 }
 
-void describe_virtual_memory(uint64_t address, char* out, size_t out_size) {
+// Allocations, plus the emulator's probe COM objects (a title storing or
+// reading through one shows up in crash reports).
+void describe_memory_for_reports(uint64_t address, char* out, size_t out_size) {
   out[0] = 0;
-  hle::describe_virtual_memory(address, out, out_size);
+  if (hle::describe_virtual_memory(address, out, out_size)) return;
+  uint64_t magic = 0;
+  if ((address & 7) == 0 && platform::safe_read(address + 8, &magic, 8) && magic == hle::kProbeMagic) {
+    const auto* o = reinterpret_cast<const hle::ProbeObject*>(address);
+    std::snprintf(out, out_size, "emulator probe object \"%s\"", o->name.c_str());
+  }
 }
 
 // For thread dumps: what the call instruction ending at `ret` calls. Handles
@@ -194,7 +201,7 @@ int Process::run() {
 
   platform::install_crash_handler(&describe_address);
   platform::install_thread_dump(&describe_address, &describe_call_site);
-  platform::set_memory_describer(&describe_virtual_memory);
+  platform::set_memory_describer(&describe_memory_for_reports);
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&print_thread_context);
 

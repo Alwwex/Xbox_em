@@ -20,10 +20,20 @@ using namespace win;
 constexpr int kSlots = kProbeSlots;
 constexpr int kLoggedCallsPerSlot = 4;
 
-bool in_loaded_image(uint64_t address) {
-  char buf[64];
+
+// Interface IDs are constants: they live in a read-only, non-executable
+// section of an image. A pointer into writable game data followed by a pointer
+// is not a (riid, ppv) pair - writing an object there corrupts the title.
+bool in_read_only_image_data(uint64_t address) {
   rt::Process* p = rt::Process::current_or_null();
-  return p && p->loader().describe(address, buf, sizeof buf);
+  if (!p) return false;
+  rt::LoadedModule* m = p->loader().find_containing(address);
+  if (!m || !m->image) return false;
+  const uint64_t rva = address - m->handle();
+  for (const pe::Section& s : m->image->sections())
+    if (rva >= s.virtual_address && rva < s.virtual_address + s.mapped_size())
+      return s.readable() && !s.writable() && !s.executable();
+  return false;
 }
 
 std::string hex_dump(uint64_t address, size_t length) {
@@ -131,13 +141,14 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
   std::string created;
   // Scanned from the last argument: (riid, ppv) usually ends the list.
   for (int i = 4; i >= 0; --i) {
-    if (!in_loaded_image(args[i]) || args[i + 1] < 0x10000 || args[i + 1] >= 0x800000000000ull) continue;
+    if (!in_read_only_image_data(args[i]) || args[i + 1] < 0x10000 || args[i + 1] >= 0x800000000000ull) continue;
     uint8_t iid[16];
     if (!platform::safe_read(args[i], iid, 16)) continue;
     const std::string child = std::format("{}.m{}", self->name, slot);
     void* object = make_probe_object(child);
     if (!platform::safe_write(args[i + 1], &object, 8)) continue;  // not a writable output pointer
-    created = std::format(" -> created {} for {{{}}} (arg {})", child, guid_to_string(iid), i + 1);
+    created = std::format(" -> created {} for {{{}}} (arg {}, stored at {:#x})", child, guid_to_string(iid), i + 1,
+                          args[i + 1]);
     break;
   }
   // No interface ID: an output variable the caller zeroed on its stack gets a

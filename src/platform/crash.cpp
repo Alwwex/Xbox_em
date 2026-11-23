@@ -438,6 +438,26 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   if (slot && fault < slot->stack_low && fault + 0x100000 >= slot->stack_low)
     write_str("Looks like a STACK OVERFLOW of this guest thread.\n");
 
+  // What the registers point at (code, emulator objects, allocations).
+  {
+    bool header = false;
+    for (const auto& r : regs) {
+      if (r.reg == REG_RSP) continue;
+      const uint64_t v = static_cast<uint64_t>(g[r.reg]);
+      if (v < 0x10000 || v >= 0x800000000000ull) continue;
+      where[0] = 0;
+      if (g_describer) g_describer(v, where, sizeof where);
+      if (!where[0]) {
+        describe_memory(v, where, sizeof where);
+        if (std::strcmp(where, "not memory the emulator handed out") == 0) continue;
+      }
+      if (!header) write_str("Registers pointing at known memory:\n");
+      header = true;
+      std::snprintf(line, sizeof line, "  %s=%016llx  %s\n", r.name, static_cast<unsigned long long>(v), where);
+      write_str(line);
+    }
+  }
+
   // Return-address scan of the stack (reads are checked, never fault).
   write_str("Stack (likely return addresses):\n");
   int shown = 0;
