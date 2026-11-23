@@ -552,22 +552,23 @@ static void test_headless_d3d12(void) {
   uint8_t got_pc[56] = {0};
   CHECK(((GetDescFn)VT(buffer)[10])(buffer, got_pc) == got_pc && memcmp(got, got_pc, 56) == 0);
 
-  /* 127: display surface creation, CreateCommittedResource's arguments */
+  /* 127: CreateCommittedResource3 - heap properties, heap flags, desc, initial
+   * layout, clear value, protected session, castable format count/array, riid, ppv */
+  typedef HRESULT (*CreateCommitted3Fn)(void*, const void*, uint32_t, const void*, uint32_t, const void*, void*,
+                                        uint32_t, const void*, const void*, void**);
   static const uint32_t heap_props[5] = {1, 0, 0, 1, 1};
-  void* back_buffer = 0;
   *(uint64_t*)(tex + 16) = 3840;
   *(uint32_t*)(tex + 24) = 2160;
   *(uint16_t*)(tex + 30) = 1;
   *(uint32_t*)(tex + 32) = 28;
-  CHECK(((CreateCommittedFn)VT(device)[127])(device, heap_props, 0x8, tex, 0, 0, resource_iid, &back_buffer) == 0 &&
-        back_buffer);
+  void* back_buffer = 0;
+  CHECK(((CreateCommitted3Fn)VT(device)[127])(device, heap_props, 0x8, tex, 2, 0, 0, 0, 0, resource_iid,
+                                              &back_buffer) == 0 && back_buffer);
   CHECK(((GpuVaFn)VT(back_buffer)[11])(back_buffer) != 0);
-  /* ... and with an extra console argument before (riid, ppv) */
-  typedef HRESULT (*CreateCommitted8Fn)(void*, const void*, uint32_t, const void*, uint32_t, const void*, uint64_t,
-                                         const void*, void**);
-  void* back_buffer2 = 0;
-  CHECK(((CreateCommitted8Fn)VT(device)[127])(device, heap_props, 0x8, tex, 0, 0, 0x1234, resource_iid,
-                                              &back_buffer2) == 0 && back_buffer2 && back_buffer2 != back_buffer);
+  /* 76: CreateCommittedResource's seven arguments */
+  void* texture76 = 0;
+  CHECK(((CreateCommittedFn)VT(device)[76])(device, heap_props, 0, tex, 0, 0, resource_iid, &texture76) == 0 &&
+        texture76 && texture76 != back_buffer);
 
   /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
   typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);
