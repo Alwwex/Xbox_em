@@ -41,6 +41,7 @@ shows them. No code was taken from it.
 | 67 | DeserializeComputePipelineStateX(desc, riid, ppv) | native RDNA2 code at desc+0x28 / size at +0x30 (captured) |
 | 73 | CreateCommandListX(desc, allocator, state, riid, ppv) | |
 | 76 | texture creation | CreateCommittedResource's arguments; layout word 0x101 = tiled |
+| 127 | display surface creation | the same call shape with heap flag ALLOW_DISPLAY (the back buffers) |
 | 78–80 | SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX | frame pacing |
 | 133 | CreatePlacedResourceX(va, desc, layout, …, riid, ppv) | a buffer on pages the title mapped |
 

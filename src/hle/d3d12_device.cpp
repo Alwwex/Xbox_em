@@ -774,10 +774,22 @@ HRESULT XBEM_GUEST_ABI device_deserialize_compute_pso_x(ProbeObject* self, const
 
 // 76 texture creation: CreateCommittedResource's arguments; the desc's layout
 // word is the console's (0x101 = tiled).
-HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void*, uint32_t, const uint8_t* desc,
-                                               uint32_t, const void*, const void*, void** out) {
-  probe_log(self, 76, "CreateCommittedResourceX (texture)", XBEM_RETURN_ADDRESS());
-  return create_into(new_resource(child_name("texture"), desc), out);
+HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void*, uint32_t heap_flags,
+                                               const uint8_t* desc, uint32_t state, const void*, const void*,
+                                               void** out) {
+  uint8_t d[56] = {};
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
+  uint64_t w;
+  uint32_t h, f;
+  std::memcpy(&w, d + 16, 8);
+  std::memcpy(&h, d + 24, 4);
+  std::memcpy(&f, d + 32, 4);
+  void* resource = new_resource(child_name("texture"), desc);
+  probe_log(self, 76,
+            std::format("CreateCommittedResourceX(dim {} {}x{} format {}, heap flags {:#x}, state {:#x}) -> {}", d[0],
+                        w, h, f, heap_flags, state, resource),
+            XBEM_RETURN_ADDRESS());
+  return create_into(resource, out);
 }
 
 // 78 SetFrameIntervalX(output, interval_us, latency, flags), 79
@@ -847,6 +859,9 @@ const ProbeVtable g_device_vtable = make_vtable({
     {62, fn(&device_create_compute_pso_x)},
     {67, fn(&device_deserialize_compute_pso_x)},
     {76, fn(&device_create_texture_x)},
+    // 127: the same call shape for display surfaces (heap flag ALLOW_DISPLAY):
+    // the title's two 4K back buffers come from here.
+    {127, fn(&device_create_texture_x)},
     {78, fn(&device_set_frame_interval_x)},
     {79, fn(&device_schedule_frame_event_x)},
     {80, fn(&device_wait_frame_event_x)},

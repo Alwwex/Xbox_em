@@ -552,6 +552,17 @@ static void test_headless_d3d12(void) {
   uint8_t got_pc[56] = {0};
   CHECK(((GetDescFn)VT(buffer)[10])(buffer, got_pc) == got_pc && memcmp(got, got_pc, 56) == 0);
 
+  /* 127: display surface creation, CreateCommittedResource's arguments */
+  static const uint32_t heap_props[5] = {1, 0, 0, 1, 1};
+  void* back_buffer = 0;
+  *(uint64_t*)(tex + 16) = 3840;
+  *(uint32_t*)(tex + 24) = 2160;
+  *(uint16_t*)(tex + 30) = 1;
+  *(uint32_t*)(tex + 32) = 28;
+  CHECK(((CreateCommittedFn)VT(device)[127])(device, heap_props, 0x8, tex, 0, 0, resource_iid, &back_buffer) == 0 &&
+        back_buffer);
+  CHECK(((GpuVaFn)VT(back_buffer)[11])(back_buffer) != 0);
+
   /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
   typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);
   typedef HRESULT (*WaitFn)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t*);
