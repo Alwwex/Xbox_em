@@ -231,19 +231,73 @@ struct ResourceState {
   std::mutex mutex;
 };
 
+// DXGI format -> element size. Block-compressed formats are 4x4 blocks of
+// `bytes`; others are one pixel of `bytes` (`bits` for sub-byte formats).
+struct FormatInfo {
+  uint32_t bytes;  // per pixel, or per 4x4 block when block is true
+  bool block;
+};
+FormatInfo format_info(uint32_t f) {
+  if (f >= 1 && f <= 4) return {16, false};    // R32G32B32A32
+  if (f >= 5 && f <= 8) return {12, false};    // R32G32B32
+  if (f >= 9 && f <= 22) return {8, false};    // R16G16B16A16, R32G32, R32G8X24
+  if (f >= 23 && f <= 47) return {4, false};   // R10G10B10A2 .. R24G8
+  if (f >= 48 && f <= 59) return {2, false};   // R8G8, R16
+  if (f >= 60 && f <= 66) return {1, false};   // R8, A8, R1 (rounded up)
+  if (f >= 67 && f <= 69) return {4, false};   // R9G9B9E5, R8G8_B8G8, G8R8_G8B8
+  if (f >= 70 && f <= 72) return {8, true};    // BC1
+  if (f >= 73 && f <= 78) return {16, true};   // BC2, BC3
+  if (f >= 79 && f <= 81) return {8, true};    // BC4
+  if (f >= 82 && f <= 84) return {16, true};   // BC5
+  if (f == 85 || f == 86 || f == 115) return {2, false};  // B5G6R5, B5G5R5A1, B4G4R4A4
+  if (f >= 87 && f <= 93) return {4, false};   // B8G8R8A8 / X8
+  if (f >= 94 && f <= 99) return {16, true};   // BC6H, BC7
+  if (f == 100 || f == 101 || f == 107) return {4, false};  // AYUV, Y410, YUY2
+  if (f == 102 || f == 108 || f == 109) return {8, false};  // Y416, Y210, Y216
+  if (f >= 103 && f <= 106) return {2, false};  // NV12/P010/P016/420_OPAQUE (upper bound)
+  if (f >= 110 && f <= 114) return {2, false};
+  return {4, false};  // unknown / console-specific: assume 32 bits per pixel
+}
+
+// Bytes of a D3D12_RESOURCE_DESC (Dimension, Alignment, Width, Height,
+// DepthOrArraySize, MipLevels, Format, SampleDesc, Layout, Flags): every mip of
+// every array slice, rows aligned to 256 bytes and subresources to 512, as
+// D3D12 lays out linear textures. Tiled console layouts pad more, which the
+// title's own 64 KiB rounding absorbs for large surfaces.
 uint64_t resource_size(const uint8_t* desc) {
-  uint32_t dimension;
+  uint32_t dimension, height, format, samples;
   uint64_t width;
-  uint32_t height;
-  uint16_t depth;
+  uint16_t depth_or_array, mips;
   std::memcpy(&dimension, desc, 4);
   std::memcpy(&width, desc + 16, 8);
   std::memcpy(&height, desc + 24, 4);
-  std::memcpy(&depth, desc + 28, 2);
+  std::memcpy(&depth_or_array, desc + 28, 2);
+  std::memcpy(&mips, desc + 30, 2);
+  std::memcpy(&format, desc + 32, 4);
+  std::memcpy(&samples, desc + 36, 4);
   if (dimension == 1) return width;  // BUFFER
-  // Textures: a generous bound (16 bytes per texel, all mips) without format tables.
-  const uint64_t texels = width * std::max<uint32_t>(height, 1) * std::max<uint16_t>(depth, 1);
-  return std::min<uint64_t>(texels * 16 * 2, 4ull << 30);
+  width = std::max<uint64_t>(width, 1);
+  height = std::max<uint32_t>(height, 1);
+  const uint32_t depth = dimension == 4 ? std::max<uint16_t>(depth_or_array, 1) : 1;
+  const uint32_t slices = dimension == 4 ? 1 : std::max<uint16_t>(depth_or_array, 1);
+  if (mips == 0) {  // full chain
+    uint64_t largest = std::max<uint64_t>({width, height, depth});
+    while (largest) {
+      ++mips;
+      largest >>= 1;
+    }
+  }
+  const FormatInfo fi = format_info(format);
+  uint64_t per_slice = 0;
+  for (uint32_t m = 0; m < mips; ++m) {
+    const uint64_t w = std::max<uint64_t>(width >> m, 1), h = std::max<uint64_t>(height >> m, 1),
+                   d = std::max<uint64_t>(depth >> m, 1);
+    const uint64_t row = fi.block ? (w + 3) / 4 * fi.bytes : w * fi.bytes;
+    const uint64_t rows = fi.block ? (h + 3) / 4 : h;
+    per_slice += (((row + 255) & ~255ull) * rows * d + 511) & ~511ull;
+  }
+  const uint64_t total = per_slice * slices * std::clamp<uint32_t>(samples, 1, 16);
+  return std::min<uint64_t>(total, 16ull << 30);
 }
 
 // ID3D12Resource: 8 Map, 9 Unmap, 10 GetDesc (hidden return), 11 GetGPUVirtualAddress
@@ -648,6 +702,7 @@ void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a
     descs = a3;
   }
   uint64_t size = 0, alignment = 0x10000;
+  std::string what;
   bool ok = count > 0 && count < 4096 && descs >= 0x10000;
   for (uint64_t i = 0; ok && i < count; ++i) {
     uint8_t d[56];
@@ -657,14 +712,29 @@ void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a
     }
     uint64_t align;
     std::memcpy(&align, d + 8, 8);
+    uint32_t samples;
+    std::memcpy(&samples, d + 36, 4);
+    if (samples > 1) align = std::max<uint64_t>(align, 4ull << 20);  // MSAA: 4 MiB placement alignment
     alignment = std::max<uint64_t>(alignment, align);
     size = ((size + alignment - 1) & ~(alignment - 1)) + ((resource_size(d) + 0xFFFF) & ~0xFFFFull);
+    if (i < 2) {
+      uint64_t w;
+      uint32_t h, f;
+      uint16_t a, mip;
+      std::memcpy(&w, d + 16, 8);
+      std::memcpy(&h, d + 24, 4);
+      std::memcpy(&a, d + 28, 2);
+      std::memcpy(&mip, d + 30, 2);
+      std::memcpy(&f, d + 32, 4);
+      what += std::format(" [dim {} {}x{}x{} mips {} format {} samples {} flags {:#x}]", d[0], w, h, a, mip, f,
+                          samples, d[48]);
+    }
   }
   const uint64_t result[2] = {ok ? size : ~0ull, ok ? alignment : 0};
   std::memcpy(r.out, result, 16);
   probe_log(r.self, 25,
-            std::format("GetResourceAllocationInfo({} descs) -> size {:#x}, alignment {:#x}", count, result[0],
-                        result[1]),
+            std::format("GetResourceAllocationInfo({} descs{}) -> size {:#x}, alignment {:#x}", count, what,
+                        result[0], result[1]),
             XBEM_RETURN_ADDRESS());
   return r.out;
 }

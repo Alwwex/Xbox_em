@@ -531,6 +531,22 @@ static void test_headless_d3d12(void) {
   uint64_t info[2] = {0, 0};
   CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, desc) == info);
   CHECK(info[0] == 0x10000 && info[1] == 0x10000); /* 4 KiB buffer -> one 64 KiB page */
+  /* 3840x2160 R8G8B8A8 render target, 1 mip: 15360-byte rows x 2160, in 64 KiB pages */
+  uint8_t tex[56] = {0};
+  tex[0] = 3; /* TEXTURE2D */
+  *(uint64_t*)(tex + 16) = 3840;
+  *(uint32_t*)(tex + 24) = 2160;
+  *(uint16_t*)(tex + 28) = 1;
+  *(uint16_t*)(tex + 30) = 1;
+  *(uint32_t*)(tex + 32) = 28; /* R8G8B8A8_UNORM */
+  *(uint32_t*)(tex + 36) = 1;
+  CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, tex) == info && info[0] == 0x1FB0000);
+  /* BC1 256x256 with a full mip chain: 32768 + 8192 + 2048 + 512 + 6 x 512 (small mips) bytes */
+  *(uint64_t*)(tex + 16) = 256;
+  *(uint32_t*)(tex + 24) = 256;
+  *(uint16_t*)(tex + 30) = 0;
+  *(uint32_t*)(tex + 32) = 71; /* BC1_UNORM */
+  CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, tex) == info && info[0] == 0x10000);
   uint8_t got[56] = {0};
   CHECK(((GetDescFn)VT(buffer)[10])(got, buffer) == got && got[0] == 1 && *(uint64_t*)(got + 16) == 4096);
   uint8_t got_pc[56] = {0};
