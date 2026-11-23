@@ -17,7 +17,7 @@
 
 namespace xbem::hle {
 
-constexpr int kProbeSlots = 128;
+constexpr int kProbeSlots = 512;  // D3D12.X devices have far more methods than the PC interface
 
 struct ProbeObject {
   void* const* vtable;

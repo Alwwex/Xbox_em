@@ -307,6 +307,25 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
     write_str(line);
   }
 
+  // A jump/call to a bad address (e.g. a NULL function pointer): show the
+  // calling instruction, found through the return address at [rsp].
+  {
+    char probe_where[64] = {0};
+    if (g_describer) g_describer(rip, probe_where, sizeof probe_where);
+    uint64_t ret = 0;
+    uint8_t caller[16];
+    if (!probe_where[0] && safe_read(rsp, &ret, 8) && safe_read(ret - 16, caller, 16)) {
+      where[0] = 0;
+      if (g_describer) g_describer(ret, where, sizeof where);
+      char* o = line;
+      o += std::snprintf(o, 120, "Bad jump target; return address %s, caller code (ret-16..ret):",
+                         where[0] ? where : "?");
+      for (int i = 0; i < 16; ++i) o += std::snprintf(o, 8, " %02x", caller[i]);
+      std::snprintf(o, 4, "\n");
+      write_str(line);
+    }
+  }
+
   // Which memory the fault address and the stack pointer belong to.
   describe_memory(fault, where, sizeof where);
   std::snprintf(line, sizeof line, "Fault address: %s\n", where);
