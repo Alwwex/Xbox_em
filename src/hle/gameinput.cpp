@@ -25,7 +25,7 @@ constexpr HRESULT E_NOINTERFACE = static_cast<HRESULT>(0x80004002);
 constexpr HRESULT GAMEINPUT_E_DEVICE_NOT_FOUND = static_cast<HRESULT>(0x838A0001);
 constexpr HRESULT GAMEINPUT_E_READING_NOT_FOUND = static_cast<HRESULT>(0x838A0003);
 
-#define GI_LOG(...) XBEM_LOG_CALL("input", __VA_ARGS__)
+
 
 // ---------------------------------------------------------------- objects
 
@@ -65,7 +65,7 @@ uint64_t now_us() {
 bool XBEM_GUEST_ABI dispatcher_dispatch(ComObject*, uint64_t) { return false; }  // nothing pending
 // HRESULT OpenWaitHandle(HANDLE* waitHandle)
 HRESULT XBEM_GUEST_ABI dispatcher_open_wait_handle(ComObject*, HANDLE* handle) {
-  GI_LOG("E_NOTIMPL", reinterpret_cast<uint64_t>(handle));
+  XBEM_LOG_CALL("input", "E_NOTIMPL", reinterpret_cast<uint64_t>(handle));
   if (handle) *handle = 0;
   return E_NOTIMPL;
 }
@@ -85,7 +85,7 @@ uint64_t XBEM_GUEST_ABI gi_get_current_timestamp(ComObject*) { return now_us(); 
 
 // HRESULT GetCurrentReading(GameInputKind, IGameInputDevice*, IGameInputReading**)
 HRESULT XBEM_GUEST_ABI gi_get_current_reading(ComObject*, uint32_t kind, void* device, void** reading) {
-  GI_LOG("GAMEINPUT_E_READING_NOT_FOUND (no devices)", kind, reinterpret_cast<uint64_t>(device));
+  XBEM_LOG_CALL("input", "GAMEINPUT_E_READING_NOT_FOUND (no devices)", kind, reinterpret_cast<uint64_t>(device));
   if (reading) *reading = nullptr;
   return GAMEINPUT_E_READING_NOT_FOUND;
 }
@@ -108,7 +108,7 @@ HRESULT XBEM_GUEST_ABI gi_get_temporal_reading(ComObject*, uint64_t, void*, void
 //                                 GameInputReadingCallback, GameInputCallbackToken* token)
 HRESULT XBEM_GUEST_ABI gi_register_reading_callback(ComObject*, void* device, uint32_t kind, float, void* context,
                                                     uint64_t callback, uint64_t* token) {
-  GI_LOG("S_OK (never fires)", reinterpret_cast<uint64_t>(device), kind, reinterpret_cast<uint64_t>(context),
+  XBEM_LOG_CALL("input", "S_OK (never fires)", reinterpret_cast<uint64_t>(device), kind, reinterpret_cast<uint64_t>(context),
          callback);
   if (token) *token = g_next_token.fetch_add(1);
   return S_OK;
@@ -119,7 +119,7 @@ HRESULT XBEM_GUEST_ABI gi_register_reading_callback(ComObject*, void* device, ui
 HRESULT XBEM_GUEST_ABI gi_register_device_callback(ComObject*, void* device, uint32_t kind, uint32_t status_filter,
                                                    uint32_t enumeration, void* context, uint64_t callback,
                                                    uint64_t* token) {
-  GI_LOG("S_OK (no devices to enumerate)", reinterpret_cast<uint64_t>(device), kind, status_filter, enumeration);
+  XBEM_LOG_CALL("input", "S_OK (no devices to enumerate)", reinterpret_cast<uint64_t>(device), kind, status_filter, enumeration);
   (void)context;
   (void)callback;
   if (token) *token = g_next_token.fetch_add(1);
@@ -129,7 +129,7 @@ HRESULT XBEM_GUEST_ABI gi_register_device_callback(ComObject*, void* device, uin
 //                                      GameInputSystemButtonCallback, GameInputCallbackToken*)
 HRESULT XBEM_GUEST_ABI gi_register_system_button_callback(ComObject*, void* device, uint32_t buttons, void*, uint64_t,
                                                           uint64_t* token) {
-  GI_LOG("S_OK (never fires)", reinterpret_cast<uint64_t>(device), buttons);
+  XBEM_LOG_CALL("input", "S_OK (never fires)", reinterpret_cast<uint64_t>(device), buttons);
   if (token) *token = g_next_token.fetch_add(1);
   return S_OK;
 }
@@ -152,7 +152,7 @@ HRESULT XBEM_GUEST_ABI gi_create_dispatcher(ComObject*, void** dispatcher) {
 }
 // HRESULT CreateAggregateDevice(GameInputKind, IGameInputDevice**)
 HRESULT XBEM_GUEST_ABI gi_create_aggregate_device(ComObject*, uint32_t kind, void** device) {
-  GI_LOG("E_NOTIMPL", kind);
+  XBEM_LOG_CALL("input", "E_NOTIMPL", kind);
   if (device) *device = nullptr;
   return E_NOTIMPL;
 }
