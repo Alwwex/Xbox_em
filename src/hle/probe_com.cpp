@@ -15,15 +15,8 @@ namespace {
 
 using namespace win;
 
-constexpr int kSlots = 64;
+constexpr int kSlots = kProbeSlots;
 constexpr int kLoggedCallsPerSlot = 4;
-
-struct ProbeObject {
-  void* const* vtable;
-  std::string name;
-  std::atomic<uint32_t> refs{1};
-  std::array<std::atomic<int>, kSlots> calls{};
-};
 
 bool in_loaded_image(uint64_t address) {
   char buf[64];
@@ -103,11 +96,19 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
 
 }  // namespace
 
-void* make_probe_object(const std::string& name) {
+const ProbeVtable& default_probe_vtable() { return g_probe_vtable; }
+
+void* make_probe_object(const std::string& name, const ProbeVtable* vtable, void* state) {
   auto* o = new ProbeObject;  // lives for the whole process
-  o->vtable = g_probe_vtable.data();
+  o->vtable = vtable ? vtable->data() : g_probe_vtable.data();
   o->name = name;
+  o->state = state;
   return o;
+}
+
+void probe_log(ProbeObject* self, int slot, const std::string& text, uint64_t return_address) {
+  if (slot < 0 || slot >= kSlots || self->calls[slot].fetch_add(1) >= kLoggedCallsPerSlot) return;
+  XBEM_WARN("probe", "{}::{} from {}", self->name, text, describe_code_address(return_address));
 }
 
 }  // namespace xbem::hle

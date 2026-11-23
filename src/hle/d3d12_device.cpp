@@ -1,0 +1,386 @@
+// Headless Direct3D 12 (D3D12.X) device.
+//
+// Without a GPU backend, titles still need a device to get through their
+// graphics initialisation and frame loop. This device "executes" GPU work
+// instantly and draws nothing:
+//
+//   * command queues complete everything immediately: Signal() sets the fence
+//     value at once, so CPU waits on GPU fences return;
+//   * resources get CPU memory for Map() and unique GPU virtual addresses;
+//   * descriptor heaps hand out CPU/GPU descriptor handles;
+//   * pipeline creation captures the title's shader binaries to disk
+//     (--dump-shaders DIR) for the shader translator;
+//   * everything else is a probe slot (see probe_com.h): logged and S_OK.
+//
+// Slot numbers follow the public d3d12.h interfaces. The console's D3D12.X
+// adds methods, so typed slots log their calls; a mismatch shows up in the run
+// log as calls with implausible arguments.
+
+#include <atomic>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <format>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include "hle/d3d12_device.h"
+#include "hle/discovery.h"
+#include "hle/heap.h"
+#include "hle/hle_util.h"
+#include "hle/probe_com.h"
+#include "platform/memory.h"
+
+namespace xbem::hle {
+namespace {
+
+using namespace win;
+namespace fs = std::filesystem;
+
+// --------------------------------------------------------------- helpers
+
+std::atomic<uint64_t> g_next_gpu_va{0x0000'1000'0000'0000ull};  // fake GPU virtual addresses
+
+uint64_t allocate_gpu_va(uint64_t size) {
+  const uint64_t aligned = (std::max<uint64_t>(size, 1) + 0xFFFF) & ~0xFFFFull;
+  return g_next_gpu_va.fetch_add(aligned + 0x10000);
+}
+
+template <class F>
+void* fn(F* f) {
+  return reinterpret_cast<void*>(f);
+}
+
+ProbeVtable make_vtable(std::initializer_list<std::pair<int, void*>> overrides) {
+  ProbeVtable v = default_probe_vtable();
+  for (const auto& [slot, f] : overrides) v[static_cast<size_t>(slot)] = f;
+  return v;
+}
+
+// SetEvent through the kernelx implementation (events are kernel objects there).
+void set_guest_event(HANDLE event) {
+  using SetEventFn = BOOL(XBEM_GUEST_ABI*)(HANDLE);
+  static auto set_event = reinterpret_cast<SetEventFn>(Registry::instance().find("kernelx.dll", "SetEvent").exp->address);
+  if (event) set_event(event);
+}
+
+// ------------------------------------------------------------ shaders
+
+struct ShaderCapture {
+  std::mutex mutex;
+  std::unordered_map<uint64_t, bool> seen;
+  size_t count = 0;
+};
+ShaderCapture g_shaders;
+
+uint64_t fnv1a(const uint8_t* p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+
+// Saves a D3D12_SHADER_BYTECODE {pointer, size} if it looks valid.
+void capture_shader(const char* stage, uint64_t pointer, uint64_t size) {
+  if (!pointer || size < 16 || size > (64u << 20)) return;
+  std::vector<uint8_t> bytes(size);
+  if (!platform::safe_read(pointer, bytes.data(), size)) return;
+  const uint64_t hash = fnv1a(bytes.data(), bytes.size());
+  std::lock_guard lock(g_shaders.mutex);
+  if (!g_shaders.seen.emplace(hash, true).second) return;
+  ++g_shaders.count;
+  const char magic[5] = {static_cast<char>(bytes[0]), static_cast<char>(bytes[1]), static_cast<char>(bytes[2]),
+                         static_cast<char>(bytes[3]), 0};
+  const fs::path& dir = proc().options().dump_shaders_dir;
+  if (dir.empty()) {
+    if (g_shaders.count <= 3)
+      XBEM_INFO("d3d12", "shader {} ({} bytes, magic '{}') - use --dump-shaders DIR to save shaders", stage, size,
+                std::isprint(static_cast<unsigned char>(magic[0])) ? magic : "?");
+    return;
+  }
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const fs::path file = dir / std::format("{}_{:016x}.bin", stage, hash);
+  std::ofstream(file, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()),
+                                               static_cast<std::streamsize>(bytes.size()));
+  if (g_shaders.count <= 20 || g_shaders.count % 100 == 0)
+    XBEM_INFO("d3d12", "captured shader #{}: {} ({} bytes)", g_shaders.count, file.string(), size);
+}
+
+// ------------------------------------------------------------- fence
+
+struct FenceState {
+  std::mutex mutex;
+  uint64_t value = 0;
+  std::vector<std::pair<uint64_t, HANDLE>> waiters;
+};
+
+void fence_signal(FenceState* f, uint64_t value) {
+  std::vector<HANDLE> fire;
+  {
+    std::lock_guard lock(f->mutex);
+    f->value = value;
+    for (auto it = f->waiters.begin(); it != f->waiters.end();) {
+      if (it->first <= value) {
+        fire.push_back(it->second);
+        it = f->waiters.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (HANDLE h : fire) set_guest_event(h);
+}
+
+FenceState* fence_of(void* object) { return static_cast<FenceState*>(static_cast<ProbeObject*>(object)->state); }
+
+// ID3D12Fence: 8 GetCompletedValue, 9 SetEventOnCompletion, 10 Signal
+uint64_t XBEM_GUEST_ABI fence_get_completed_value(ProbeObject* self) {
+  auto* f = static_cast<FenceState*>(self->state);
+  std::lock_guard lock(f->mutex);
+  return f->value;
+}
+HRESULT XBEM_GUEST_ABI fence_set_event_on_completion(ProbeObject* self, uint64_t value, HANDLE event) {
+  auto* f = static_cast<FenceState*>(self->state);
+  {
+    std::lock_guard lock(f->mutex);
+    if (f->value < value) {
+      if (event) f->waiters.emplace_back(value, event);
+      return S_OK;  // NULL event + not reached would block: values are always reached instantly here
+    }
+  }
+  set_guest_event(event);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI fence_signal_cpu(ProbeObject* self, uint64_t value) {
+  fence_signal(static_cast<FenceState*>(self->state), value);
+  return S_OK;
+}
+const ProbeVtable g_fence_vtable = make_vtable({{8, fn(&fence_get_completed_value)},
+                                                {9, fn(&fence_set_event_on_completion)},
+                                                {10, fn(&fence_signal_cpu)}});
+
+void* new_fence(const std::string& name, uint64_t initial) {
+  auto* state = new FenceState;
+  state->value = initial;
+  return make_probe_object(name, &g_fence_vtable, state);
+}
+
+bool is_fence(void* object) {
+  return object && static_cast<ProbeObject*>(object)->vtable == g_fence_vtable.data();
+}
+
+// ------------------------------------------------------- command queue
+
+// ID3D12CommandQueue: 10 ExecuteCommandLists, 14 Signal, 15 Wait, 16 GetTimestampFrequency
+void XBEM_GUEST_ABI queue_execute(ProbeObject* self, UINT count, void* const* lists) {
+  probe_log(self, 10, std::format("ExecuteCommandLists({} lists) - completed instantly (headless)", count),
+            XBEM_RETURN_ADDRESS());
+  (void)lists;
+}
+HRESULT XBEM_GUEST_ABI queue_signal(ProbeObject* self, void* fence, uint64_t value) {
+  probe_log(self, 14, std::format("Signal(fence, {})", value), XBEM_RETURN_ADDRESS());
+  if (is_fence(fence)) fence_signal(fence_of(fence), value);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI queue_wait(ProbeObject*, void*, uint64_t) { return S_OK; }
+HRESULT XBEM_GUEST_ABI queue_get_timestamp_frequency(ProbeObject*, uint64_t* frequency) {
+  if (frequency) *frequency = 100'000'000;  // 100 MHz GPU timestamps
+  return S_OK;
+}
+const ProbeVtable g_queue_vtable = make_vtable({{10, fn(&queue_execute)},
+                                                {14, fn(&queue_signal)},
+                                                {15, fn(&queue_wait)},
+                                                {16, fn(&queue_get_timestamp_frequency)}});
+
+// ------------------------------------------------------------ resource
+
+struct ResourceState {
+  uint8_t desc[56] = {};  // D3D12_RESOURCE_DESC
+  uint64_t gpu_va = 0;
+  uint64_t size = 0;
+  void* cpu = nullptr;
+  std::mutex mutex;
+};
+
+uint64_t resource_size(const uint8_t* desc) {
+  uint32_t dimension;
+  uint64_t width;
+  uint32_t height;
+  uint16_t depth;
+  std::memcpy(&dimension, desc, 4);
+  std::memcpy(&width, desc + 16, 8);
+  std::memcpy(&height, desc + 24, 4);
+  std::memcpy(&depth, desc + 28, 2);
+  if (dimension == 1) return width;  // BUFFER
+  // Textures: a generous bound (16 bytes per texel, all mips) without format tables.
+  const uint64_t texels = width * std::max<uint32_t>(height, 1) * std::max<uint16_t>(depth, 1);
+  return std::min<uint64_t>(texels * 16 * 2, 4ull << 30);
+}
+
+// ID3D12Resource: 8 Map, 9 Unmap, 10 GetDesc (hidden return), 11 GetGPUVirtualAddress
+HRESULT XBEM_GUEST_ABI resource_map(ProbeObject* self, UINT, const void*, void** data) {
+  auto* r = static_cast<ResourceState*>(self->state);
+  std::lock_guard lock(r->mutex);
+  if (!r->cpu) {
+    r->cpu = virtual_alloc(nullptr, std::max<uint64_t>(r->size, 1), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0);
+    if (!r->cpu) return E_OUTOFMEMORY;
+  }
+  if (data) *data = r->cpu;
+  return S_OK;
+}
+void XBEM_GUEST_ABI resource_unmap(ProbeObject*, UINT, const void*) {}
+void* XBEM_GUEST_ABI resource_get_desc(ProbeObject* self, uint8_t* out) {
+  std::memcpy(out, static_cast<ResourceState*>(self->state)->desc, 56);
+  return out;
+}
+uint64_t XBEM_GUEST_ABI resource_get_gpu_va(ProbeObject* self) { return static_cast<ResourceState*>(self->state)->gpu_va; }
+const ProbeVtable g_resource_vtable = make_vtable({{8, fn(&resource_map)},
+                                                   {9, fn(&resource_unmap)},
+                                                   {10, fn(&resource_get_desc)},
+                                                   {11, fn(&resource_get_gpu_va)}});
+
+void* new_resource(const std::string& name, const uint8_t* desc) {
+  auto* state = new ResourceState;
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), state->desc, 56);
+  state->size = resource_size(state->desc);
+  state->gpu_va = allocate_gpu_va(state->size);
+  return make_probe_object(name, &g_resource_vtable, state);
+}
+
+// ----------------------------------------------------- descriptor heap
+
+struct DescriptorHeapState {
+  uint8_t desc[16] = {};  // D3D12_DESCRIPTOR_HEAP_DESC
+  uint64_t cpu = 0;
+  uint64_t gpu = 0;
+};
+constexpr uint32_t kDescriptorSize = 32;
+
+// ID3D12DescriptorHeap: 8 GetDesc, 9 GetCPUDescriptorHandleForHeapStart, 10 GetGPU... (all hidden returns)
+void* XBEM_GUEST_ABI heap_get_desc(ProbeObject* self, uint8_t* out) {
+  std::memcpy(out, static_cast<DescriptorHeapState*>(self->state)->desc, 16);
+  return out;
+}
+uint64_t* XBEM_GUEST_ABI heap_get_cpu_start(ProbeObject* self, uint64_t* out) {
+  *out = static_cast<DescriptorHeapState*>(self->state)->cpu;
+  return out;
+}
+uint64_t* XBEM_GUEST_ABI heap_get_gpu_start(ProbeObject* self, uint64_t* out) {
+  *out = static_cast<DescriptorHeapState*>(self->state)->gpu;
+  return out;
+}
+const ProbeVtable g_heap_vtable = make_vtable({{8, fn(&heap_get_desc)},
+                                               {9, fn(&heap_get_cpu_start)},
+                                               {10, fn(&heap_get_gpu_start)}});
+
+// -------------------------------------------------------------- device
+
+std::atomic<int> g_object_counter{0};
+std::string child_name(const char* kind) { return std::format("d3d12.{}#{}", kind, g_object_counter.fetch_add(1)); }
+
+HRESULT create_into(void* object, void** out) {
+  if (!out) return E_POINTER;
+  *out = object;
+  return S_OK;
+}
+
+UINT XBEM_GUEST_ABI device_get_node_count(ProbeObject*) { return 1; }
+
+// 8 CreateCommandQueue(desc, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_command_queue(ProbeObject* self, const uint32_t* desc, const void*, void** out) {
+  probe_log(self, 8, std::format("CreateCommandQueue(type {})", desc ? desc[0] : 0), XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(child_name("queue"), &g_queue_vtable), out);
+}
+
+// 10 CreateGraphicsPipelineState(desc, riid, ppv): VS, PS, DS, HS, GS bytecode at +8
+HRESULT XBEM_GUEST_ABI device_create_graphics_pso(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
+  probe_log(self, 10, "CreateGraphicsPipelineState", XBEM_RETURN_ADDRESS());
+  static const char* kStages[] = {"vs", "ps", "ds", "hs", "gs"};
+  if (desc)
+    for (int i = 0; i < 5; ++i) {
+      uint64_t bc[2] = {};
+      if (platform::safe_read(reinterpret_cast<uint64_t>(desc) + 8 + i * 16, bc, 16)) capture_shader(kStages[i], bc[0], bc[1]);
+    }
+  return create_into(make_probe_object(child_name("pso")), out);
+}
+
+// 11 CreateComputePipelineState(desc, riid, ppv): CS bytecode at +8
+HRESULT XBEM_GUEST_ABI device_create_compute_pso(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
+  probe_log(self, 11, "CreateComputePipelineState", XBEM_RETURN_ADDRESS());
+  uint64_t bc[2] = {};
+  if (desc && platform::safe_read(reinterpret_cast<uint64_t>(desc) + 8, bc, 16)) capture_shader("cs", bc[0], bc[1]);
+  return create_into(make_probe_object(child_name("pso")), out);
+}
+
+// 13 CheckFeatureSupport(feature, data, size): report "not supported" values (zeros).
+HRESULT XBEM_GUEST_ABI device_check_feature_support(ProbeObject* self, uint32_t feature, void* data, UINT size) {
+  probe_log(self, 13, std::format("CheckFeatureSupport(feature {}, {} bytes) -> zeros", feature, size),
+            XBEM_RETURN_ADDRESS());
+  if (data && size <= 4096) platform::safe_write(reinterpret_cast<uint64_t>(data), std::vector<uint8_t>(size).data(), size);
+  return S_OK;
+}
+
+// 14 CreateDescriptorHeap(desc, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
+  auto* state = new DescriptorHeapState;
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), state->desc, 16);
+  uint32_t count = 0;
+  std::memcpy(&count, state->desc + 4, 4);
+  const uint64_t bytes = std::max<uint64_t>(count, 1) * kDescriptorSize;
+  state->cpu = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
+  state->gpu = allocate_gpu_va(bytes);
+  probe_log(self, 14, std::format("CreateDescriptorHeap({} descriptors)", count), XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(child_name("descriptor_heap"), &g_heap_vtable, state), out);
+}
+
+UINT XBEM_GUEST_ABI device_get_descriptor_increment(ProbeObject*, uint32_t) { return kDescriptorSize; }
+
+// 27 CreateCommittedResource(heapProps, flags, desc, state, clear, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_committed_resource(ProbeObject* self, const void*, uint32_t, const uint8_t* desc,
+                                                        uint32_t, const void*, const void*, void** out) {
+  probe_log(self, 27, "CreateCommittedResource", XBEM_RETURN_ADDRESS());
+  return create_into(new_resource(child_name("resource"), desc), out);
+}
+// 29 CreatePlacedResource(heap, offset, desc, state, clear, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_placed_resource(ProbeObject* self, void*, uint64_t, const uint8_t* desc, uint32_t,
+                                                     const void*, const void*, void** out) {
+  probe_log(self, 29, "CreatePlacedResource", XBEM_RETURN_ADDRESS());
+  return create_into(new_resource(child_name("resource"), desc), out);
+}
+// 30 CreateReservedResource(desc, state, clear, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_reserved_resource(ProbeObject* self, const uint8_t* desc, uint32_t, const void*,
+                                                       const void*, void** out) {
+  probe_log(self, 30, "CreateReservedResource", XBEM_RETURN_ADDRESS());
+  return create_into(new_resource(child_name("resource"), desc), out);
+}
+// 36 CreateFence(initial, flags, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_fence(ProbeObject* self, uint64_t initial, uint32_t, const void*, void** out) {
+  probe_log(self, 36, std::format("CreateFence(initial {})", initial), XBEM_RETURN_ADDRESS());
+  return create_into(new_fence(child_name("fence"), initial), out);
+}
+HRESULT XBEM_GUEST_ABI device_get_removed_reason(ProbeObject*) { return S_OK; }
+
+const ProbeVtable g_device_vtable = make_vtable({
+    {7, fn(&device_get_node_count)},
+    {8, fn(&device_create_command_queue)},
+    {10, fn(&device_create_graphics_pso)},
+    {11, fn(&device_create_compute_pso)},
+    {13, fn(&device_check_feature_support)},
+    {14, fn(&device_create_descriptor_heap)},
+    {15, fn(&device_get_descriptor_increment)},
+    {27, fn(&device_create_committed_resource)},
+    {29, fn(&device_create_placed_resource)},
+    {30, fn(&device_create_reserved_resource)},
+    {36, fn(&device_create_fence)},
+    {37, fn(&device_get_removed_reason)},
+});
+
+}  // namespace
+
+void* create_headless_d3d12_device() {
+  static void* device = make_probe_object("d3d12.device", &g_device_vtable);
+  return device;
+}
+
+}  // namespace xbem::hle

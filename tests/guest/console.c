@@ -60,6 +60,9 @@ IMP WCHAR* SysAllocString(const WCHAR*);
 IMP void SysFreeString(WCHAR*);
 IMP uint32_t SysStringLen(const WCHAR*);
 
+/* d3d12_xs.dll */
+IMP HRESULT D3D12XboxCreateDevice(void* adapter, const void* params, const void* iid, void** device);
+
 /* xcrdapi.dll */
 IMP HRESULT DStorageGetFactory(const void* iid, void** factory);
 
@@ -357,9 +360,69 @@ static void test_dstorage_probe(void) {
   CHECK(((ProbeSet)(*(void***)queue)[5])(queue, 7) == 0);
 }
 
+/* ------------------------------------------------- headless D3D12 */
+
+typedef void** Vt;
+#define VT(o) (*(Vt*)(o))
+typedef HRESULT (*CreateFenceFn)(void*, uint64_t, uint32_t, const void*, void**);
+typedef HRESULT (*CreateQueueFn)(void*, const void*, const void*, void**);
+typedef HRESULT (*QueueSignalFn)(void*, void*, uint64_t);
+typedef uint64_t (*FenceValueFn)(void*);
+typedef HRESULT (*FenceEventFn)(void*, uint64_t, HANDLE);
+typedef HRESULT (*CreateCommittedFn)(void*, const void*, uint32_t, const void*, uint32_t, const void*, const void*, void**);
+typedef HRESULT (*MapFn)(void*, uint32_t, const void*, void**);
+typedef uint64_t (*GpuVaFn)(void*);
+typedef HRESULT (*CreateComputePsoFn)(void*, const void*, const void*, void**);
+typedef HRESULT (*CreateHeapFn)(void*, const void*, const void*, void**);
+typedef uint64_t* (*HeapStartFn)(void*, uint64_t*);
+
+static void test_headless_d3d12(void) {
+  static const uint8_t iid[16] = {0x7d, 0x12};
+  void* device = 0;
+  CHECK(D3D12XboxCreateDevice(0, 0, iid, &device) == 0 && device);
+
+  void* fence = 0;
+  CHECK(((CreateFenceFn)VT(device)[36])(device, 1, 0, iid, &fence) == 0 && fence);
+  CHECK(((FenceValueFn)VT(fence)[8])(fence) == 1);
+  static const uint32_t queue_desc[4] = {0};
+  void* queue = 0;
+  CHECK(((CreateQueueFn)VT(device)[8])(device, queue_desc, iid, &queue) == 0 && queue);
+  HANDLE ev = CreateEventW(0, 1, 0, 0);
+  CHECK(((FenceEventFn)VT(fence)[9])(fence, 5, ev) == 0);
+  CHECK(WaitForSingleObject(ev, 0) == WAIT_TIMEOUT);
+  CHECK(((QueueSignalFn)VT(queue)[14])(queue, fence, 5) == 0); /* GPU work "completes" at once */
+  CHECK(((FenceValueFn)VT(fence)[8])(fence) == 5);
+  CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+
+  /* D3D12_RESOURCE_DESC: buffer of 4096 bytes */
+  uint8_t desc[56] = {0};
+  desc[0] = 1;
+  *(uint64_t*)(desc + 16) = 4096;
+  void* buffer = 0;
+  CHECK(((CreateCommittedFn)VT(device)[27])(device, 0, 0, desc, 0, 0, iid, &buffer) == 0 && buffer);
+  uint8_t* mapped = 0;
+  CHECK(((MapFn)VT(buffer)[8])(buffer, 0, 0, (void**)&mapped) == 0 && mapped);
+  mapped[4095] = 0x42;
+  CHECK(((GpuVaFn)VT(buffer)[11])(buffer) != 0);
+
+  /* D3D12_DESCRIPTOR_HEAP_DESC: 64 descriptors; handle returned through a hidden pointer */
+  static const uint32_t heap_desc[4] = {0, 64, 1, 0};
+  void* heap = 0;
+  CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc, iid, &heap) == 0 && heap);
+  uint64_t start = 0;
+  CHECK(((HeapStartFn)VT(heap)[9])(heap, &start) == &start && start != 0);
+
+  /* Compute pipeline: the shader binary is captured (--dump-shaders) */
+  static const uint8_t shader[32] = {'X', 'B', 'E', 'M', 's', 'h', 'a', 'd', 'e', 'r'};
+  const void* pso_desc[3] = {0, shader, (void*)(uintptr_t)sizeof shader};
+  void* pso = 0;
+  CHECK(((CreateComputePsoFn)VT(device)[11])(device, pso_desc, iid, &pso) == 0 && pso);
+}
+
 DWORD guest_main(void* peb) {
   (void)peb;
   test_xmem();
+  test_headless_d3d12();
   test_dstorage_probe();
   test_gameinput();
   test_locale();

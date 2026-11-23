@@ -40,6 +40,7 @@ add_library(xbem_core STATIC
   hle/ucrt_misc.cpp
   hle/xgameruntime.cpp
   hle/d3d12.cpp
+  hle/d3d12_device.cpp
 
   runtime/objects.cpp
   runtime/vfs.cpp

@@ -5,6 +5,7 @@
 // E_NOTIMPL, which lets a title reach - and report - its graphics init.
 
 #include "gpu/backend.h"
+#include "hle/d3d12_device.h"
 #include "hle/discovery.h"
 #include "hle/hle_util.h"
 
@@ -13,23 +14,27 @@ namespace {
 
 using namespace win;
 
-HRESULT device_unavailable(const char* function) {
-  const gpu::BackendInfo info = gpu::active_backend().info();
-  XBEM_WARN("d3d12", "{}: GPU backend '{}' cannot create devices -> DXGI_ERROR_UNSUPPORTED ({})", function, info.name,
-            info.notes);
-  return DXGI_ERROR_UNSUPPORTED;
-}
 
 // HRESULT D3D12XboxCreateDevice(IGraphicsUnknown* adapter, const D3D12XBOX_CREATE_DEVICE_PARAMETERS*, REFIID, void**)
-HRESULT XBEM_GUEST_ABI hle_D3D12XboxCreateDevice(void*, const void*, const void*, void** device) {
-  if (device) *device = nullptr;
-  return device_unavailable("D3D12XboxCreateDevice");
+// Without a rendering backend the title gets the headless device: GPU work
+// completes instantly and nothing is drawn, so its CPU side keeps running.
+HRESULT headless_device(const char* function, const void* params, void** device) {
+  const gpu::BackendInfo info = gpu::active_backend().info();
+  XBEM_WARN("d3d12", "{}: GPU backend '{}' cannot render - using the HEADLESS device (GPU work completes "
+            "instantly, nothing is drawn)", function, info.name);
+  if (params) XBEM_INFO("d3d12", "{} parameters: {}", function, describe_arg(reinterpret_cast<uint64_t>(params)));
+  if (!device) return E_POINTER;
+  *device = create_headless_d3d12_device();
+  return S_OK;
+}
+
+HRESULT XBEM_GUEST_ABI hle_D3D12XboxCreateDevice(void*, const void* params, const void*, void** device) {
+  return headless_device("D3D12XboxCreateDevice", params, device);
 }
 
 // HRESULT D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL, REFIID, void**)
 HRESULT XBEM_GUEST_ABI hle_D3D12CreateDevice(void*, uint32_t, const void*, void** device) {
-  if (device) *device = nullptr;
-  return device_unavailable("D3D12CreateDevice");
+  return headless_device("D3D12CreateDevice", nullptr, device);
 }
 
 HRESULT XBEM_GUEST_ABI hle_D3D12GetDebugInterface(const void*, void** out) {
@@ -70,7 +75,7 @@ ModuleDef make_d3d12_module() {
   m.aliases = {"d3d12_x.dll", "d3d12.dll"};
   m.description = "Direct3D 12 (D3D12.X): device creation routed to the GPU backend (null for now)";
   m.exports = {
-      XBEM_HLE_STUB(D3D12XboxCreateDevice),   XBEM_HLE_STUB(D3D12CreateDevice),
+      XBEM_HLE(D3D12XboxCreateDevice),        XBEM_HLE(D3D12CreateDevice),
       XBEM_HLE_STUB(D3D12GetDebugInterface),  XBEM_HLE_STUB(D3D12SerializeRootSignature),
       XBEM_HLE_STUB(D3D12SerializeVersionedRootSignature), XBEM_HLE(D3D12ConfigureVirtualMemoryX),
       XBEM_HLE_STUB(D3D12CreateRootSignatureDeserializer),

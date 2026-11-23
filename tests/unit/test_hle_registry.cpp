@@ -27,7 +27,7 @@ TEST(registry_export_lookup) {
   CHECK(l.exp != nullptr && l.exp->address != nullptr);
   CHECK(reg.find("kernelx.dll", "NoSuchExport").exp == nullptr);
   auto d = reg.find("d3d12_xs.dll", "D3D12XboxCreateDevice");
-  CHECK(d.exp != nullptr && d.exp->kind == hle::ExportKind::Stub);
+  CHECK(d.exp != nullptr && d.exp->kind == hle::ExportKind::Implemented);  // headless device
   auto x = reg.find("xgameruntime.dll", "XTaskQueueCreate");
   CHECK(x.exp != nullptr && x.exp->kind == hle::ExportKind::Implemented);
 }
