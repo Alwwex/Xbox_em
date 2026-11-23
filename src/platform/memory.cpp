@@ -56,6 +56,11 @@ bool map_shared(uint64_t, size_t, Prot, intptr_t, uint64_t) { return false; }
 bool remap_anonymous(uint64_t, size_t, Prot) { return false; }
 bool discard_shared(intptr_t, uint64_t, size_t) { return false; }
 
+bool safe_write(uint64_t address, const void* data, size_t size) {
+  SIZE_T done = 0;
+  return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), data, size, &done) && done == size;
+}
+
 bool safe_read(uint64_t address, void* out, size_t size) {
   SIZE_T done = 0;
   return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), out, size, &done) &&
@@ -150,6 +155,12 @@ bool remap_anonymous(uint64_t address, size_t size, Prot prot) {
 bool discard_shared(intptr_t memory, uint64_t offset, size_t size) {
   return fallocate(static_cast<int>(memory), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
                    static_cast<off_t>(size)) == 0;
+}
+
+bool safe_write(uint64_t address, const void* data, size_t size) {
+  iovec local{const_cast<void*>(data), size};
+  iovec remote{reinterpret_cast<void*>(address), size};
+  return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
 }
 
 bool safe_read(uint64_t address, void* out, size_t size) {

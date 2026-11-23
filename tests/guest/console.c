@@ -60,6 +60,9 @@ IMP WCHAR* SysAllocString(const WCHAR*);
 IMP void SysFreeString(WCHAR*);
 IMP uint32_t SysStringLen(const WCHAR*);
 
+/* xcrdapi.dll */
+IMP HRESULT DStorageGetFactory(const void* iid, void** factory);
+
 /* gameinput.dll (ordinal 1) */
 IMP HRESULT GameInputCreate(void** game_input);
 
@@ -336,9 +339,28 @@ static void test_gameinput(void) {
   ((Release)vt[2])(gi);
 }
 
+/* ------------------------------------------------- DirectStorage probe */
+
+static const uint8_t kFactoryIid[16] = {0x11, 0x9d, 0x95, 0x62};
+static const uint8_t kQueueIid[16] = {0x22, 0x33};
+typedef HRESULT (*ProbeCreate)(void*, const void*, const void*, void**);
+typedef HRESULT (*ProbeSet)(void*, uint64_t);
+
+static void test_dstorage_probe(void) {
+  void* factory = 0;
+  CHECK(DStorageGetFactory(kFactoryIid, &factory) == 0 && factory);
+  void** vt = *(void***)factory;
+  void* queue = 0;
+  static const uint8_t desc[32] = {1, 2, 3};
+  CHECK(((ProbeCreate)vt[3])(factory, desc, kQueueIid, &queue) == 0 && queue && queue != factory);
+  CHECK(((ProbeSet)vt[8])(factory, 0x2000000) == 0);
+  CHECK(((ProbeSet)(*(void***)queue)[5])(queue, 7) == 0);
+}
+
 DWORD guest_main(void* peb) {
   (void)peb;
   test_xmem();
+  test_dstorage_probe();
   test_gameinput();
   test_locale();
   test_time();

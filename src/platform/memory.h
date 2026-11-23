@@ -24,6 +24,8 @@ bool unmap(void* address, size_t size);
 // Copies `size` bytes from `address` without faulting if it is not mapped.
 // Used to log the contents of guest pointers of unknown validity.
 bool safe_read(uint64_t address, void* out, size_t size);
+// Writes without faulting if the destination is not mapped writable.
+bool safe_write(uint64_t address, const void* data, size_t size);
 bool protect(void* address, size_t size, Prot prot);
 
 // Drops the contents of committed pages and makes them inaccessible, keeping

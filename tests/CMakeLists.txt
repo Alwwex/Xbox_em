@@ -49,7 +49,7 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -107,7 +107,7 @@ endforeach()
 # Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
 find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
 if(XBEM_MINGW_WINDRES)
-  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput)
+  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi)
   set(CONSOLE_DEPS)
   foreach(lib ${CONSOLE_LIBS})
     list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)
@@ -222,7 +222,9 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_trace_hle COMMAND run ${GOUT}/seh.exe --trace-hle
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
-    xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe EXPECT "PASS console")
+    xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe
+                    EXPECT "PASS console" "dstorage.factory::method3\\(.*created dstorage.factory.m3"
+                           "dstorage.factory.m3::method5\\(0x7")
   endif()
   if(Python3_Interpreter_FOUND)
     add_test(NAME guest_thread_dump
