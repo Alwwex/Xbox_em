@@ -84,7 +84,16 @@ struct Reservation {
   uint64_t caller = 0;      // guest return address of the allocating call
   DWORD commit_protect = 0; // last commit / VirtualProtect
   uint64_t commit_caller = 0;
+  // Placeholders (MEM_RESERVE_PLACEHOLDER): reserved address space that can be
+  // split, coalesced and replaced by an allocation or a mapped view.
+  bool placeholder = false;
+  bool replaced_placeholder = false;  // an allocation made in a placeholder
 };
+
+constexpr DWORD MEM_COALESCE_PLACEHOLDERS = 0x1;
+constexpr DWORD MEM_PRESERVE_PLACEHOLDER = 0x2;
+constexpr DWORD MEM_REPLACE_PLACEHOLDER = 0x4000;  // VirtualAlloc2 / MapViewOfFile3
+constexpr DWORD MEM_RESERVE_PLACEHOLDER = 0x40000;
 
 std::mutex g_vm_mutex;
 std::map<uint64_t, Reservation> g_reservations;  // keyed by base address
@@ -121,6 +130,7 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
     return nullptr;
   }
   constexpr DWORD kKnown = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_LARGE_PAGES |
+                           MEM_REPLACE_PLACEHOLDER | MEM_RESERVE_PLACEHOLDER |
                            0x200000 /*MEM_WRITE_WATCH*/ | 0x400000 /*MEM_PHYSICAL*/ | 0x80000000u /*MEM_4MB_PAGES*/;
   if (alignment == 0) {
     // Large-page allocations come back aligned to their page size on the console.
@@ -146,6 +156,30 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
   const Prot prot = commit ? to_prot(protect) : Prot::None;
 
   std::lock_guard lock(g_vm_mutex);
+  if (type & MEM_REPLACE_PLACEHOLDER) {
+    // The allocation takes the place of exactly one placeholder.
+    auto it = g_reservations.find(addr);
+    if (!address || it == g_reservations.end() || !it->second.placeholder ||
+        it->second.size != platform::align_up(size, ps)) {
+      XBEM_WARN("kernelx", "VirtualAlloc({:#x}, {:#x}, MEM_REPLACE_PLACEHOLDER) does not match a placeholder", addr,
+                size);
+      set_last_error(ERROR_INVALID_ADDRESS);
+      return nullptr;
+    }
+    if (commit && !platform::protect(address, it->second.size, prot)) {
+      set_last_error(ERROR_INVALID_ADDRESS);
+      return nullptr;
+    }
+    Reservation& r = it->second;
+    r.placeholder = false;
+    r.replaced_placeholder = true;
+    r.protect = protect;
+    r.type = type;
+    r.caller = caller;
+    r.commit_protect = commit ? protect : 0;
+    r.commit_caller = commit ? caller : 0;
+    return address;
+  }
   if ((type & MEM_RESERVE) || !address) {
     void* p;
     uint64_t base, length;
@@ -162,7 +196,9 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
       set_last_error(address ? ERROR_INVALID_ADDRESS : ERROR_NOT_ENOUGH_MEMORY);
       return nullptr;
     }
-    g_reservations[base] = Reservation{length, protect, type, caller, commit ? protect : 0, commit ? caller : 0};
+    Reservation r{length, protect, type, caller, commit ? protect : 0, commit ? caller : 0};
+    r.placeholder = (type & MEM_RESERVE_PLACEHOLDER) != 0;
+    g_reservations[base] = r;
     XBEM_TRACE("kernelx", "VirtualAlloc reserve {:#x} +{:#x} commit={}", base, length, commit);
     return p;
   }
@@ -190,12 +226,94 @@ void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DW
   return virtual_alloc(address, size, type, protect, 0, XBEM_RETURN_ADDRESS());
 }
 
+// Splits the placeholder at `it` so that [start, start + size) becomes a
+// placeholder of its own.
+bool split_placeholder(std::map<uint64_t, Reservation>::iterator it, uint64_t start, uint64_t size) {
+  const uint64_t base = it->first, end = base + it->second.size;
+  if (start < base || start + size > end || size == 0) return false;
+  Reservation piece = it->second;
+  if (start + size < end) {
+    Reservation tail = piece;
+    tail.size = end - (start + size);
+    g_reservations[start + size] = tail;
+  }
+  if (start > base) {
+    it->second.size = start - base;
+    piece.size = size;
+    g_reservations[start] = piece;
+  } else {
+    it->second.size = size;
+  }
+  return true;
+}
+
+// Merges the placeholders exactly covering [start, start + size) into one.
+bool coalesce_placeholders(uint64_t start, uint64_t size) {
+  auto first = g_reservations.find(start);
+  if (first == g_reservations.end()) return false;
+  uint64_t cursor = start;
+  auto it = first;
+  while (cursor < start + size) {
+    if (it == g_reservations.end() || it->first != cursor || !it->second.placeholder) return false;
+    cursor += it->second.size;
+    ++it;
+  }
+  if (cursor != start + size) return false;
+  first->second.size = size;
+  g_reservations.erase(std::next(first), it);
+  return true;
+}
+
+// PVOID VirtualAlloc2(HANDLE process, PVOID base, SIZE_T size, ULONG type, ULONG protect,
+//                     MEM_EXTENDED_PARAMETER* params, ULONG count)
+void* XBEM_GUEST_ABI hle_VirtualAlloc2(HANDLE process, void* address, SIZE_T size, DWORD type, DWORD protect,
+                                      const uint64_t* params, DWORD count) {
+  uint64_t alignment = 0;
+  if (process && process != kCurrentProcessPseudo)
+    XBEM_WARN_ONCE("kernelx", "VirtualAlloc2 for another process ({:#x}) - allocating in this one", process);
+  for (DWORD i = 0; params && i < count; ++i) {
+    const uint64_t kind = params[i * 2] & 0xFF;
+    if (kind == 1 /*MemExtendedParameterAddressRequirements*/ && params[i * 2 + 1]) {
+      // MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress, HighestEndingAddress, Alignment }
+      alignment = reinterpret_cast<const uint64_t*>(params[i * 2 + 1])[2];
+    } else if (kind != 0) {
+      XBEM_WARN_ONCE("kernelx", "VirtualAlloc2: extended parameter type {} ignored", kind);
+    }
+  }
+  return virtual_alloc(address, size, type, protect, alignment, XBEM_RETURN_ADDRESS());
+}
+
 BOOL XBEM_GUEST_ABI hle_VirtualFree(void* address, SIZE_T size, DWORD type) {
   const auto addr = reinterpret_cast<uint64_t>(address);
   std::lock_guard lock(g_vm_mutex);
+  if ((type & MEM_RELEASE) && (type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS))) {
+    auto it = find_reservation(addr);
+    bool ok = false;
+    if (it != g_reservations.end()) {
+      Reservation& r = it->second;
+      if (type & MEM_COALESCE_PLACEHOLDERS) {
+        ok = coalesce_placeholders(addr, size);
+      } else if (r.placeholder) {
+        ok = split_placeholder(it, addr, size);
+      } else if (r.replaced_placeholder && addr == it->first && (size == 0 || size == r.size)) {
+        // Back to a placeholder: drop the contents (and any mapped view).
+        ok = platform::remap_anonymous(addr, r.size, Prot::None);
+        r.placeholder = true;
+        r.replaced_placeholder = false;
+        r.commit_protect = 0;
+      }
+    }
+    if (!ok) {
+      XBEM_WARN("kernelx", "VirtualFree({:#x}, {:#x}, {:#x}): no matching placeholder", addr, size, type);
+      set_last_error(ERROR_INVALID_PARAMETER);
+      return FALSE;
+    }
+    return TRUE;
+  }
   if (type & MEM_RELEASE) {
     auto it = g_reservations.find(addr);
     if (size != 0 || it == g_reservations.end()) {
+      XBEM_WARN("kernelx", "VirtualFree({:#x}, {:#x}, MEM_RELEASE): not the base of an allocation", addr, size);
       set_last_error(ERROR_INVALID_PARAMETER);
       return FALSE;
     }
@@ -258,9 +376,15 @@ SIZE_T XBEM_GUEST_ABI hle_VirtualQuery(const void* address, uint8_t* mbi, SIZE_T
     if (auto it = find_reservation(addr); it != g_reservations.end()) {
       alloc_base = it->first;
       region = it->first + it->second.size - base;
-      state = MEM_COMMIT;
-      prot = alloc_prot = it->second.protect ? it->second.protect : PAGE_READWRITE;
       kind = MEM_PRIVATE;
+      if (it->second.placeholder) {
+        state = MEM_RESERVE;
+        prot = 0;
+        alloc_prot = PAGE_NOACCESS;
+      } else {
+        state = MEM_COMMIT;
+        prot = alloc_prot = it->second.protect ? it->second.protect : PAGE_READWRITE;
+      }
     }
   }
   if (state == MEM_FREE) {
@@ -382,7 +506,7 @@ uint64_t default_process_heap() { return reinterpret_cast<uint64_t>(&g_default_h
 
 void add_kernelx_memory_exports(std::vector<ExportDef>& out) {
   out.insert(out.end(), {
-      XBEM_HLE(VirtualAlloc), XBEM_HLE(VirtualFree), XBEM_HLE(VirtualProtect), XBEM_HLE(VirtualQuery),
+      XBEM_HLE(VirtualAlloc), XBEM_HLE(VirtualAlloc2), XBEM_HLE(VirtualFree), XBEM_HLE(VirtualProtect), XBEM_HLE(VirtualQuery),
       XBEM_HLE(GetProcessHeap), XBEM_HLE(HeapCreate), XBEM_HLE(HeapDestroy), XBEM_HLE(HeapAlloc),
       XBEM_HLE(HeapFree), XBEM_HLE(HeapReAlloc), XBEM_HLE(HeapSize), XBEM_HLE(HeapValidate),
       XBEM_HLE(HeapSetInformation), XBEM_HLE(HeapLock), XBEM_HLE(HeapUnlock), XBEM_HLE(HeapCompact),

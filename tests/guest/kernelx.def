@@ -105,3 +105,5 @@ EXPORTS
   FlushProcessWriteBuffers
   LocalFree
   InitializeProcThreadAttributeList
+  VirtualQuery
+  VirtualAlloc2

@@ -37,6 +37,8 @@ IMP HANDLE OpenThread(DWORD, BOOL, DWORD);
 IMP void FlushProcessWriteBuffers(void);
 IMP void* LocalFree(void*);
 IMP BOOL InitializeProcThreadAttributeList(void*, DWORD, DWORD, size_t*);
+IMP size_t VirtualQuery(const void*, void*, size_t);
+IMP void* VirtualAlloc2(HANDLE, void*, size_t, DWORD, DWORD, void*, DWORD);
 
 /* ws2_32.dll (by ordinal) */
 IMP uint16_t htons(uint16_t);
@@ -119,6 +121,31 @@ static void test_xmem(void) {
   CHECK(XMemMapPhysicalPages(va, 1, 0) == va); /* unmap */
   CHECK(XMemFreePhysicalPages(1, pages) >= 0);
   CHECK(VirtualFree(va, 0, MEM_RELEASE));
+
+  /* Placeholders: reserve, split, replace with an allocation, turn back into a
+   * placeholder, coalesce, release (the pattern GTA-engine descriptor heaps use). */
+  enum { RESERVE_PH = 0x40000, REPLACE_PH = 0x4000, PRESERVE_PH = 0x2, COALESCE_PH = 0x1 };
+  uint8_t* ph = XMemVirtualAlloc(0, 0x300000, MEM_RESERVE | RESERVE_PH, 0x7, 0x1 /*PAGE_NOACCESS*/);
+  CHECK(ph != 0);
+  CHECK(!VirtualFree(ph, 0x100000, MEM_RELEASE)); /* partial release without PRESERVE fails */
+  CHECK(VirtualFree(ph, 0x100000, MEM_RELEASE | PRESERVE_PH));
+  CHECK(VirtualFree(ph + 0x100000, 0x100000, MEM_RELEASE | PRESERVE_PH));
+  uint64_t mbi[6];
+  CHECK(VirtualQuery(ph + 0x100000, mbi, sizeof mbi) == 48);
+  CHECK((DWORD)mbi[4] == MEM_RESERVE);
+  CHECK(VirtualAlloc(ph + 0x100000, 0x100000, MEM_RESERVE | MEM_COMMIT | REPLACE_PH, PAGE_READWRITE) == ph + 0x100000);
+  ph[0x100000 + 0x42] = 9;
+  CHECK(ph[0x100042] == 9);
+  CHECK(!VirtualAlloc(ph + 0x100000, 0x100000, MEM_RESERVE | REPLACE_PH, 0x1)); /* no longer a placeholder */
+  CHECK(VirtualFree(ph + 0x100000, 0, MEM_RELEASE | PRESERVE_PH));
+  uint64_t req[3] = {0, 0, 0x400000}; /* MEM_ADDRESS_REQUIREMENTS: 4 MiB alignment */
+  uint64_t ext[2] = {1, (uint64_t)(uintptr_t)req};
+  uint8_t* aligned = VirtualAlloc2(0, 0, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, ext, 1);
+  CHECK(aligned && ((uintptr_t)aligned & 0x3FFFFF) == 0);
+  CHECK(VirtualFree(aligned, 0, MEM_RELEASE));
+  CHECK(VirtualFree(ph, 0x200000, MEM_RELEASE | COALESCE_PH)); /* merging a subset */
+  CHECK(VirtualFree(ph, 0x300000, MEM_RELEASE | COALESCE_PH));
+  CHECK(VirtualFree(ph, 0, MEM_RELEASE));
 }
 
 /* --------------------------------------------------------------- locale */
