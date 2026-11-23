@@ -593,7 +593,9 @@ ModuleDef make_kernelx_module() {
   m.name = "kernelx.dll";
   // The console's kernel DLL. The PC names are aliases so the same code can
   // also serve PC GDK builds and test programs.
-  m.aliases = {"kernel32.dll", "kernelbase.dll"};
+  // advapi32's registry and event-tracing functions forward to kernelbase on
+  // current Windows; serving them from here keeps one implementation.
+  m.aliases = {"kernel32.dll", "kernelbase.dll", "advapi32.dll", "ole32.dll", "combase.dll"};
   m.description = "Kernel/Win32 base API (threads, sync, memory, files, modules, time)";
   m.exports = {
       XBEM_HLE(OutputDebugStringA), XBEM_HLE(OutputDebugStringW), XBEM_HLE(IsDebuggerPresent), XBEM_HLE(DebugBreak),
@@ -620,6 +622,8 @@ ModuleDef make_kernelx_module() {
       XBEM_HLE(InterlockedPopEntrySList), XBEM_HLE(InterlockedFlushSList), XBEM_HLE(QueryDepthSList),
   };
   add_kernelx_seh_exports(m.exports);
+  add_kernelx_system_exports(m.exports);
+  add_kernelx_threadpool_exports(m.exports);
   add_kernelx_memory_exports(m.exports);
   add_kernelx_sync_exports(m.exports);
   add_kernelx_file_exports(m.exports);

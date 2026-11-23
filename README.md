@@ -27,7 +27,7 @@ PC build z nějakého důvodu není možný.
 
 - **PE loader** pro x64 obrazy: mapování sekcí, relokace, importy (i podle ordinálu), exporty a forwardery, ochrany stránek, načítání DLL přibalených ke hře (statické i `LoadLibrary`), `DllMain`.
 - **Prostředí vlákna jako ve Windows**: emulovaný TEB/PEB přes segment `GS` (stejně jako Wine), implicitní TLS (`__declspec(thread)`), TLS callbacky, `TlsAlloc`/`FlsAlloc`, `GetLastError` přímo v TEB.
-- **HLE `kernelx.dll`** (~210 funkcí): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace. API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
+- **HLE `kernelx.dll`** (~330 funkcí, slouží i jako `advapi32`/`ole32`): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace, **thread pool** (práce, časovače, čekání, cleanup groups), registr (prázdný jako na konzoli), ETW, základ COM, WinRT řetězce a aktivace, `oleaut32` (BSTR) a `bcrypt` (náhodná čísla). API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
 - **Výjimky (SEH)**: `RaiseException`, `RtlUnwindEx`, `RtlVirtualUnwind`, `RtlCaptureContext` a spol. nad unwind daty hry (`.pdata`/`.xdata`). Funguje dvoufázové doručení, kolidující unwind, „consolidate“ mechanismus, kterým MSVC spouští `catch` bloky, vektorové handlery i `RtlCaptureStackBackTrace`. Ověřeno skutečnými C++ výjimkami (`throw`/`catch`, rethrow, výjimky ve vláknech). Neošetřená výjimka vypíše typ C++ výjimky a zásobník.
 - **C knihovna (UCRT)** (~660 funkcí za `api-ms-win-crt-*`, tedy to, co hry importují, ale nepřibalují): start/ukončení programu, `atexit`, `errno`, `malloc` a zarovnaná alokace, řetězce a wide řetězce (16bitový `wchar_t`), vlastní `printf`/`scanf` s Windows specifikátory (`%I64d`, `%ls`, …), `FILE` i `_open`/`_read` přes VFS (včetně CRLF v textovém režimu), matematika a `_controlfp`/`fenv`, čas, `qsort`, MSVC `rand()`, `_stat`/`_findfirst`, prostředí, „C“ locale. Pod jménem `msvcrt.dll` slouží i programům z MinGW.
 - **HLE `xgameruntime.dll`**: `XGameRuntimeInitialize`, `XSystemGetDeviceType` (Series X / Series S / devkit), `XPackage*`, kompletní **XTaskQueue** (režimy Manual / Immediate / ThreadPool). `XUser`, `XGameSave`, `XStore` atd. zatím vracejí `E_NOTIMPL`.
@@ -37,7 +37,7 @@ PC build z nějakého důvodu není možný.
 - **Komunikace PC ↔ konzole**: [`tools/xbdp`](tools/xbdp/xbdp.py) – klient Xbox Device Portalu (informace, balíčky, spuštění/ukončení aplikace, instalace, přenos souborů včetně rekurzivního stažení loose buildu, screenshot). Viz [docs/DEVKIT.md](docs/DEVKIT.md).
 
 Všechno výše je pokryté testy: 36 unit testů, 8 testů devkit klienta proti
-mock serveru a 17 integračních testů, které spouští **skutečné Windows PE
+mock serveru a 18 integračních testů, které spouští **skutečné Windows PE
 binárky** (sestavené MinGW) importující z `kernelx.dll`, `xgameruntime.dll`
 a `api-ms-win-crt-*`, včetně C++ programu s výjimkami a `libstdc++`.
 

@@ -49,7 +49,7 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -73,9 +73,13 @@ add_custom_command(
   COMMENT "Guest DLL plugin.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
+  if(prog STREQUAL "system")
+    set(extra_libs -ladvapi32 -lbcrypt -loleaut32 -lkernelx)
+    list(APPEND extra_deps ${GOUT}/libadvapi32.a ${GOUT}/libbcrypt.a ${GOUT}/liboleaut32.a)
+  endif()
   if(prog STREQUAL "dlls")
     set(extra_libs -lgamelib -lkernelx)
     list(APPEND extra_deps ${GOUT}/libgamelib.a ${GOUT}/plugin.dll)
@@ -176,6 +180,7 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "XbemDefinitelyMissing \\(strict mode\\)")
   xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
   xbem_guest_test(guest_crt COMMAND run ${GOUT}/crt.exe EXPECT "PASS crt")
+  xbem_guest_test(guest_system COMMAND run ${GOUT}/system.exe EXPECT "PASS system")
   if(XBEM_MINGW_CXX)
     xbem_guest_test(guest_cpp_exceptions COMMAND run ${GOUT}/cpp_exceptions.exe EXPECT "PASS cpp_exceptions")
   endif()

@@ -27,6 +27,8 @@ Registry::Registry() {
   modules_.push_back(make_xgameruntime_module());
   modules_.push_back(make_d3d12_module());
   modules_.push_back(make_ucrt_module());
+  modules_.push_back(make_oleaut32_module());
+  modules_.push_back(make_bcrypt_module());
 
   export_index_.resize(modules_.size());
   for (size_t i = 0; i < modules_.size(); ++i) {

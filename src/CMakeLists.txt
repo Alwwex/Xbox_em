@@ -21,6 +21,8 @@ add_library(xbem_core STATIC
   hle/kernelx_sync.cpp
   hle/kernelx_file.cpp
   hle/kernelx_seh.cpp
+  hle/kernelx_system.cpp
+  hle/kernelx_threadpool.cpp
   hle/ucrt_runtime.cpp
   hle/ucrt_string.cpp
   hle/ucrt_stdio.cpp

@@ -59,12 +59,16 @@ ModuleDef make_kernelx_module();
 ModuleDef make_xgameruntime_module();
 ModuleDef make_d3d12_module();
 ModuleDef make_ucrt_module();
+ModuleDef make_oleaut32_module();
+ModuleDef make_bcrypt_module();
 
 // Pieces of kernelx implemented in separate files.
 void add_kernelx_memory_exports(std::vector<ExportDef>& out);
 void add_kernelx_sync_exports(std::vector<ExportDef>& out);
 void add_kernelx_file_exports(std::vector<ExportDef>& out);
 void add_kernelx_seh_exports(std::vector<ExportDef>& out);
+void add_kernelx_system_exports(std::vector<ExportDef>& out);
+void add_kernelx_threadpool_exports(std::vector<ExportDef>& out);
 
 // Handle value returned by GetProcessHeap() (also stored in the PEB).
 uint64_t default_process_heap();

@@ -94,6 +94,7 @@ IMP HRESULT XUserAddAsync(uint32_t options, void* async_block);
 /* guest_rt.c */
 void* memcpy(void* dst, const void* src, size_t n);
 void* memset(void* dst, int c, size_t n);
+int memcmp(const void* a, const void* b, size_t n);
 void say(const char* text);
 void say_num(const char* label, int64_t value);
 void check_failed(int line, const char* expr);

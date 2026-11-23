@@ -57,3 +57,29 @@ EXPORTS
   AddVectoredExceptionHandler
   RemoveVectoredExceptionHandler
   GetEnvironmentVariableA
+  CreateThreadpoolWork
+  SubmitThreadpoolWork
+  WaitForThreadpoolWorkCallbacks
+  CloseThreadpoolWork
+  CreateThreadpoolTimer
+  SetThreadpoolTimer
+  WaitForThreadpoolTimerCallbacks
+  CloseThreadpoolTimer
+  CreateThreadpoolWait
+  SetThreadpoolWait
+  WaitForThreadpoolWaitCallbacks
+  CloseThreadpoolWait
+  TrySubmitThreadpoolCallback
+  SetEventWhenCallbackReturns
+  CreateThreadpoolCleanupGroup
+  CloseThreadpoolCleanupGroupMembers
+  CloseThreadpoolCleanupGroup
+  WindowsCreateString
+  WindowsDeleteString
+  WindowsDuplicateString
+  WindowsGetStringRawBuffer
+  WindowsCompareStringOrdinal
+  CoCreateGuid
+  StringFromGUID2
+  CLSIDFromString
+  CoCreateInstance
