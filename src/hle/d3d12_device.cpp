@@ -17,6 +17,7 @@
 // log as calls with implausible arguments.
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <filesystem>
@@ -306,6 +307,81 @@ bool is_device_iid(const uint8_t* iid) {
   return false;
 }
 
+// ------------------------------------------------------------- DXGI
+//
+// Titles reach the display through the device: QueryInterface(IDXGIDevice)
+// -> GetAdapter -> EnumOutputs(0) -> GetDisplayModeList. One adapter, one
+// output, with 4K and 1080p modes at 60 and 120 Hz (what a TV offers a
+// Series X). Slot numbers follow dxgi.h; the console's DXGI_MODE_DESC is
+// 32 bytes (the title steps through the list in 32-byte strides).
+
+constexpr HRESULT DXGI_ERROR_NOT_FOUND = static_cast<HRESULT>(0x887A0002);
+constexpr HRESULT DXGI_ERROR_MORE_DATA = static_cast<HRESULT>(0x887A0003);
+
+// IDXGIOutput: 21 GetDisplayModeList(format, flags, UINT* count, DXGI_MODE_DESC* modes)
+HRESULT XBEM_GUEST_ABI output_get_display_mode_list(ProbeObject* self, uint32_t format, uint32_t flags, uint32_t* count,
+                                                    uint8_t* modes) {
+  struct Mode {
+    uint32_t width, height, refresh;
+  };
+  static const Mode kModes[] = {{3840, 2160, 60}, {3840, 2160, 120}, {1920, 1080, 60}, {1920, 1080, 120}};
+  constexpr uint32_t kStride = 32;
+  probe_log(self, 21, std::format("GetDisplayModeList(format {}, flags {:#x}, {})", format, flags,
+                                  modes ? "fill" : "count"),
+            XBEM_RETURN_ADDRESS());
+  if (!count) return E_INVALIDARG;
+  const uint32_t n = sizeof kModes / sizeof kModes[0];
+  if (!modes) {
+    *count = n;
+    return S_OK;
+  }
+  const uint32_t written = std::min(*count, n);
+  for (uint32_t i = 0; i < written; ++i) {
+    uint8_t* m = modes + i * kStride;
+    std::memset(m, 0, kStride);
+    const uint32_t fields[] = {kModes[i].width, kModes[i].height, kModes[i].refresh, 1,
+                               format ? format : 87u /*B8G8R8A8_UNORM*/, 1 /*progressive*/, 0};
+    std::memcpy(m, fields, sizeof fields);
+  }
+  *count = written;
+  return written < n ? DXGI_ERROR_MORE_DATA : S_OK;
+}
+const ProbeVtable g_output_vtable = make_vtable({{21, fn(&output_get_display_mode_list)}});
+
+// IDXGIAdapter: 7 EnumOutputs(index, IDXGIOutput**)
+HRESULT XBEM_GUEST_ABI adapter_enum_outputs(ProbeObject* self, uint32_t index, void** out) {
+  probe_log(self, 7, std::format("EnumOutputs({})", index), XBEM_RETURN_ADDRESS());
+  if (!out) return E_POINTER;
+  if (index != 0) {
+    *out = nullptr;
+    return DXGI_ERROR_NOT_FOUND;
+  }
+  static void* output = make_probe_object("dxgi.output", &g_output_vtable);
+  *out = output;
+  return S_OK;
+}
+const ProbeVtable g_adapter_vtable = make_vtable({{7, fn(&adapter_enum_outputs)}});
+
+// IDXGIDevice: 7 GetAdapter(IDXGIAdapter**)
+HRESULT XBEM_GUEST_ABI dxgi_device_get_adapter(ProbeObject* self, void** out) {
+  probe_log(self, 7, "GetAdapter", XBEM_RETURN_ADDRESS());
+  if (!out) return E_POINTER;
+  static void* adapter = make_probe_object("dxgi.adapter", &g_adapter_vtable);
+  *out = adapter;
+  return S_OK;
+}
+const ProbeVtable g_dxgi_device_vtable = make_vtable({{7, fn(&dxgi_device_get_adapter)}});
+
+bool is_dxgi_device_iid(const uint8_t* iid) {
+  // IDXGIDevice {54ec77fa-1377-44e6-8c32-88fd5f44c84c} and IDXGIDevice1..4 share the family.
+  static const uint32_t kDxgiDevice[] = {0x54ec77fa, 0x77db970f, 0x05008617, 0x6007896c, 0x95b4f95f};
+  uint32_t first;
+  std::memcpy(&first, iid, 4);
+  for (uint32_t p : kDxgiDevice)
+    if (first == p) return true;
+  return false;
+}
+
 // QueryInterface: the device for D3D12 device IIDs; any other interface (for
 // example IDXGIDevice, from which titles get the adapter and its outputs) is a
 // separate object, so its methods do not collide with the device's slots.
@@ -328,7 +404,9 @@ HRESULT XBEM_GUEST_ABI device_query_interface(ProbeObject* self, const uint8_t* 
       *out = object;
       return S_OK;
     }
-  void* object = make_probe_object(std::format("d3d12.device.as{{{}}}", guid_to_string(id)));
+  void* object = is_dxgi_device_iid(id)
+                     ? make_probe_object("dxgi.device", &g_dxgi_device_vtable)
+                     : make_probe_object(std::format("d3d12.device.as{{{}}}", guid_to_string(id)));
   interfaces.emplace_back(key, object);
   probe_log(self, 0, std::format("QueryInterface({{{}}}) -> separate interface object", guid_to_string(id)),
             XBEM_RETURN_ADDRESS());

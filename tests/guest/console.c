@@ -393,7 +393,8 @@ static void test_headless_d3d12(void) {
   typedef HRESULT (*QiFn)(void*, const void*, void**);
   typedef HRESULT (*OutFn)(void*, void**);
   typedef HRESULT (*IndexOutFn)(void*, uint32_t, void**);
-  static const uint8_t dxgi_iid[16] = {0xfa, 0x77, 0xec, 0x54};
+  static const uint8_t dxgi_iid[16] = {0xfa, 0x77, 0xec, 0x54, 0x77, 0x13, 0xe6, 0x44,
+                                       0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c};
   void* same = 0;
   CHECK(((QiFn)VT(device)[0])(device, iid, &same) == 0 && same == device);
   void* dxgi = 0;
@@ -402,6 +403,17 @@ static void test_headless_d3d12(void) {
   CHECK(((OutFn)VT(dxgi)[7])(dxgi, &adapter) == 0 && adapter);
   void* output = 0;
   CHECK(((IndexOutFn)VT(adapter)[7])(adapter, 0, &output) == 0 && output);
+  void* second = (void*)1;
+  CHECK(((IndexOutFn)VT(adapter)[7])(adapter, 1, &second) == (HRESULT)0x887A0002 && second == 0);
+  /* GetDisplayModeList: count, then 32-byte modes; the title looks for 120 Hz */
+  typedef HRESULT (*ModesFn)(void*, uint32_t, uint32_t, uint32_t*, uint8_t*);
+  uint32_t mode_count = 0;
+  CHECK(((ModesFn)VT(output)[21])(output, 0, 0, &mode_count, 0) == 0 && mode_count >= 2);
+  static uint8_t modes[8 * 32];
+  CHECK(((ModesFn)VT(output)[21])(output, 0, 0, &mode_count, modes) == 0);
+  int has120 = 0;
+  for (uint32_t i = 0; i < mode_count; ++i) has120 |= *(uint32_t*)(modes + i * 32 + 8) == 120;
+  CHECK(has120 && *(uint32_t*)modes == 3840);
 
   /* Methods without a typed implementation are logged probe slots, far past
    * the PC interface (the console device has many more methods). */
