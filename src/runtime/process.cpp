@@ -69,6 +69,8 @@ void describe_call_site(uint64_t ret, char* out, size_t out_size) {
   out[0] = 0;
   if (const std::string* name = hle::Registry::instance().name_of(target)) {
     std::snprintf(out, out_size, "-> calls %s", name->c_str());
+  } else if (const TracedImport* t = p->trampolines().find_thunk(target)) {
+    std::snprintf(out, out_size, "-> calls %s", t->name.c_str());
   } else if (const UnimplementedImport* imp = p->trampolines().find_by_stub(target)) {
     std::snprintf(out, out_size, "-> calls UNIMPLEMENTED %s!%s", imp->dll.c_str(), imp->function.c_str());
   } else {
@@ -159,6 +161,8 @@ int Process::run() {
   if (fs::absolute(layout_.root) != fs::absolute(dirs.front())) dirs.push_back(layout_.root);
   loader_ = std::make_unique<ModuleLoader>(dirs, trampolines_);
   TrampolinePool::set_strict(options_.strict);
+  TrampolinePool::set_tracing(options_.trace_hle);
+  if (options_.trace_hle) XBEM_INFO("process", "--trace-hle: emulated-function calls are traced");
 
   LoadedModule* main = nullptr;
   try {
@@ -184,6 +188,7 @@ int Process::run() {
   platform::install_crash_handler(&describe_address);
   platform::install_thread_dump(&describe_address, &describe_call_site);
   platform::set_memory_describer(&describe_virtual_memory);
+  platform::set_thread_context_printer(&TrampolinePool::print_call_history);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

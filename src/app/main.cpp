@@ -23,10 +23,13 @@ void print_usage() {
       "  xvd <file>                      read-only XVD/XVC container header info (no decryption)\n"
       "  cpu                             check the host CPU against the Xbox Series (Zen 2) ISA\n"
       "  hle [module]                    list HLE modules / implemented functions\n"
+      "  hexdump <file> <rva> [len]      bytes of a PE file at an RVA (hex), e.g. code to disassemble\n"
       "\n"
       "execution (Linux x86-64 / WSL2):\n"
       "  run <dir|file.exe> [options] [-- guest args]\n"
       "      --strict                    stop at the first call to an unimplemented import\n"
+      "      --trace-hle                 log calls to emulated functions; crash reports and Ctrl+C\n"
+      "                                  dumps show each thread's last 64 calls\n"
       "      --device series-x|series-s|devkit\n"
       "      --scratch DIR               host directory for the writable T:\\ drive\n"
       "      --mount X=DIR               mount an extra writable drive letter\n");
@@ -70,6 +73,7 @@ int main(int argc, char** argv) {
     if (command == "cpu") return xbem::app::cmd_cpu(rest);
     if (command == "hle") return xbem::app::cmd_hle(rest);
     if (command == "run") return xbem::app::cmd_run(rest);
+    if (command == "hexdump") return xbem::app::cmd_hexdump(rest);
     if (command == "help" || command == "-h") {
       print_usage();
       return 0;

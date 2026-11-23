@@ -180,6 +180,7 @@ endfunction()
 # Analysis commands work on every host.
 xbem_guest_test(inspect_imports COMMAND inspect ${GOUT}/unimplemented.exe
                 EXPECT "kernelx.dll  \\[HLE\\]  3/5 resolved" "- XbemDefinitelyMissing" "- XbemMissingWithArgs")
+xbem_guest_test(hexdump COMMAND hexdump ${GOUT}/hello.exe 1000 32 EXPECT "00001000:( [0-9a-f][0-9a-f])+" "00001010:")
 xbem_guest_test(package_summary COMMAND package ${PKG}
                 EXPECT "Identity: +Xbem.FilesTest" "Main executable: .*files.exe")
 xbem_guest_test(coverage_report COMMAND coverage ${GOUT}
@@ -203,6 +204,8 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "XbemDefinitelyMissing\\(.*\\) from unimplemented.exe\\+0x[0-9a-f]+ \\(strict mode\\)")
   xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
   xbem_guest_test(guest_crt COMMAND run ${GOUT}/crt.exe EXPECT "PASS crt")
+  xbem_guest_test(guest_trace_hle COMMAND run ${GOUT}/seh.exe --trace-hle
+                  EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
     xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe EXPECT "PASS console")
   endif()

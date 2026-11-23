@@ -84,7 +84,131 @@ void write_stub(uint8_t* p, uint64_t info, uint64_t handler) {
   while (i < kStubSize) p[i++] = 0xCC;   // int3 padding
 }
 
+std::atomic<bool> g_tracing{false};
+constexpr size_t kThunkSize = 160;
+constexpr size_t kThunkChunk = 0x40000;  // 1638 thunks per chunk
+constexpr uint64_t kLogTracedCalls = 3;
+
+struct HistoryEntry {
+  const void* import;  // TracedImport*
+  uint64_t args[4];
+  uint64_t ret;
+};
+constexpr uint32_t kHistory = 64;
+thread_local HistoryEntry t_history[kHistory];
+thread_local uint32_t t_history_count = 0;
+
+// x86-64 thunk: preserves the integer and vector argument registers, calls
+// the logger with (info, rcx, rdx, r8, r9, return address), then jumps to
+// the implementation so the callee sees exactly the caller's stack.
+void write_trace_thunk(uint8_t* p, uint64_t info, uint64_t logger, uint64_t target) {
+  size_t i = 0;
+  auto emit = [&](std::initializer_list<uint8_t> bytes) {
+    for (uint8_t b : bytes) p[i++] = b;
+  };
+  auto imm64 = [&](uint64_t v) {
+    std::memcpy(p + i, &v, 8);
+    i += 8;
+  };
+  emit({0x51, 0x52, 0x41, 0x50, 0x41, 0x51});              // push rcx, rdx, r8, r9
+  emit({0x48, 0x81, 0xEC, 0x78, 0x00, 0x00, 0x00});        // sub rsp, 0x78
+  emit({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x30});              // movdqu [rsp+0x30], xmm0
+  emit({0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x40});              // movdqu [rsp+0x40], xmm1
+  emit({0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x50});              // movdqu [rsp+0x50], xmm2
+  emit({0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x60});              // movdqu [rsp+0x60], xmm3
+  emit({0x4C, 0x89, 0x4C, 0x24, 0x20});                    // mov [rsp+0x20], r9
+  emit({0x48, 0x8B, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00});  // mov rax, [rsp+0x98] (return address)
+  emit({0x48, 0x89, 0x44, 0x24, 0x28});                    // mov [rsp+0x28], rax
+  emit({0x4D, 0x89, 0xC1, 0x49, 0x89, 0xD0, 0x48, 0x89, 0xCA});  // mov r9,r8; mov r8,rdx; mov rdx,rcx
+  emit({0x48, 0xB9});                                      // mov rcx, info
+  imm64(info);
+  emit({0x48, 0xB8});  // mov rax, logger
+  imm64(logger);
+  emit({0xFF, 0xD0});                                // call rax
+  emit({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x30});        // movdqu xmm0, [rsp+0x30]
+  emit({0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x40});        // movdqu xmm1, [rsp+0x40]
+  emit({0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x50});        // movdqu xmm2, [rsp+0x50]
+  emit({0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x60});        // movdqu xmm3, [rsp+0x60]
+  emit({0x48, 0x81, 0xC4, 0x78, 0x00, 0x00, 0x00});  // add rsp, 0x78
+  emit({0x41, 0x59, 0x41, 0x58, 0x5A, 0x59});        // pop r9, r8, rdx, rcx
+  emit({0x48, 0xB8});                                // mov rax, target
+  imm64(target);
+  emit({0xFF, 0xE0});  // jmp rax
+  while (i < kThunkSize) p[i++] = 0xCC;
+}
+
 }  // namespace
+
+namespace {
+uint64_t XBEM_GUEST_ABI trace_logger_entry(void* info_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                          uint64_t ret) {
+  auto* info = static_cast<TracedImport*>(info_raw);
+  HistoryEntry& e = t_history[t_history_count % kHistory];
+  e.import = info;
+  e.args[0] = a1;
+  e.args[1] = a2;
+  e.args[2] = a3;
+  e.args[3] = a4;
+  e.ret = ret;
+  ++t_history_count;
+  const uint64_t n = info->calls.fetch_add(1) + 1;
+  if (n <= kLogTracedCalls)
+    XBEM_INFO("trace", "{}({:#x}, {:#x}, {:#x}, {:#x}) from {}{}", info->name, a1, a2, a3, a4, describe_code(ret),
+              n == kLogTracedCalls ? " (further calls not logged)" : "");
+  return 0;
+}
+}  // namespace
+
+void TrampolinePool::set_tracing(bool enabled) { g_tracing.store(enabled); }
+bool TrampolinePool::tracing() { return g_tracing.load(); }
+
+uint64_t TrampolinePool::trace_thunk(const std::string& name, uint64_t target) {
+  std::lock_guard lock(mutex_);
+  if (auto it = thunk_by_target_.find(target); it != thunk_by_target_.end()) return it->second;
+  if (!thunk_chunk_ || thunk_used_ + kThunkSize > kThunkChunk) {
+    thunk_chunk_ = static_cast<uint8_t*>(platform::map_anywhere(kThunkChunk, platform::page_size(), platform::Prot::RWX));
+    if (!thunk_chunk_) return target;  // tracing is best effort
+    thunk_used_ = 0;
+    regions_.push_back({reinterpret_cast<uint64_t>(thunk_chunk_), kThunkChunk});
+  }
+  TracedImport& info = traced_.emplace_back();
+  info.name = name;
+  info.target = target;
+  uint8_t* thunk = thunk_chunk_ + thunk_used_;
+  thunk_used_ += kThunkSize;
+  write_trace_thunk(thunk, reinterpret_cast<uint64_t>(&info), reinterpret_cast<uint64_t>(&trace_logger_entry), target);
+  const auto addr = reinterpret_cast<uint64_t>(thunk);
+  thunk_by_target_[target] = addr;
+  info_by_thunk_[addr] = &info;
+  return addr;
+}
+
+const TracedImport* TrampolinePool::find_thunk(uint64_t address) const {
+  std::unique_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return nullptr;
+  auto it = info_by_thunk_.find(address);
+  return it == info_by_thunk_.end() ? nullptr : it->second;
+}
+
+void TrampolinePool::print_call_history(void (*write)(const char*)) {
+  if (!g_tracing.load()) return;
+  const uint32_t count = t_history_count;
+  if (count == 0) return;
+  char line[512], where[256];
+  write("Last emulated-function calls of this thread (oldest first):\n");
+  const uint32_t first = count > kHistory ? count - kHistory : 0;
+  for (uint32_t k = first; k < count; ++k) {
+    const HistoryEntry& e = t_history[k % kHistory];
+    const auto* info = static_cast<const TracedImport*>(e.import);
+    where[0] = 0;
+    if (Process* p = Process::current_or_null()) p->loader().describe(e.ret, where, sizeof where);
+    std::snprintf(line, sizeof line, "  %s(%#llx, %#llx, %#llx, %#llx) from %s\n", info ? info->name.c_str() : "?",
+                  static_cast<unsigned long long>(e.args[0]), static_cast<unsigned long long>(e.args[1]),
+                  static_cast<unsigned long long>(e.args[2]), static_cast<unsigned long long>(e.args[3]),
+                  where[0] ? where : "?");
+    write(line);
+  }
+}
 
 void TrampolinePool::set_strict(bool strict) { g_strict.store(strict); }
 

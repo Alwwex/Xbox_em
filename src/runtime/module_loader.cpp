@@ -170,6 +170,11 @@ void ModuleLoader::map_image(LoadedModule& m) {
   m.entry = img.entry_rva() ? reinterpret_cast<uint64_t>(base) + img.entry_rva() : 0;
 }
 
+uint64_t ModuleLoader::traced(const hle::Registry::Lookup& look, uint64_t address) {
+  if (!TrampolinePool::tracing() || !look.module || !look.exp) return address;
+  return trampolines_.trace_thunk(look.module->name + "!" + std::string(look.exp->name), address);
+}
+
 void ModuleLoader::index_exports(LoadedModule& m) {
   for (const pe::ExportEntry& e : m.image->exports()) {
     LoadedModule::ExportTarget t;
@@ -195,7 +200,7 @@ void ModuleLoader::resolve_imports(LoadedModule& m) {
         if (dep->hle) {
           const auto& reg = hle::Registry::instance();
           const auto look = e.by_ordinal ? reg.find_ordinal(imp.dll_name, e.ordinal) : reg.find(imp.dll_name, e.name);
-          if (look.exp) addr = reinterpret_cast<uint64_t>(look.exp->address);
+          if (look.exp) addr = traced(look, reinterpret_cast<uint64_t>(look.exp->address));
         } else {
           addr = e.by_ordinal ? get_proc_address(*dep, e.ordinal) : get_proc_address_impl(*dep, e.name, 0);
         }
@@ -288,7 +293,7 @@ uint64_t ModuleLoader::get_proc_address(LoadedModule& m, std::string_view name) 
 uint64_t ModuleLoader::get_proc_address_impl(LoadedModule& m, std::string_view name, int depth) {
   if (m.hle) {
     const auto look = hle::Registry::instance().find(m.hle->name, name);
-    return look.exp ? reinterpret_cast<uint64_t>(look.exp->address) : 0;
+    return look.exp ? traced(look, reinterpret_cast<uint64_t>(look.exp->address)) : 0;
   }
   auto it = m.exports_by_name.find(std::string(name));
   return it == m.exports_by_name.end() ? 0 : resolve_export(m, it->second, depth);
@@ -298,7 +303,7 @@ uint64_t ModuleLoader::get_proc_address(LoadedModule& m, uint16_t ordinal) {
   std::lock_guard lock(mutex_);
   if (m.hle) {
     const auto look = hle::Registry::instance().find_ordinal(m.hle->name, ordinal);
-    return look.exp ? reinterpret_cast<uint64_t>(look.exp->address) : 0;
+    return look.exp ? traced(look, reinterpret_cast<uint64_t>(look.exp->address)) : 0;
   }
   auto it = m.exports_by_ordinal.find(ordinal);
   return it == m.exports_by_ordinal.end() ? 0 : resolve_export(m, it->second, 0);

@@ -14,5 +14,6 @@ int cmd_xvd(const Args& args);
 int cmd_cpu(const Args& args);
 int cmd_hle(const Args& args);
 int cmd_run(const Args& args);
+int cmd_hexdump(const Args& args);
 
 }  // namespace xbem::app

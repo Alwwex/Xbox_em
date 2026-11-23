@@ -30,6 +30,11 @@ void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t
 
 // Crash reports also say which allocation a fault address / stack pointer is in.
 void set_memory_describer(AddressDescriber describer);
+
+// Prints extra per-thread context (e.g. the thread's recent emulated calls)
+// into crash reports and thread dumps, using the given writer.
+using ThreadContextPrinter = void (*)(void (*write)(const char*));
+void set_thread_context_printer(ThreadContextPrinter printer);
 void unregister_dump_thread();
 
 }  // namespace xbem::platform

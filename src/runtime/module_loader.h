@@ -98,6 +98,7 @@ class ModuleLoader {
   std::recursive_mutex mutex_;
   std::vector<std::filesystem::path> search_dirs_;
   TrampolinePool& trampolines_;
+  uint64_t traced(const hle::Registry::Lookup& look, uint64_t address);
   std::vector<std::unique_ptr<LoadedModule>> modules_;
   std::unordered_map<std::string, LoadedModule*> by_name_;
   std::vector<LoadedModule*> pending_init_;

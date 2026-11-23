@@ -421,6 +421,27 @@ int cmd_hle(const Args& args) {
 
 // ---------------------------------------------------------------------- run
 
+// Hex dump of a PE file's bytes at an RVA (for disassembling code or reading
+// data the emulator reports addresses of, e.g. "game.exe+0x1234").
+int cmd_hexdump(const Args& args) {
+  if (args.size() < 2) throw std::runtime_error("usage: xbem hexdump <file.exe|dll> <rva (hex)> [length (default 256)]");
+  const pe::PeImage img = pe::PeImage::load(args[0]);
+  const uint32_t rva = static_cast<uint32_t>(std::stoul(args[1], nullptr, 16));
+  const size_t length = args.size() > 2 ? std::stoul(args[2], nullptr, 0) : 256;
+  for (size_t done = 0; done < length; done += 16) {
+    const auto off = img.rva_to_offset(rva + static_cast<uint32_t>(done), 1);
+    if (!off) {
+      std::printf("%08zx: (not backed by file data)\n", rva + done);
+      break;
+    }
+    std::printf("%08zx:", rva + done);
+    for (size_t k = 0; k < 16 && done + k < length && *off + k < img.bytes().size(); ++k)
+      std::printf(" %02x", img.bytes()[*off + k]);
+    std::printf("\n");
+  }
+  return 0;
+}
+
 int cmd_run(const Args& args) {
   if (args.empty()) throw std::runtime_error("usage: xbem run <dir|file.exe> [options] [-- guest args]");
   rt::ProcessOptions opt;
@@ -436,6 +457,8 @@ int cmd_run(const Args& args) {
       break;
     } else if (a == "--strict") {
       opt.strict = true;
+    } else if (a == "--trace-hle") {
+      opt.trace_hle = true;
     } else if (a == "--device") {
       const std::string& d = value();
       if (d == "series-x") opt.device = rt::DeviceType::XboxScarlettAnaconda;

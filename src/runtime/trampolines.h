@@ -20,6 +20,13 @@ struct UnimplementedImport {
   std::atomic<uint64_t> calls{0};
 };
 
+// An emulated function wrapped for --trace-hle.
+struct TracedImport {
+  std::string name;
+  uint64_t target = 0;
+  std::atomic<uint64_t> calls{0};
+};
+
 class TrampolinePool {
  public:
   struct Request {
@@ -38,6 +45,16 @@ class TrampolinePool {
 
   static void set_strict(bool strict);
 
+  // --trace-hle: calls to emulated functions go through a thunk that records
+  // them (first calls are logged; every thread keeps its last calls for crash
+  // reports and thread dumps) and then jumps to the implementation.
+  static void set_tracing(bool enabled);
+  static bool tracing();
+  uint64_t trace_thunk(const std::string& name, uint64_t target);
+  // Prints the calling thread's recent emulated-function calls. Signal-safe.
+  static void print_call_history(void (*write)(const char*));
+  const TracedImport* find_thunk(uint64_t address) const;  // never blocks
+
  private:
   mutable std::mutex mutex_;
   std::deque<UnimplementedImport> infos_;  // stable addresses
@@ -48,6 +65,12 @@ class TrampolinePool {
     size_t size;
   };
   std::vector<Region> regions_;
+
+  std::deque<TracedImport> traced_;
+  std::unordered_map<uint64_t, uint64_t> thunk_by_target_;
+  std::unordered_map<uint64_t, const TracedImport*> info_by_thunk_;
+  uint8_t* thunk_chunk_ = nullptr;
+  size_t thunk_used_ = 0;
 };
 
 }  // namespace xbem::rt

@@ -8,6 +8,7 @@ void setup_thread_signal_stack() {}
 void install_thread_dump(AddressDescriber, CallSiteDescriber) {}
 void register_dump_thread(uint32_t, uint64_t, uint64_t) {}
 void set_memory_describer(AddressDescriber) {}
+void set_thread_context_printer(ThreadContextPrinter) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
 
@@ -23,6 +24,7 @@ void unregister_dump_thread() {}
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <initializer_list>
 #include <cstdio>
@@ -64,6 +66,7 @@ struct DumpSlot {
 constexpr int kMaxDumpThreads = 1024;
 DumpSlot g_dump_slots[kMaxDumpThreads];
 CallSiteDescriber g_call_site = nullptr;
+ThreadContextPrinter g_context_printer = nullptr;
 std::atomic<int> g_dump_active{0};
 std::atomic<int> g_dump_done{0};
 std::atomic<bool> g_print_lock{false};
@@ -123,6 +126,7 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
     ++shown;
   }
   if (!shown) write_str("    (no guest return addresses found on the stack)\n");
+  if (g_context_printer) g_context_printer(&write_str);
   unlock_print();
 #else
   (void)slot;
@@ -176,6 +180,41 @@ void interrupt_handler(int sig, siginfo_t*, void* ctx) {
 
 
 AddressDescriber g_memory_describer = nullptr;
+
+// Prints the outermost guest frames (where a deep recursion started).
+void print_outermost_frames(const DumpSlot* slot, char* line, size_t line_size, char* where, size_t where_size) {
+  if (!slot || !slot->stack_high) return;
+  uint64_t found[64];
+  int n = 0;
+  const uint64_t top = slot->stack_high;
+  const uint64_t start = top > 0x40000 ? top - 0x40000 : 0;
+  for (uint64_t p = std::max<uint64_t>(start, slot->stack_low) & ~7ull; p + 8 <= top; p += 8) {
+    uint64_t v;
+    if (!safe_read(p, &v, 8) || v < 0x10000) continue;
+    where[0] = 0;
+    if (g_describer) g_describer(v, where, where_size);
+    if (!where[0] || !std::strstr(where, "+0x")) continue;
+    uint8_t before[7];
+    if (!safe_read(v - 7, before, 7) || !preceded_by_call(v)) continue;
+    found[n % 64] = p;  // address of the stack slot
+    ++n;
+  }
+  if (n == 0) return;
+  write_str("Outermost frames (top of the stack, innermost first):\n");
+  const int first = n > 12 ? n - 12 : 0;
+  for (int k = first; k < n; ++k) {
+    const uint64_t p = found[k % 64];
+    uint64_t v;
+    if (!safe_read(p, &v, 8)) continue;
+    where[0] = 0;
+    if (g_describer) g_describer(v, where, where_size);
+    char call[256] = {0};
+    if (g_call_site) g_call_site(v, call, sizeof call);
+    std::snprintf(line, line_size, "  [top-0x%05llx] %s%s%s\n", static_cast<unsigned long long>(top - p), where,
+                  call[0] ? "  " : "", call);
+    write_str(line);
+  }
+}
 std::atomic<int> g_crash_tid{0};
 
 const DumpSlot* slot_of_tid(int tid) {
@@ -286,6 +325,8 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
     ++shown;
   }
   if (!shown) write_str("  (none found)\n");
+  print_outermost_frames(slot, line, sizeof line, where, sizeof where);
+  if (g_context_printer) g_context_printer(&write_str);
 #else
   (void)ctx_raw;
   (void)where;
@@ -312,6 +353,7 @@ void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site
 }
 
 void set_memory_describer(AddressDescriber describer) { g_memory_describer = describer; }
+void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();
