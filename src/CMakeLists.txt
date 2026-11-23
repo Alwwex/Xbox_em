@@ -32,6 +32,7 @@ add_library(xbem_core STATIC
   hle/gameinput.cpp
   hle/probe_com.cpp
   hle/console_devices.cpp
+  hle/xg.cpp
   hle/user32.cpp
   hle/ucrt_runtime.cpp
   hle/ucrt_string.cpp

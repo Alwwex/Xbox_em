@@ -13,6 +13,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <initializer_list>
+#include <utility>
 #include <string>
 
 namespace xbem::hle {
@@ -34,6 +36,13 @@ using ProbeVtable = std::array<void*, kProbeSlots>;
 
 // The all-probe vtable; typed classes copy it and override known slots.
 const ProbeVtable& default_probe_vtable();
+
+// A copy of the all-probe vtable with some slots replaced by typed methods.
+inline ProbeVtable make_probe_vtable(std::initializer_list<std::pair<int, void*>> overrides) {
+  ProbeVtable v = default_probe_vtable();
+  for (const auto& [slot, f] : overrides) v[static_cast<size_t>(slot)] = f;
+  return v;
+}
 
 // Creates a probe object; `name` labels its calls in the log ("dstorage.factory").
 void* make_probe_object(const std::string& name, const ProbeVtable* vtable = nullptr, void* state = nullptr);

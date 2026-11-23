@@ -51,7 +51,7 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -109,7 +109,7 @@ endforeach()
 # Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
 find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
 if(XBEM_MINGW_WINDRES)
-  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs)
+  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs)
   set(CONSOLE_DEPS)
   foreach(lib ${CONSOLE_LIBS})
     list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)

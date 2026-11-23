@@ -81,11 +81,7 @@ StructReturn struct_return(uint64_t a0, uint64_t a1) {
   return r;
 }
 
-ProbeVtable make_vtable(std::initializer_list<std::pair<int, void*>> overrides) {
-  ProbeVtable v = default_probe_vtable();
-  for (const auto& [slot, f] : overrides) v[static_cast<size_t>(slot)] = f;
-  return v;
-}
+ProbeVtable make_vtable(std::initializer_list<std::pair<int, void*>> overrides) { return make_probe_vtable(overrides); }
 
 // SetEvent through the kernelx implementation (events are kernel objects there).
 void set_guest_event(HANDLE event) {

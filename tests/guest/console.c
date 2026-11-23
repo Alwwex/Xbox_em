@@ -15,6 +15,10 @@ IMP void* XMemMapPhysicalPages(void*, uint64_t, const uint64_t*);
 IMP int32_t XMemFreePhysicalPages(uint64_t, const uint64_t*);
 IMP BOOL XMemIsToolsMemAvailable(void);
 
+/* xg_xs.dll */
+IMP HRESULT XGCreateTextureComputer(const void* desc, void** out);
+IMP HRESULT XGSuggestSwizzleMode(const void* desc, uint64_t reserved, uint32_t* mode);
+
 /* kernelx.dll */
 IMP DWORD FormatMessageA(DWORD, const void*, DWORD, DWORD, char*, DWORD, void*);
 IMP int GetLocaleInfoEx(const WCHAR*, DWORD, WCHAR*, int);
@@ -162,6 +166,36 @@ static void test_zen2_instructions(void) {
   __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x38" ::"a"(p) : "memory"); /* clflushopt [rax] */
   __asm__ volatile(".byte 0x0f, 0x01, 0xfc" ::"a"(p + 5) : "memory");   /* clzero: line of rax */
   CHECK(buf[63] == 0xEE && buf[64] == 0 && buf[127] == 0 && buf[128] == 0xEE);
+}
+
+typedef void** Vt;
+#define VT(o) (*(Vt*)(o))
+
+/* ------------------------------------------------------------------- XG */
+
+/* Texture uploads: the computer copies linear rows into the emulator's
+ * linear D3D12 layout (rows aligned to 256 bytes, subresources to 512). */
+static void test_xg(void) {
+  static uint8_t xg_desc[64];
+  uint32_t mode = 0xFFFF;
+  CHECK(XGSuggestSwizzleMode(xg_desc, 0, &mode) == 0 && mode == 0);
+  void* computer = 0;
+  CHECK(XGCreateTextureComputer(xg_desc, &computer) == 0 && computer);
+  typedef HRESULT (*CopyFn)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+  static uint8_t gpu[0x20000];
+  static uint8_t mip0[100 * 4], mip1[50 * 2];
+  for (int i = 0; i < (int)sizeof mip0; ++i) mip0[i] = (uint8_t)i;
+  for (int i = 0; i < (int)sizeof mip1; ++i) mip1[i] = (uint8_t)(0x80 + i);
+  /* R8 100x4 (pitch 100) then 50x2 (pitch 50) */
+  CHECK(((CopyFn)VT(computer)[8])(computer, gpu, 0, 0, mip0, 100, 400) == 0);
+  CHECK(((CopyFn)VT(computer)[8])(computer, gpu, 0, 1, mip1, 50, 100) == 0);
+  CHECK(gpu[0] == 0 && gpu[99] == 99 && gpu[256] == 100 && gpu[3 * 256 + 99] == (uint8_t)399);
+  CHECK(gpu[1024] == 0x80 && gpu[1024 + 256 + 49] == 0x80 + 99); /* subresource 1 at 4 x 256 = 1024 */
+  static uint8_t back[100];
+  CHECK(((CopyFn)VT(computer)[10])(computer, back, 0, 1, gpu, 50, 100) == 0);
+  CHECK(memcmp(back, mip1, 100) == 0);
+  typedef uint32_t (*RefFn)(void*);
+  CHECK(((RefFn)VT(computer)[1])(computer) == 0); /* Release */
 }
 
 /* --------------------------------------------------------------- locale */
@@ -412,8 +446,6 @@ static void test_dstorage_probe(void) {
 
 /* ------------------------------------------------- headless D3D12 */
 
-typedef void** Vt;
-#define VT(o) (*(Vt*)(o))
 typedef HRESULT (*CreateFenceFn)(void*, uint64_t, uint32_t, const void*, void**);
 typedef HRESULT (*CreateQueueFn)(void*, const void*, const void*, void**);
 typedef HRESULT (*QueueSignalFn)(void*, void*, uint64_t);
@@ -617,6 +649,7 @@ DWORD guest_main(void* peb) {
   (void)peb;
   test_xmem();
   test_zen2_instructions();
+  test_xg();
   test_headless_d3d12();
   test_dstorage_probe();
   test_gameinput();

@@ -4,7 +4,6 @@
 //   chad.dll    - audio DSP command interface (XDsp*)
 //   xapu.dll    - audio processing unit command queues (XApu*)
 //   xcrdapi.dll - the console DirectStorage runtime (DStorageGetFactory)
-//   xg_xs.dll   - XG texture layout helpers for the Series GPU
 //
 // Until they are implemented, each entry point logs its first calls with all
 // argument values (pointers are probed for GUIDs and strings) and the call
@@ -53,14 +52,6 @@ HRESULT XBEM_GUEST_ABI hle_DStorageGetFactory(const void* iid, void** out) {
   return S_OK;
 }
 
-// HRESULT XGCreateTextureComputer(const XG_RESOURCE_DESC*, XGTextureAddressComputer** out)
-HRESULT XBEM_GUEST_ABI hle_XGCreateTextureComputer(const void* desc, void** out) {
-  XBEM_LOG_CALL("xg", "E_NOTIMPL", reinterpret_cast<uint64_t>(desc), reinterpret_cast<uint64_t>(out));
-  if (out) *out = nullptr;
-  return E_NOTIMPL;
-}
-XBEM_DISCOVERY_FAIL("xg", XGSuggestSwizzleMode)
-
 }  // namespace
 
 std::vector<ModuleDef> make_console_modules() {
@@ -85,8 +76,6 @@ std::vector<ModuleDef> make_console_modules() {
        XBEM_HLE_STUB(XApuEnqueueCommand), XBEM_HLE_STUB(XApuGetResultCount)});
   add("xcrdapi.dll", "Console DirectStorage runtime (probe: calls are logged, no I/O yet)",
       {XBEM_HLE_STUB(DStorageGetFactory)});
-  add("xg_xs.dll", "XG texture layout library (not emulated yet)",
-      {XBEM_HLE_STUB(XGCreateTextureComputer), XBEM_HLE_STUB(XGSuggestSwizzleMode)});
   return out;
 }
 
