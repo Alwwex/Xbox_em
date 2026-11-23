@@ -482,6 +482,12 @@ static void test_headless_d3d12(void) {
   const uint64_t gpu_start = ((HeapStartFn)VT(heap)[10])(heap);
   CHECK(gpu_start == start);
   *(volatile uint64_t*)(uintptr_t)(gpu_start + 63 * 32) = 1; /* descriptors are writable memory */
+  /* Console desc: memory the title set aside for the descriptors follows the PC fields */
+  uint8_t* title_mem = VirtualAlloc(0, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  uint64_t heap_desc_x[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)title_mem, 0};
+  void* heap_x = 0;
+  CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_x, iid, &heap_x) == 0 && heap_x);
+  CHECK(((HeapStartFn)VT(heap_x)[9])(heap_x) == (uint64_t)(uintptr_t)title_mem);
 
   /* Heaps: CreateHeap (28) and the console's heap over already-mapped memory
    * (133: address, ..., riid, ppv); placed resources live at heap + offset. */

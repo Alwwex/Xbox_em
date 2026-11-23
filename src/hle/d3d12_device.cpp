@@ -492,16 +492,58 @@ HRESULT XBEM_GUEST_ABI device_check_feature_support(ProbeObject* self, uint32_t 
   return S_OK;
 }
 
-// 14 CreateDescriptorHeap(desc, riid, ppv)
+// Is `address` inside memory the title allocated (VirtualAlloc / XMemVirtualAlloc)?
+bool is_allocated_memory(uint64_t address) {
+  if (address < 0x10000 || address >= 0x800000000000ull) return false;
+  uint8_t mbi[48] = {};
+  if (virtual_query(reinterpret_cast<void*>(address), mbi, sizeof mbi) != 48) return false;
+  uint32_t state, kind;
+  std::memcpy(&state, mbi + 32, 4);
+  std::memcpy(&kind, mbi + 40, 4);
+  return state != MEM_FREE && kind == MEM_PRIVATE;
+}
+
+// 14 CreateDescriptorHeap(desc, riid, ppv). D3D12_DESCRIPTOR_HEAP_DESC is
+// {Type, NumDescriptors, Flags, NodeMask}; the console version also carries the
+// memory the title set aside for the descriptors (a real title checks that the
+// heap starts there), found as a pointer to allocated memory after the PC fields.
 HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
   auto* state = new DescriptorHeapState;
-  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), state->desc, 16);
+  uint8_t raw[64] = {};
+  if (desc) {
+    if (!platform::safe_read(reinterpret_cast<uint64_t>(desc), raw, sizeof raw))
+      platform::safe_read(reinterpret_cast<uint64_t>(desc), raw, 16);
+    std::memcpy(state->desc, raw, 16);
+  }
   uint32_t count = 0;
   std::memcpy(&count, state->desc + 4, 4);
   const uint64_t bytes = std::max<uint64_t>(count, 1) * kDescriptorSize;
-  state->cpu = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
-  state->gpu = state->cpu;  // unified memory: shader-visible descriptors are read from the same bytes
-  probe_log(self, 14, std::format("CreateDescriptorHeap({} descriptors)", count), XBEM_RETURN_ADDRESS());
+  uint64_t memory = 0;
+  int memory_offset = -1;
+  for (int off = 16; off + 8 <= 64 && !memory; off += 8) {
+    uint64_t v;
+    std::memcpy(&v, raw + off, 8);
+    if (is_allocated_memory(v)) {
+      memory = v;
+      memory_offset = off;
+    }
+  }
+  if (!memory)
+    memory = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
+  state->cpu = memory;
+  state->gpu = memory;  // unified memory: shader-visible descriptors are read from the same bytes
+  std::string dump;
+  for (int i = 0; i < 64; i += 8) {
+    uint64_t v;
+    std::memcpy(&v, raw + i, 8);
+    dump += std::format(" {:016x}", v);
+  }
+  probe_log(self, 14,
+            std::format("CreateDescriptorHeap({} descriptors, type {}, flags {:#x}) at {:#x} ({}) desc:{}", count,
+                        raw[0], raw[8], memory,
+                        memory_offset >= 0 ? std::format("title memory from desc+{}", memory_offset) : "own memory",
+                        dump),
+            XBEM_RETURN_ADDRESS());
   return create_into(make_probe_object(child_name("descriptor_heap"), &g_heap_vtable, state), out);
 }
 
