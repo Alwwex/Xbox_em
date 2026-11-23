@@ -86,7 +86,9 @@ void unlock_print() { g_print_lock.store(false, std::memory_order_release); }
 // True if the bytes before `ret` end with a call instruction.
 bool preceded_by_call(uint64_t ret) {
   uint8_t b[7];
-  std::memcpy(b, reinterpret_cast<const void*>(ret - 7), 7);
+  // The 7 bytes can start before a mapped image (a "return address" equal to
+  // the image base): read them without faulting.
+  if (ret < 0x10007 || !safe_read(ret - 7, b, 7)) return false;
   if (b[2] == 0xE8) return true;                                       // call rel32
   if (b[1] == 0xFF && (b[2] & 0x38) == 0x10 && (b[2] & 0xC7) == 0x05) return true;  // call [rip+disp32]
   if (b[5] == 0xFF && (b[6] & 0xF8) == 0xD0) return true;              // call reg

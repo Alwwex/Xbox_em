@@ -65,14 +65,16 @@ void describe_call_site(uint64_t ret, char* out, size_t out_size) {
   out[0] = 0;
   Process* p = Process::current_or_null();
   if (!p) return;
-  const auto* code = reinterpret_cast<const uint8_t*>(ret);
+  uint8_t before[6];
+  if (ret < 0x10006 || !platform::safe_read(ret - 6, before, 6)) return;  // may sit at an image's first byte
+  const uint8_t* code = before + 6;
   uint64_t target = 0;
   if (code[-6] == 0xFF && code[-5] == 0x15) {
     int32_t disp;
     std::memcpy(&disp, code - 4, 4);
     const uint64_t slot = ret + static_cast<int64_t>(disp);
     if (!p->loader().describe(slot, out, out_size)) return;  // the IAT lives inside the module
-    std::memcpy(&target, reinterpret_cast<const void*>(slot), 8);
+    if (!platform::safe_read(slot, &target, 8)) return;
   } else if (code[-5] == 0xE8) {
     int32_t rel;
     std::memcpy(&rel, code - 4, 4);
