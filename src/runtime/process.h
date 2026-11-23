@@ -34,7 +34,8 @@ enum class DeviceType : uint32_t {
 struct ProcessOptions {
   std::filesystem::path target;  // package directory or .exe
   bool strict = false;           // terminate on the first call to an unimplemented import
-  bool trace_hle = false;        // trace calls to emulated functions (log + per-thread history)
+  bool trace_hle = false;
+  bool continue_after_breakpoint = false;  // log int3 / __debugbreak() and keep running        // trace calls to emulated functions (log + per-thread history)
   DeviceType device = DeviceType::XboxScarlettAnaconda;
   std::filesystem::path scratch_dir;  // host directory for T:\ (created if missing)
   std::vector<std::pair<char, std::filesystem::path>> extra_mounts;

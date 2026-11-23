@@ -128,15 +128,16 @@ VirtualAllocArgs decode_virtual_alloc(const uint64_t* a, int n) {
     if (a[ti - 1] == 0 || a[ti - 1] > (1ull << 44)) continue;  // size
     // Protection: the next recognisable value, preferring one that grants access.
     int pi = -1;
+    // The protection is a DWORD: the upper half of its register can be garbage.
     for (int k = ti + 1; k < n && k <= ti + 2; ++k)
-      if (looks_like_protect(a[k]) && (pi < 0 || (a[pi] & 0xFF) == PAGE_NOACCESS)) pi = k;
+      if (looks_like_protect(a[k] & 0xFFFFFFFF) && (pi < 0 || (a[pi] & 0xFF) == PAGE_NOACCESS)) pi = k;
     r.ok = true;
     r.type_index = ti;
     r.size = a[ti - 1];
     r.address = ti >= 2 ? a[ti - 2] : 0;
     r.type = static_cast<uint32_t>(a[ti]);
     r.protect_index = pi;
-    r.protect = pi >= 0 ? static_cast<uint32_t>(a[pi]) : PAGE_READWRITE;
+    r.protect = pi >= 0 ? static_cast<uint32_t>(a[pi] & 0xFFFFFFFF) : PAGE_READWRITE;
     return r;
   }
   return r;

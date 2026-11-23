@@ -29,6 +29,7 @@ add_library(xbem_core STATIC
   hle/xmem.cpp
   hle/net.cpp
   hle/media.cpp
+  hle/gameinput.cpp
   hle/console_devices.cpp
   hle/user32.cpp
   hle/ucrt_runtime.cpp

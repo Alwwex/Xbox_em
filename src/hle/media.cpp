@@ -1,4 +1,4 @@
-// Media Foundation (video playback), GameInput and XAudio2.
+// Media Foundation (video playback) and XAudio2.
 //
 // None of these have a host implementation yet. Entry points fail cleanly
 // with E_NOTIMPL (and null out-pointers), which titles treat as "feature not
@@ -60,14 +60,6 @@ HRESULT XBEM_GUEST_ABI hle_MFCreateSourceReaderFromByteStream(void*, void*, void
   return not_available(out);
 }
 
-// ------------------------------------------------------------- GameInput
-
-// HRESULT GameInputCreate(IGameInput** gameInput)  (gameinput.dll ordinal 1)
-HRESULT XBEM_GUEST_ABI hle_GameInputCreate(void** out, uint64_t a1, uint64_t a2, uint64_t a3) {
-  XBEM_LOG_CALL("input", "E_NOTIMPL (no input devices yet)", reinterpret_cast<uint64_t>(out), a1, a2, a3);
-  return not_available(out);
-}
-
 // ---------------------------------------------------------------- XAudio2
 
 // HRESULT XAudio2Create(IXAudio2** out, UINT32 flags, XAUDIO2_PROCESSOR)  (xaudio2_9.dll ordinal 1)
@@ -103,13 +95,6 @@ std::vector<ModuleDef> make_media_modules() {
         XBEM_HLE_STUB(MFCreateSourceReaderFromURL),
         XBEM_HLE_STUB(MFCreateSourceReaderFromByteStream),
     };
-    out.push_back(std::move(m));
-  }
-  {
-    ModuleDef m;
-    m.name = "gameinput.dll";
-    m.description = "GameInput (not emulated yet)";
-    m.exports = {XBEM_HLE_STUB_ORD(GameInputCreate, 1)};
     out.push_back(std::move(m));
   }
   {

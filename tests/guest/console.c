@@ -60,6 +60,9 @@ IMP WCHAR* SysAllocString(const WCHAR*);
 IMP void SysFreeString(WCHAR*);
 IMP uint32_t SysStringLen(const WCHAR*);
 
+/* gameinput.dll (ordinal 1) */
+IMP HRESULT GameInputCreate(void** game_input);
+
 /* ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll */
 IMP uint64_t CreateWindowExA(DWORD, const char*, const char*, DWORD, int, int, int, int, uint64_t, uint64_t,
                              uint64_t, void*);
@@ -306,9 +309,37 @@ static void test_misc(void) {
   CHECK(!PeekMessageA(msg, 0, 0, 0, 1));
 }
 
+/* --------------------------------------------------------- GameInput */
+
+typedef HRESULT (*GiCurrentReading)(void*, uint32_t, void*, void**);
+typedef uint64_t (*GiTimestamp)(void*);
+typedef HRESULT (*GiRegisterDevice)(void*, void*, uint32_t, uint32_t, uint32_t, void*, void*, uint64_t*);
+typedef HRESULT (*GiCreateDispatcher)(void*, void**);
+typedef _Bool (*GiDispatch)(void*, uint64_t);
+typedef uint32_t (*Release)(void*);
+
+static void test_gameinput(void) {
+  void* gi = 0;
+  CHECK(GameInputCreate(&gi) == 0 && gi);
+  void** vt = *(void***)gi;
+  const uint64_t t1 = ((GiTimestamp)vt[3])(gi);
+  Sleep(2);
+  CHECK(((GiTimestamp)vt[3])(gi) > t1);
+  void* reading = (void*)1;
+  CHECK(((GiCurrentReading)vt[4])(gi, 0x40000 /*Gamepad*/, 0, &reading) == (HRESULT)0x838A0003 && reading == 0);
+  uint64_t token = 0;
+  CHECK(((GiRegisterDevice)vt[9])(gi, 0, 0x40000, 1, 1, 0, 0, &token) == 0 && token != 0);
+  void* dispatcher = 0;
+  CHECK(((GiCreateDispatcher)vt[14])(gi, &dispatcher) == 0 && dispatcher);
+  CHECK(!((GiDispatch)(*(void***)dispatcher)[3])(dispatcher, 0));
+  ((Release)(*(void***)dispatcher)[2])(dispatcher);
+  ((Release)vt[2])(gi);
+}
+
 DWORD guest_main(void* peb) {
   (void)peb;
   test_xmem();
+  test_gameinput();
   test_locale();
   test_time();
   test_topology();

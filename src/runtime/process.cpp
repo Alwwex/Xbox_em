@@ -188,6 +188,7 @@ int Process::run() {
   platform::install_crash_handler(&describe_address);
   platform::install_thread_dump(&describe_address, &describe_call_site);
   platform::set_memory_describer(&describe_virtual_memory);
+  platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&TrampolinePool::print_call_history);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;

@@ -49,7 +49,7 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -80,7 +80,7 @@ add_custom_command(
   COMMENT "Guest DLL tlsdll.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll ${GOUT}/tlsdll.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang breakpoint)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "system")
@@ -107,7 +107,7 @@ endforeach()
 # Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
 find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
 if(XBEM_MINGW_WINDRES)
-  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser)
+  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput)
   set(CONSOLE_DEPS)
   foreach(lib ${CONSOLE_LIBS})
     list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)
@@ -215,6 +215,10 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "XbemDefinitelyMissing\\(.*\\) from unimplemented.exe\\+0x[0-9a-f]+ \\(strict mode\\)")
   xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
   xbem_guest_test(guest_crt COMMAND run ${GOUT}/crt.exe EXPECT "PASS crt")
+  xbem_guest_test(guest_breakpoint_crash COMMAND run ${GOUT}/breakpoint.exe EXIT 133
+                  EXPECT "SIGTRAP \\(int3 breakpoint" "RIP=.*breakpoint.exe\\+0x")
+  xbem_guest_test(guest_breakpoint_continue COMMAND run ${GOUT}/breakpoint.exe --continue-after-breakpoint
+                  EXPECT "int3 breakpoint at breakpoint.exe\\+0x[0-9a-f]+ ignored" "PASS breakpoint")
   xbem_guest_test(guest_trace_hle COMMAND run ${GOUT}/seh.exe --trace-hle
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)

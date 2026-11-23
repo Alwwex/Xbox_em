@@ -8,6 +8,7 @@ void setup_thread_signal_stack() {}
 void install_thread_dump(AddressDescriber, CallSiteDescriber) {}
 void register_dump_thread(uint32_t, uint64_t, uint64_t) {}
 void set_memory_describer(AddressDescriber) {}
+void set_continue_after_breakpoint(bool) {}
 void set_thread_context_printer(ThreadContextPrinter) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
@@ -51,6 +52,7 @@ const char* signal_name(int sig) {
     case SIGILL: return "SIGILL (illegal instruction - CPU feature missing on host?)";
     case SIGFPE: return "SIGFPE (arithmetic exception)";
     case SIGBUS: return "SIGBUS (bus error)";
+    case SIGTRAP: return "SIGTRAP (int3 breakpoint: the title hit __debugbreak(), usually a failed check)";
     default: return "signal";
   }
 }
@@ -240,7 +242,21 @@ void describe_memory(uint64_t address, char* out, size_t out_size) {
   if (!out[0]) std::snprintf(out, out_size, "not memory the emulator handed out");
 }
 
+std::atomic<bool> g_continue_after_breakpoint{false};
+
 void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
+#if defined(__x86_64__)
+  if (sig == SIGTRAP && g_continue_after_breakpoint.load()) {
+    // int3 leaves RIP after the instruction: returning continues the title.
+    char line[320], where[256] = {0};
+    const uint64_t rip = static_cast<uint64_t>(static_cast<ucontext_t*>(ctx_raw)->uc_mcontext.gregs[REG_RIP]);
+    if (g_describer) g_describer(rip - 1, where, sizeof where);
+    std::snprintf(line, sizeof line, "[warn ][crash] int3 breakpoint at %s ignored (--continue-after-breakpoint)\n",
+                  where[0] ? where : "?");
+    write_str(line);
+    return;
+  }
+#endif
   const int self = current_tid();
   int expected = 0;
   if (!g_crash_tid.compare_exchange_strong(expected, self)) {
@@ -353,6 +369,7 @@ void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site
 }
 
 void set_memory_describer(AddressDescriber describer) { g_memory_describer = describer; }
+void set_continue_after_breakpoint(bool enabled) { g_continue_after_breakpoint.store(enabled); }
 void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
@@ -383,7 +400,7 @@ void install_crash_handler(AddressDescriber describer) {
   sa.sa_sigaction = crash_handler;
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   sigemptyset(&sa.sa_mask);
-  for (int sig : {SIGSEGV, SIGILL, SIGFPE, SIGBUS}) sigaction(sig, &sa, nullptr);
+  for (int sig : {SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP}) sigaction(sig, &sa, nullptr);
 }
 
 void setup_thread_signal_stack() {

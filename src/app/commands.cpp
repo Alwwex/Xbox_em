@@ -459,6 +459,8 @@ int cmd_run(const Args& args) {
       opt.strict = true;
     } else if (a == "--trace-hle") {
       opt.trace_hle = true;
+    } else if (a == "--continue-after-breakpoint") {
+      opt.continue_after_breakpoint = true;
     } else if (a == "--device") {
       const std::string& d = value();
       if (d == "series-x") opt.device = rt::DeviceType::XboxScarlettAnaconda;

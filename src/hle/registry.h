@@ -73,7 +73,8 @@ ModuleDef make_user32_module();
 ModuleDef make_ws2_32_module();
 ModuleDef make_winhttp_module();
 ModuleDef make_crypt32_module();
-std::vector<ModuleDef> make_media_modules();    // mfplat, mfreadwrite, gameinput, xaudio2_9
+std::vector<ModuleDef> make_media_modules();    // mfplat, mfreadwrite, xaudio2_9
+ModuleDef make_gameinput_module();
 std::vector<ModuleDef> make_console_modules();  // acphal, chad, xapu, xcrdapi, xg_xs
 
 // Pieces of kernelx implemented in separate files.

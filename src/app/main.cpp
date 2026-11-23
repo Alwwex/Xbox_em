@@ -30,6 +30,7 @@ void print_usage() {
       "      --strict                    stop at the first call to an unimplemented import\n"
       "      --trace-hle                 log calls to emulated functions; crash reports and Ctrl+C\n"
       "                                  dumps show each thread's last 64 calls\n"
+      "      --continue-after-breakpoint log int3/__debugbreak() in the title and keep running\n"
       "      --device series-x|series-s|devkit\n"
       "      --scratch DIR               host directory for the writable T:\\ drive\n"
       "      --mount X=DIR               mount an extra writable drive letter\n");

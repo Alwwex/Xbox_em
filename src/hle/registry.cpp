@@ -35,6 +35,7 @@ Registry::Registry() {
   modules_.push_back(make_winhttp_module());
   modules_.push_back(make_crypt32_module());
   for (ModuleDef& m : make_media_modules()) modules_.push_back(std::move(m));
+  modules_.push_back(make_gameinput_module());
   for (ModuleDef& m : make_console_modules()) modules_.push_back(std::move(m));
 
   export_index_.resize(modules_.size());
