@@ -47,7 +47,12 @@ constexpr std::array<void*, kSlots> make_vtable(std::index_sequence<I...>) {
   return {reinterpret_cast<void*>(&probe_method<static_cast<int>(I)>)...};
 }
 
-const std::array<void*, kSlots> g_probe_vtable = make_vtable(std::make_index_sequence<kSlots>{});
+// Built on first use: typed vtables in other files copy it during their own
+// static initialisation, whose order relative to this file is unspecified.
+const std::array<void*, kSlots>& probe_vtable() {
+  static const std::array<void*, kSlots> vtable = make_vtable(std::make_index_sequence<kSlots>{});
+  return vtable;
+}
 
 uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t ret) {
   if (slot == 1) return self->refs.fetch_add(1) + 1;  // AddRef
@@ -96,11 +101,11 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
 
 }  // namespace
 
-const ProbeVtable& default_probe_vtable() { return g_probe_vtable; }
+const ProbeVtable& default_probe_vtable() { return probe_vtable(); }
 
 void* make_probe_object(const std::string& name, const ProbeVtable* vtable, void* state) {
   auto* o = new ProbeObject;  // lives for the whole process
-  o->vtable = vtable ? vtable->data() : g_probe_vtable.data();
+  o->vtable = vtable ? vtable->data() : probe_vtable().data();
   o->name = name;
   o->state = state;
   return o;

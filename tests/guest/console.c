@@ -381,6 +381,12 @@ static void test_headless_d3d12(void) {
   void* device = 0;
   CHECK(D3D12XboxCreateDevice(0, 0, iid, &device) == 0 && device);
 
+  /* Methods without a typed implementation are logged probe slots, far past
+   * the PC interface (the console device has many more methods). */
+  typedef HRESULT (*AnyFn)(void*, uint64_t);
+  CHECK(((AnyFn)VT(device)[26])(device, 0) == 0);
+  CHECK(((AnyFn)VT(device)[300])(device, 0) == 0);
+
   void* fence = 0;
   CHECK(((CreateFenceFn)VT(device)[36])(device, 1, 0, iid, &fence) == 0 && fence);
   CHECK(((FenceValueFn)VT(fence)[8])(fence) == 1);
