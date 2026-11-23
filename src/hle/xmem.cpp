@@ -165,7 +165,7 @@ void* XBEM_GUEST_ABI hle_XMemVirtualAlloc(uint64_t a0, uint64_t a1, uint64_t a2,
     set_last_error(ERROR_INVALID_PARAMETER);
     return nullptr;
   }
-  void* p = virtual_alloc(reinterpret_cast<void*>(d.address), d.size, d.type, host_protect(d.protect), 0);
+  void* p = virtual_alloc(reinterpret_cast<void*>(d.address), d.size, d.type, host_protect(d.protect), 0, caller);
   if (log || !p) {
     XBEM_WARN("xmem",
               "XMemVirtualAlloc({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {}: decoded address={:#x} size={:#x} "

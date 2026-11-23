@@ -6,7 +6,8 @@ namespace xbem::platform {
 void install_crash_handler(AddressDescriber) {}
 void setup_thread_signal_stack() {}
 void install_thread_dump(AddressDescriber, CallSiteDescriber) {}
-void register_dump_thread(uint32_t, uint64_t) {}
+void register_dump_thread(uint32_t, uint64_t, uint64_t) {}
+void set_memory_describer(AddressDescriber) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
 
@@ -28,12 +29,13 @@ void unregister_dump_thread() {}
 #include <cstdlib>
 #include <cstring>
 
+#include "platform/memory.h"
+
 namespace xbem::platform {
 
 namespace {
 
 AddressDescriber g_describer = nullptr;
-std::atomic<bool> g_in_handler{false};
 
 void write_str(const char* s) {
   const size_t n = std::strlen(s);
@@ -51,66 +53,12 @@ const char* signal_name(int sig) {
   }
 }
 
-void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
-  if (g_in_handler.exchange(true)) _exit(128 + sig);  // crashed while reporting
-
-  char line[512];
-  char where[256];
-  write_str("\n================ xbem: guest crash ================\n");
-  std::snprintf(line, sizeof line, "%s, fault address 0x%016llx\n", signal_name(sig),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(info->si_addr)));
-  write_str(line);
-
-#if defined(__x86_64__)
-  auto* uc = static_cast<ucontext_t*>(ctx_raw);
-  const greg_t* g = uc->uc_mcontext.gregs;
-  const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
-  where[0] = 0;
-  if (g_describer) g_describer(rip, where, sizeof where);
-  std::snprintf(line, sizeof line, "RIP=%016llx  %s\n", static_cast<unsigned long long>(rip), where);
-  write_str(line);
-
-  struct {
-    const char* name;
-    int reg;
-  } regs[] = {{"RAX", REG_RAX}, {"RBX", REG_RBX}, {"RCX", REG_RCX}, {"RDX", REG_RDX}, {"RSI", REG_RSI},
-              {"RDI", REG_RDI}, {"RBP", REG_RBP}, {"RSP", REG_RSP}, {"R8 ", REG_R8},  {"R9 ", REG_R9},
-              {"R10", REG_R10}, {"R11", REG_R11}, {"R12", REG_R12}, {"R13", REG_R13}, {"R14", REG_R14},
-              {"R15", REG_R15}};
-  for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
-    std::snprintf(line, sizeof line, "%s=%016llx%s", regs[i].name,
-                  static_cast<unsigned long long>(g[regs[i].reg]), (i % 4 == 3) ? "\n" : "  ");
-    write_str(line);
-  }
-
-  // Best-effort return-address scan of the top of the stack.
-  write_str("Stack (possible return addresses):\n");
-  const uint64_t* sp = reinterpret_cast<const uint64_t*>(g[REG_RSP]);
-  int shown = 0;
-  for (int i = 0; i < 256 && shown < 12; ++i) {
-    const uint64_t v = sp[i];
-    where[0] = 0;
-    if (g_describer) g_describer(v, where, sizeof where);
-    if (where[0] && std::strstr(where, "+0x")) {
-      std::snprintf(line, sizeof line, "  [rsp+0x%03x] %016llx  %s\n", i * 8, static_cast<unsigned long long>(v),
-                    where);
-      write_str(line);
-      ++shown;
-    }
-  }
-#else
-  (void)ctx_raw;
-  (void)where;
-#endif
-  write_str("===================================================\n");
-  _exit(128 + sig);
-}
-
 // ------------------------------------------------------------ thread dump
 
 struct DumpSlot {
   std::atomic<int> tid{0};
   uint32_t guest_id = 0;
+  uint64_t stack_low = 0;
   uint64_t stack_high = 0;
 };
 constexpr int kMaxDumpThreads = 1024;
@@ -226,6 +174,127 @@ void interrupt_handler(int sig, siginfo_t*, void* ctx) {
   g_dump_active.store(0);
 }
 
+
+AddressDescriber g_memory_describer = nullptr;
+std::atomic<int> g_crash_tid{0};
+
+const DumpSlot* slot_of_tid(int tid) {
+  for (const DumpSlot& s : g_dump_slots)
+    if (s.tid.load() == tid) return &s;
+  return nullptr;
+}
+
+// Where an address points: module+offset, a guest thread's stack, or a
+// VirtualAlloc region (with the allocating call site).
+void describe_memory(uint64_t address, char* out, size_t out_size) {
+  out[0] = 0;
+  if (g_describer) g_describer(address, out, out_size);
+  if (out[0]) return;
+  for (const DumpSlot& s : g_dump_slots) {
+    if (s.tid.load() && address >= s.stack_low && address < s.stack_high) {
+      std::snprintf(out, out_size, "stack of guest thread %u [%#llx, %#llx)", s.guest_id,
+                    static_cast<unsigned long long>(s.stack_low), static_cast<unsigned long long>(s.stack_high));
+      return;
+    }
+  }
+  if (g_memory_describer) g_memory_describer(address, out, out_size);
+  if (!out[0]) std::snprintf(out, out_size, "not memory the emulator handed out");
+}
+
+void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
+  const int self = current_tid();
+  int expected = 0;
+  if (!g_crash_tid.compare_exchange_strong(expected, self)) {
+    if (expected == self) _exit(128 + sig);  // crashed while reporting
+    for (;;) pause();                        // another thread is reporting; it will end the process
+  }
+
+  char line[600];
+  char where[300];
+  write_str("\n================ xbem: guest crash ================\n");
+  const uint64_t fault = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info->si_addr));
+  const DumpSlot* slot = slot_of_tid(self);
+  std::snprintf(line, sizeof line, "%s, fault address 0x%016llx, guest thread %u (host tid %d)\n", signal_name(sig),
+                static_cast<unsigned long long>(fault), slot ? slot->guest_id : 0, self);
+  write_str(line);
+
+#if defined(__x86_64__)
+  auto* uc = static_cast<ucontext_t*>(ctx_raw);
+  const greg_t* g = uc->uc_mcontext.gregs;
+  const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
+  const uint64_t rsp = static_cast<uint64_t>(g[REG_RSP]);
+  where[0] = 0;
+  if (g_describer) g_describer(rip, where, sizeof where);
+  std::snprintf(line, sizeof line, "RIP=%016llx  %s\n", static_cast<unsigned long long>(rip), where);
+  write_str(line);
+
+  struct {
+    const char* name;
+    int reg;
+  } regs[] = {{"RAX", REG_RAX}, {"RBX", REG_RBX}, {"RCX", REG_RCX}, {"RDX", REG_RDX}, {"RSI", REG_RSI},
+              {"RDI", REG_RDI}, {"RBP", REG_RBP}, {"RSP", REG_RSP}, {"R8 ", REG_R8},  {"R9 ", REG_R9},
+              {"R10", REG_R10}, {"R11", REG_R11}, {"R12", REG_R12}, {"R13", REG_R13}, {"R14", REG_R14},
+              {"R15", REG_R15}};
+  for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+    std::snprintf(line, sizeof line, "%s=%016llx%s", regs[i].name,
+                  static_cast<unsigned long long>(g[regs[i].reg]), (i % 4 == 3) ? "\n" : "  ");
+    write_str(line);
+  }
+
+  // Code around RIP, for disassembly.
+  uint8_t code[48];
+  if (safe_read(rip - 16, code, sizeof code)) {
+    char* o = line;
+    o += std::snprintf(o, 40, "Code (RIP-16..RIP+32):");
+    for (size_t i = 0; i < sizeof code; ++i)
+      o += std::snprintf(o, 8, i == 16 ? " [%02x]" : " %02x", code[i]);
+    std::snprintf(o, 4, "\n");
+    write_str(line);
+  }
+
+  // Which memory the fault address and the stack pointer belong to.
+  describe_memory(fault, where, sizeof where);
+  std::snprintf(line, sizeof line, "Fault address: %s\n", where);
+  write_str(line);
+  describe_memory(rsp, where, sizeof where);
+  uint64_t probe;
+  std::snprintf(line, sizeof line, "Stack pointer: %s%s\n", where,
+                safe_read(rsp, &probe, 8) ? "" : "  ** RSP IS NOT READABLE (stack switched to bad memory?) **");
+  write_str(line);
+  if (slot && fault < slot->stack_low && fault + 0x100000 >= slot->stack_low)
+    write_str("Looks like a STACK OVERFLOW of this guest thread.\n");
+
+  // Return-address scan of the stack (reads are checked, never fault).
+  write_str("Stack (likely return addresses):\n");
+  int shown = 0;
+  // After a stack overflow RSP is below the stack: scan from its bottom instead.
+  const uint64_t scan = (!safe_read(rsp, &probe, 8) && slot && rsp < slot->stack_low) ? slot->stack_low : rsp;
+  for (uint64_t p = scan & ~7ull; shown < 16 && p - scan < 0x20000; p += 8) {
+    uint64_t v;
+    if (!safe_read(p, &v, 8)) break;
+    if (v < 0x10000) continue;
+    where[0] = 0;
+    if (g_describer) g_describer(v, where, sizeof where);
+    if (!where[0] || !std::strstr(where, "+0x")) continue;
+    uint8_t before[7];
+    if (!safe_read(v - 7, before, 7) || !preceded_by_call(v)) continue;
+    char call[256] = {0};
+    if (g_call_site) g_call_site(v, call, sizeof call);
+    std::snprintf(line, sizeof line, "  [%s+0x%05llx] %s%s%s\n", scan == rsp ? "rsp" : "stack bottom",
+                  static_cast<unsigned long long>(p - scan), where, call[0] ? "  " : "", call);
+    write_str(line);
+    ++shown;
+  }
+  if (!shown) write_str("  (none found)\n");
+#else
+  (void)ctx_raw;
+  (void)where;
+  (void)line;
+#endif
+  write_str("===================================================\n");
+  _exit(128 + sig);
+}
+
 }  // namespace
 
 void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site) {
@@ -242,12 +311,15 @@ void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site
   sigaction(SIGQUIT, &sa, nullptr);
 }
 
-void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_high) {
+void set_memory_describer(AddressDescriber describer) { g_memory_describer = describer; }
+
+void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();
   for (DumpSlot& s : g_dump_slots) {
     int expected = 0;
     if (s.tid.compare_exchange_strong(expected, self)) {
       s.guest_id = guest_thread_id;
+      s.stack_low = stack_low;
       s.stack_high = stack_high;
       return;
     }

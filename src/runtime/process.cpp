@@ -12,6 +12,7 @@
 #include "common/log.h"
 #include "common/strings.h"
 #include "hle/guest_types.h"
+#include "hle/heap.h"
 #include "hle/registry.h"
 #include "platform/crash.h"
 #include "platform/memory.h"
@@ -37,6 +38,11 @@ void describe_address(uint64_t address, char* out, size_t out_size) {
   if (!p) return;
   if (p->loader().describe(address, out, out_size)) return;
   if (p->trampolines().contains(address)) std::snprintf(out, out_size, "<xbem import stub>");
+}
+
+void describe_virtual_memory(uint64_t address, char* out, size_t out_size) {
+  out[0] = 0;
+  hle::describe_virtual_memory(address, out, out_size);
 }
 
 // For thread dumps: what the call instruction ending at `ret` calls. Handles
@@ -177,9 +183,14 @@ int Process::run() {
 
   platform::install_crash_handler(&describe_address);
   platform::install_thread_dump(&describe_address, &describe_call_site);
+  platform::set_memory_describer(&describe_virtual_memory);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
-  const size_t stack = static_cast<size_t>(std::max<uint64_t>(reserve, 1u << 20)) + (512u << 10);
+  // Generous: host pages are only used when touched, and console titles can
+  // use large frames early (the console may give the main thread more than
+  // the header asks for). 16 MiB minimum plus room for host code.
+  const size_t stack = static_cast<size_t>(std::max<uint64_t>(reserve, 16u << 20)) + (1u << 20);
+  XBEM_DEBUG("process", "main thread stack {:#x} (image reserve {:#x})", stack, reserve);
 
   std::shared_ptr<GuestThread> t = std::make_shared<GuestThread>();
   t->is_main = true;
@@ -238,6 +249,7 @@ bool Process::setup_thread_environment(GuestThread& t) {
   platform::current_stack_bounds(low, high);
   field<uint64_t>(t.teb, teb::kStackBase) = high;
   field<uint64_t>(t.teb, teb::kStackLimit) = low;
+  field<uint64_t>(t.teb, 0x1478) = low;  // DeallocationStack (read by stack-size checks)
   field<uint64_t>(t.teb, teb::kSelf) = reinterpret_cast<uint64_t>(t.teb);
   field<uint64_t>(t.teb, teb::kClientIdProcess) = process_id_;
   field<uint64_t>(t.teb, teb::kClientIdThread) = t.id;
@@ -317,9 +329,10 @@ void Process::thread_main(GuestThread& t) {
     return;
   }
   {
-    uint64_t stack_high = 0;
+    uint64_t stack_low = 0, stack_high = 0;
+    std::memcpy(&stack_low, t.teb + teb::kStackLimit, 8);
     std::memcpy(&stack_high, t.teb + teb::kStackBase, 8);
-    platform::register_dump_thread(t.id, stack_high);
+    platform::register_dump_thread(t.id, stack_low, stack_high);
   }
   {
     std::unique_lock lock(sync_mutex());
@@ -375,9 +388,13 @@ std::shared_ptr<GuestThread> Process::create_thread(uint64_t start, uint64_t par
   t->start_routine = start;
   t->parameter = param;
   t->suspend_count = suspended ? 1 : 0;
-  if (stack_size == 0 && loader_->main_module() && loader_->main_module()->image)
-    stack_size = loader_->main_module()->image->optional_header().SizeOfStackReserve;
-  t->stack_size = std::max<size_t>(stack_size, 256u << 10) + (256u << 10);  // + room for host code
+  // Windows gives a thread at least the image's default reserve (the size
+  // argument is normally a commit size). Host pages are only used when touched.
+  uint64_t image_reserve = 0;
+  if (loader_->main_module() && loader_->main_module()->image)
+    image_reserve = loader_->main_module()->image->optional_header().SizeOfStackReserve;
+  stack_size = static_cast<size_t>(std::max<uint64_t>({stack_size, image_reserve, 2u << 20}));
+  t->stack_size = stack_size + (1u << 20);  // + room for host code
   {
     std::lock_guard lock(threads_mutex_);
     t->id = next_thread_id_;

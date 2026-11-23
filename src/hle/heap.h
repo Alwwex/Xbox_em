@@ -17,8 +17,12 @@ size_t heap_block_size(const void* p);  // ~0 if not owned
 
 // Virtual memory (VirtualAlloc/VirtualFree/VirtualQuery semantics, Win32 last
 // error set on failure). `alignment` 0 = default for the allocation type.
-void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment);
+void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment,
+                    uint64_t caller = 0);
 bool virtual_free(void* address, uint64_t size, uint32_t type);
+// For crash reports: describes the VirtualAlloc region containing `address`
+// (who allocated it and with which protection). Never blocks.
+bool describe_virtual_memory(uint64_t address, char* out, size_t out_size);
 size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
 
 }  // namespace xbem::hle

@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <cstdio>
 #include <mutex>
 
+#include "hle/discovery.h"
 #include "hle/heap.h"
 #include "hle/hle_util.h"
 #include "platform/memory.h"
@@ -77,7 +79,11 @@ constexpr size_t kGranularity = platform::kAllocationGranularity;
 
 struct Reservation {
   uint64_t size;
-  DWORD protect;
+  DWORD protect;            // protection given at reservation
+  DWORD type = 0;           // allocation type of the reservation
+  uint64_t caller = 0;      // guest return address of the allocating call
+  DWORD commit_protect = 0; // last commit / VirtualProtect
+  uint64_t commit_caller = 0;
 };
 
 std::mutex g_vm_mutex;
@@ -108,7 +114,8 @@ std::map<uint64_t, Reservation>::iterator find_reservation(uint64_t addr) {
 
 }  // namespace
 
-void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment) {
+void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment,
+                    uint64_t caller) {
   if (size == 0) {
     set_last_error(ERROR_INVALID_PARAMETER);
     return nullptr;
@@ -126,7 +133,15 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
 
   const size_t ps = platform::page_size();
   const auto addr = reinterpret_cast<uint64_t>(address);
+  XBEM_DEBUG("kernelx", "VirtualAlloc({:#x}, {:#x}, type {:#x}, protect {:#x}) from {:#x}", addr, size, type, protect,
+             caller);
   if (type & MEM_RESET) return address;  // contents may be discarded - keeping them is valid
+  if (type & 0x1000000 /*MEM_RESET_UNDO*/) return address;
+  if (!(type & (MEM_COMMIT | MEM_RESERVE))) {
+    // Neither reserve nor commit: nothing to do (never change the protection).
+    set_last_error(ERROR_INVALID_PARAMETER);
+    return nullptr;
+  }
   const bool commit = type & MEM_COMMIT;
   const Prot prot = commit ? to_prot(protect) : Prot::None;
 
@@ -147,7 +162,7 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
       set_last_error(address ? ERROR_INVALID_ADDRESS : ERROR_NOT_ENOUGH_MEMORY);
       return nullptr;
     }
-    g_reservations[base] = Reservation{length, protect};
+    g_reservations[base] = Reservation{length, protect, type, caller, commit ? protect : 0, commit ? caller : 0};
     XBEM_TRACE("kernelx", "VirtualAlloc reserve {:#x} +{:#x} commit={}", base, length, commit);
     return p;
   }
@@ -164,13 +179,15 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
     set_last_error(ERROR_INVALID_ADDRESS);
     return nullptr;
   }
+  it->second.commit_protect = protect;
+  it->second.commit_caller = caller;
   return reinterpret_cast<void*>(start);
 }
 
 namespace {
 
 void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DWORD protect) {
-  return virtual_alloc(address, size, type, protect, 0);
+  return virtual_alloc(address, size, type, protect, 0, XBEM_RETURN_ADDRESS());
 }
 
 BOOL XBEM_GUEST_ABI hle_VirtualFree(void* address, SIZE_T size, DWORD type) {
@@ -212,6 +229,13 @@ BOOL XBEM_GUEST_ABI hle_VirtualProtect(void* address, SIZE_T size, DWORD protect
   const uint64_t start = platform::align_down(addr, ps);
   const uint64_t end = platform::align_up(addr + size, ps);
   *old_protect = PAGE_READWRITE;  // per-page protections are not tracked yet
+  {
+    std::lock_guard lock(g_vm_mutex);
+    if (auto it = find_reservation(addr); it != g_reservations.end()) {
+      it->second.commit_protect = protect;
+      it->second.commit_caller = XBEM_RETURN_ADDRESS();
+    }
+  }
   if (!platform::protect(reinterpret_cast<void*>(start), end - start, to_prot(protect))) {
     set_last_error(ERROR_INVALID_ADDRESS);
     return FALSE;
@@ -335,6 +359,20 @@ void* XBEM_GUEST_ABI hle_GlobalAlloc(UINT flags, SIZE_T size) { return heap_allo
 void* XBEM_GUEST_ABI hle_GlobalFree(void* p) { return heap_free(p) ? nullptr : p; }
 
 }  // namespace
+
+bool describe_virtual_memory(uint64_t address, char* out, size_t out_size) {
+  std::unique_lock lock(g_vm_mutex, std::try_to_lock);  // may run in a signal handler: never block
+  if (!lock.owns_lock()) return false;
+  auto it = find_reservation(address);
+  if (it == g_reservations.end()) return false;
+  const Reservation& r = it->second;
+  std::snprintf(out, out_size,
+                "VirtualAlloc region %#llx+%#llx (type %#x, protect %#x, by %#llx; last commit/protect %#x by %#llx)",
+                static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(r.size), r.type, r.protect,
+                static_cast<unsigned long long>(r.caller), r.commit_protect,
+                static_cast<unsigned long long>(r.commit_caller));
+  return true;
+}
 
 bool virtual_free(void* address, uint64_t size, uint32_t type) { return hle_VirtualFree(address, size, type) != 0; }
 

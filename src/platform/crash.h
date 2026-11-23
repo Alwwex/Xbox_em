@@ -26,7 +26,10 @@ using CallSiteDescriber = void (*)(uint64_t return_address, char* out, size_t ou
 // stack, with the imported function each call site calls - and exits.
 // Ctrl+\ (SIGQUIT) prints the same dump and lets the title continue.
 void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site);
-void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_high);
+void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high);
+
+// Crash reports also say which allocation a fault address / stack pointer is in.
+void set_memory_describer(AddressDescriber describer);
 void unregister_dump_thread();
 
 }  // namespace xbem::platform
