@@ -16,6 +16,7 @@
 // adds methods, so typed slots log their calls; a mismatch shows up in the run
 // log as calls with implausible arguments.
 
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <filesystem>
@@ -287,6 +288,54 @@ HRESULT create_into(void* object, void** out) {
 
 UINT XBEM_GUEST_ABI device_get_node_count(ProbeObject*) { return 1; }
 
+// Interface IDs that mean "the D3D12 device itself": the IID the title created
+// the device with, plus the public ID3D12Device..ID3D12Device9 IIDs.
+std::mutex g_device_iid_mutex;
+std::vector<std::array<uint8_t, 16>> g_device_iids;
+
+bool is_device_iid(const uint8_t* iid) {
+  static const uint32_t kPublic[] = {0x189819f1, 0x77acce80, 0x30baa41e, 0x81dadc15, 0x8754318e, 0x9727a022,
+                                     0xc70b221b, 0x5c014b53, 0x9218e6bb, 0x4c80e962};
+  uint32_t first;
+  std::memcpy(&first, iid, 4);
+  for (uint32_t p : kPublic)
+    if (first == p) return true;
+  std::lock_guard lock(g_device_iid_mutex);
+  for (const auto& known : g_device_iids)
+    if (std::memcmp(known.data(), iid, 16) == 0) return true;
+  return false;
+}
+
+// QueryInterface: the device for D3D12 device IIDs; any other interface (for
+// example IDXGIDevice, from which titles get the adapter and its outputs) is a
+// separate object, so its methods do not collide with the device's slots.
+HRESULT XBEM_GUEST_ABI device_query_interface(ProbeObject* self, const uint8_t* iid, void** out) {
+  if (!out) return E_POINTER;
+  uint8_t id[16] = {};
+  if (iid) platform::safe_read(reinterpret_cast<uint64_t>(iid), id, 16);
+  if (is_device_iid(id)) {
+    self->refs.fetch_add(1);
+    *out = self;
+    return S_OK;
+  }
+  static std::mutex mutex;
+  static std::vector<std::pair<std::array<uint8_t, 16>, void*>> interfaces;
+  std::lock_guard lock(mutex);
+  std::array<uint8_t, 16> key;
+  std::memcpy(key.data(), id, 16);
+  for (auto& [k, object] : interfaces)
+    if (k == key) {
+      *out = object;
+      return S_OK;
+    }
+  void* object = make_probe_object(std::format("d3d12.device.as{{{}}}", guid_to_string(id)));
+  interfaces.emplace_back(key, object);
+  probe_log(self, 0, std::format("QueryInterface({{{}}}) -> separate interface object", guid_to_string(id)),
+            XBEM_RETURN_ADDRESS());
+  *out = object;
+  return S_OK;
+}
+
 // 8 CreateCommandQueue(desc, riid, ppv)
 HRESULT XBEM_GUEST_ABI device_create_command_queue(ProbeObject* self, const uint32_t* desc, const void*, void** out) {
   probe_log(self, 8, std::format("CreateCommandQueue(type {})", desc ? desc[0] : 0), XBEM_RETURN_ADDRESS());
@@ -362,6 +411,7 @@ HRESULT XBEM_GUEST_ABI device_create_fence(ProbeObject* self, uint64_t initial, 
 HRESULT XBEM_GUEST_ABI device_get_removed_reason(ProbeObject*) { return S_OK; }
 
 const ProbeVtable g_device_vtable = make_vtable({
+    {0, fn(&device_query_interface)},
     {7, fn(&device_get_node_count)},
     {8, fn(&device_create_command_queue)},
     {10, fn(&device_create_graphics_pso)},
@@ -378,7 +428,14 @@ const ProbeVtable g_device_vtable = make_vtable({
 
 }  // namespace
 
-void* create_headless_d3d12_device() {
+void* create_headless_d3d12_device(const void* iid) {
+  if (iid) {
+    std::array<uint8_t, 16> id{};
+    if (platform::safe_read(reinterpret_cast<uint64_t>(iid), id.data(), 16)) {
+      std::lock_guard lock(g_device_iid_mutex);
+      g_device_iids.push_back(id);
+    }
+  }
   static void* device = make_probe_object("d3d12.device", &g_device_vtable);
   return device;
 }

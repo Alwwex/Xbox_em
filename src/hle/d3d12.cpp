@@ -18,23 +18,23 @@ using namespace win;
 // HRESULT D3D12XboxCreateDevice(IGraphicsUnknown* adapter, const D3D12XBOX_CREATE_DEVICE_PARAMETERS*, REFIID, void**)
 // Without a rendering backend the title gets the headless device: GPU work
 // completes instantly and nothing is drawn, so its CPU side keeps running.
-HRESULT headless_device(const char* function, const void* params, void** device) {
+HRESULT headless_device(const char* function, const void* params, const void* iid, void** device) {
   const gpu::BackendInfo info = gpu::active_backend().info();
   XBEM_WARN("d3d12", "{}: GPU backend '{}' cannot render - using the HEADLESS device (GPU work completes "
             "instantly, nothing is drawn)", function, info.name);
   if (params) XBEM_INFO("d3d12", "{} parameters: {}", function, describe_arg(reinterpret_cast<uint64_t>(params)));
   if (!device) return E_POINTER;
-  *device = create_headless_d3d12_device();
+  *device = create_headless_d3d12_device(iid);
   return S_OK;
 }
 
-HRESULT XBEM_GUEST_ABI hle_D3D12XboxCreateDevice(void*, const void* params, const void*, void** device) {
-  return headless_device("D3D12XboxCreateDevice", params, device);
+HRESULT XBEM_GUEST_ABI hle_D3D12XboxCreateDevice(void*, const void* params, const void* iid, void** device) {
+  return headless_device("D3D12XboxCreateDevice", params, iid, device);
 }
 
 // HRESULT D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL, REFIID, void**)
-HRESULT XBEM_GUEST_ABI hle_D3D12CreateDevice(void*, uint32_t, const void*, void** device) {
-  return headless_device("D3D12CreateDevice", nullptr, device);
+HRESULT XBEM_GUEST_ABI hle_D3D12CreateDevice(void*, uint32_t, const void* iid, void** device) {
+  return headless_device("D3D12CreateDevice", nullptr, iid, device);
 }
 
 HRESULT XBEM_GUEST_ABI hle_D3D12GetDebugInterface(const void*, void** out) {

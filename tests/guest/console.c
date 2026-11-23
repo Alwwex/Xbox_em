@@ -388,6 +388,21 @@ static void test_headless_d3d12(void) {
   void* device = 0;
   CHECK(D3D12XboxCreateDevice(0, 0, iid, &device) == 0 && device);
 
+  /* The title's DXGI path: device -> QueryInterface(IDXGIDevice) ->
+   * GetAdapter(&adapter) -> EnumOutputs(0, &output), all via zeroed outputs. */
+  typedef HRESULT (*QiFn)(void*, const void*, void**);
+  typedef HRESULT (*OutFn)(void*, void**);
+  typedef HRESULT (*IndexOutFn)(void*, uint32_t, void**);
+  static const uint8_t dxgi_iid[16] = {0xfa, 0x77, 0xec, 0x54};
+  void* same = 0;
+  CHECK(((QiFn)VT(device)[0])(device, iid, &same) == 0 && same == device);
+  void* dxgi = 0;
+  CHECK(((QiFn)VT(device)[0])(device, dxgi_iid, &dxgi) == 0 && dxgi && dxgi != device);
+  void* adapter = 0;
+  CHECK(((OutFn)VT(dxgi)[7])(dxgi, &adapter) == 0 && adapter);
+  void* output = 0;
+  CHECK(((IndexOutFn)VT(adapter)[7])(adapter, 0, &output) == 0 && output);
+
   /* Methods without a typed implementation are logged probe slots, far past
    * the PC interface (the console device has many more methods). */
   typedef HRESULT (*AnyFn)(void*, uint64_t);
