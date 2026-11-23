@@ -9,6 +9,7 @@ void install_thread_dump(AddressDescriber, CallSiteDescriber) {}
 void register_dump_thread(uint32_t, uint64_t, uint64_t) {}
 void set_memory_describer(AddressDescriber) {}
 void set_continue_after_breakpoint(bool) {}
+const char* patch_cache_hint_instruction(uint8_t*) { return nullptr; }
 void set_thread_context_printer(ThreadContextPrinter) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
@@ -20,6 +21,7 @@ void unregister_dump_thread() {}
 #endif
 #include <sched.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
 #include <time.h>
@@ -244,8 +246,106 @@ void describe_memory(uint64_t address, char* out, size_t out_size) {
 
 std::atomic<bool> g_continue_after_breakpoint{false};
 
+#if defined(__x86_64__)
+// Instructions of the console CPU (AMD Zen 2) that the host CPU may lack.
+// Cache write-back hints (CLWB, CLFLUSHOPT) are rewritten in place into a NOP
+// of the same length (memory is coherent: they have no visible effect);
+// CLZERO, MONITORX and MWAITX are emulated each time.
+std::atomic<uint32_t> g_patched_kinds{0};
+
+void note_patch(uint32_t kind, const char* what, uint64_t rip) {
+  if (g_patched_kinds.fetch_or(kind) & kind) return;
+  char line[400], where[256] = {0};
+  if (g_describer) g_describer(rip, where, sizeof where);
+  std::snprintf(line, sizeof line, "[warn ][cpu  ] %s at %s is not supported by this CPU - %s\n", what,
+                where[0] ? where : "?",
+                kind <= 2 ? "replaced with a NOP (cache hint only)" : "emulated");
+  write_str(line);
+}
+
+bool make_writable(uint64_t address, size_t size) {
+  const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+  const uint64_t start = address & ~(page - 1);
+  const uint64_t end = (address + size + page - 1) & ~(page - 1);
+  return mprotect(reinterpret_cast<void*>(start), end - start, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+}
+
+struct DecodedPrefixes {
+  size_t opcode = 0;  // index of the 0F escape
+  bool opsize = false;
+};
+
+DecodedPrefixes skip_prefixes(const uint8_t* code) {
+  DecodedPrefixes d;
+  size_t i = 0;
+  for (; i < 4; ++i) {  // legacy prefixes
+    const uint8_t b = code[i];
+    if (b == 0x66) d.opsize = true;
+    else if (!(b == 0xF2 || b == 0xF3 || b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 ||
+               b == 0x65 || b == 0x67))
+      break;
+  }
+  if ((code[i] & 0xF0) == 0x40) ++i;  // REX
+  d.opcode = i;
+  return d;
+}
+
+}  // namespace
+
+const char* patch_cache_hint_instruction(uint8_t* code) {
+  const DecodedPrefixes d = skip_prefixes(code);
+  const size_t i = d.opcode;
+  if (code[i] != 0x0F || code[i + 1] != 0xAE || !d.opsize) return nullptr;
+  const uint8_t modrm = code[i + 2];
+  const int reg = (modrm >> 3) & 7;
+  if ((modrm >> 6) == 3 || reg < 6) return nullptr;
+  // 66 0F AE /6 CLWB m8, 66 0F AE /7 CLFLUSHOPT m8 -> 66 0F 1F /0 NOP m16: the
+  // same length and addressing bytes, and it touches no memory.
+  if (!make_writable(reinterpret_cast<uint64_t>(code + i + 1), 2)) return nullptr;
+  code[i + 1] = 0x1F;
+  code[i + 2] = static_cast<uint8_t>(modrm & ~0x38);
+  __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code + i + 3));
+  return reg == 6 ? "CLWB" : "CLFLUSHOPT";
+}
+
+namespace {
+
+// Returns true when execution can continue at the (possibly updated) RIP.
+bool handle_unsupported_instruction(ucontext_t* uc) {
+  greg_t* g = uc->uc_mcontext.gregs;
+  auto* code = reinterpret_cast<uint8_t*>(g[REG_RIP]);
+  const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
+  if (const char* what = patch_cache_hint_instruction(code)) {
+    note_patch(what[2] == 'W' ? 1 : 2, what, rip);
+    return true;
+  }
+  const DecodedPrefixes d = skip_prefixes(code);
+  const size_t i = d.opcode;
+  const bool opsize = d.opsize;
+  if (code[i] != 0x0F) return false;
+  const uint8_t op = code[i + 1], modrm = code[i + 2];
+  if (op == 0x1F && opsize && ((modrm >> 3) & 7) == 0) return true;  // patched by another thread meanwhile
+  if (op == 0x01 && i == 0) {
+    if (modrm == 0xFC) {  // CLZERO: zero the 64-byte line at RAX
+      auto* line = reinterpret_cast<uint64_t*>(static_cast<uint64_t>(g[REG_RAX]) & ~63ull);
+      for (int k = 0; k < 8; ++k) line[k] = 0;
+      g[REG_RIP] += 3;
+      note_patch(4, "CLZERO", rip);
+      return true;
+    }
+    if (modrm == 0xFA || modrm == 0xFB) {  // MONITORX / MWAITX: wake up at once
+      g[REG_RIP] += 3;
+      note_patch(8, modrm == 0xFA ? "MONITORX" : "MWAITX", rip);
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
 #if defined(__x86_64__)
+  if (sig == SIGILL && handle_unsupported_instruction(static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGTRAP && g_continue_after_breakpoint.load()) {
     // int3 leaves RIP after the instruction: returning continues the title.
     char line[320], where[256] = {0};

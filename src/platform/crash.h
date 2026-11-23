@@ -35,6 +35,12 @@ void set_memory_describer(AddressDescriber describer);
 // report; when enabled, it is logged and execution continues.
 void set_continue_after_breakpoint(bool enabled);
 
+// Console-CPU instructions the host may lack are handled when they fault
+// (SIGILL). Cache write-back hints (CLWB, CLFLUSHOPT) are rewritten in place
+// into a same-length NOP; returns the instruction's name, or nullptr when the
+// code is not one of them. Exposed for tests.
+const char* patch_cache_hint_instruction(uint8_t* code);
+
 // Prints extra per-thread context (e.g. the thread's recent emulated calls)
 // into crash reports and thread dumps, using the given writer.
 using ThreadContextPrinter = void (*)(void (*write)(const char*));

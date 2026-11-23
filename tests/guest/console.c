@@ -148,6 +148,20 @@ static void test_xmem(void) {
   CHECK(VirtualFree(ph, 0, MEM_RELEASE));
 }
 
+/* ------------------------------------------------- console CPU (Zen 2) */
+
+/* Zen 2 instructions a host CPU may lack: cache hints are patched into NOPs,
+ * CLZERO is emulated (an Intel host faults on it). */
+static void test_zen2_instructions(void) {
+  static uint8_t buf[256] __attribute__((aligned(64)));
+  for (int i = 0; i < 256; ++i) buf[i] = 0xEE;
+  uint8_t* p = buf + 64;
+  __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x30" ::"a"(p) : "memory"); /* clwb [rax] */
+  __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x38" ::"a"(p) : "memory"); /* clflushopt [rax] */
+  __asm__ volatile(".byte 0x0f, 0x01, 0xfc" ::"a"(p + 5) : "memory");   /* clzero: line of rax */
+  CHECK(buf[63] == 0xEE && buf[64] == 0 && buf[127] == 0 && buf[128] == 0xEE);
+}
+
 /* --------------------------------------------------------------- locale */
 
 static void test_locale(void) {
@@ -518,6 +532,7 @@ static void test_headless_d3d12(void) {
 DWORD guest_main(void* peb) {
   (void)peb;
   test_xmem();
+  test_zen2_instructions();
   test_headless_d3d12();
   test_dstorage_probe();
   test_gameinput();
