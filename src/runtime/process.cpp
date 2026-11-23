@@ -85,6 +85,12 @@ int Process::run() {
   }
 
   layout_ = package::scan_package(options_.target);
+  if (!layout_.missing_executable.empty()) {
+    XBEM_ERROR("process", "MicrosoftGame.config names '{}' as the game executable, but that file is not in {}. "
+               "The build is incomplete - the main executable is missing.",
+               layout_.missing_executable, layout_.root.string());
+    return 2;
+  }
   if (layout_.main_executable.empty()) {
     XBEM_ERROR("process", "could not determine the game executable in {} (no MicrosoftGame.config "
                "and not exactly one .exe at the top level) - pass the .exe directly",

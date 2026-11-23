@@ -90,3 +90,15 @@ TEST(package_scan_reports_broken_config) {
   CHECK(!layout.config.has_value());
   CHECK(!layout.config_error.empty());
 }
+
+TEST(package_scan_reports_missing_executable) {
+  // MicrosoftGame.config names an exe that is not in the folder (incomplete build).
+  const fs::path root = make_temp_dir("pkg4");
+  touch(root / "MicrosoftGame.config", kConfig);
+  touch(root / "helper.dll");
+  touch(root / "gameos.xvd");
+  const auto layout = package::scan_package(root);
+  CHECK(layout.main_executable.empty());
+  CHECK_EQ(layout.missing_executable, std::string("Bin\\ConsoleGame.exe"));
+  CHECK_EQ(layout.container_files.size(), 1u);
+}

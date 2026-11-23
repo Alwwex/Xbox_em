@@ -339,7 +339,11 @@ int cmd_package(const Args& args) {
     for (const auto& e : c.executables)
       out("Executable:      {}  (TargetDeviceFamily={}, Id={})\n", e.name, e.target_device_family, e.id);
   }
-  out("Main executable: {}\n", l.main_executable.empty() ? "<not determined>" : l.main_executable.string());
+  if (!l.missing_executable.empty())
+    out("Main executable: {}  <-- MISSING: named in MicrosoftGame.config but not in this folder\n",
+        l.missing_executable);
+  else
+    out("Main executable: {}\n", l.main_executable.empty() ? "<not determined>" : l.main_executable.string());
   out("PE files:        {}\n", l.pe_files.size());
   for (const auto& p : l.pe_files) out("  {}\n", p.generic_string());
   if (!l.container_files.empty()) {

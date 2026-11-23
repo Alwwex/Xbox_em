@@ -57,9 +57,10 @@ PackageLayout scan_package(const fs::path& target) {
         candidate = found ? *found : candidate / std::string(part);
       }
       if (fs::exists(candidate, ec)) layout.main_executable = candidate;
+      else layout.missing_executable = e->name;
     }
   }
-  if (layout.main_executable.empty()) {
+  if (layout.main_executable.empty() && layout.missing_executable.empty()) {
     // Fall back to the only .exe at the top level, if unambiguous.
     std::vector<fs::path> top;
     for (const fs::path& p : layout.pe_files)

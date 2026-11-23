@@ -18,6 +18,7 @@ struct PackageLayout {
   std::optional<GameConfig> config;
   std::string config_error;               // set if MicrosoftGame.config exists but failed to parse
   std::filesystem::path main_executable;  // absolute; empty if it could not be determined
+  std::string missing_executable;         // named in MicrosoftGame.config but not present on disk
   std::vector<std::filesystem::path> pe_files;       // relative to root (.exe / .dll)
   std::vector<std::filesystem::path> container_files;  // .xvc / .msixvc / .xvd (packaged, usually encrypted)
   uint64_t total_bytes = 0;
