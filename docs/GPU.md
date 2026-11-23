@@ -9,6 +9,7 @@ layers, built in this order:
 | **Headless D3D12.X device** (`src/hle/d3d12_device.cpp`) – queues complete work instantly, fences signal, resources get memory and GPU addresses, descriptor heaps hand out handles; unknown methods are logged probe slots | done |
 | **Shader capture** – `xbem run <game> --dump-shaders DIR` saves every shader binary passed to pipeline creation | done |
 | **RDNA2 decoder / disassembler** (`src/gpu/rdna2.*`, `xbem gpu-disasm`) – all encodings, 1500+ opcodes, checked against LLVM's gfx1030 disassembler in the unit tests | done |
+| **Root signatures** (`src/gpu/root_signature.*`) – D3D12 descriptions 1.0/1.1/1.2 parsed from guest memory, serialized as DXBC/RTS0 (`D3D12Serialize[Versioned]RootSignature`), read back by `CreateRootSignature` and the deserializer; the console's `0x03000000` flag bits are kept | done |
 | Shader container parsing – locate the RDNA2 program, resource bindings and input/output layout inside the console shader blobs | next (needs captured shaders) |
 | RDNA2 → SPIR-V translation – scalar/vector ALU, memory (buffer, image, LDS), control flow (exec mask, branches), exports | planned |
 | Vulkan backend – D3D12 objects mapped to Vulkan: queues, command buffers, descriptors, pipelines; presentation to a window | planned |

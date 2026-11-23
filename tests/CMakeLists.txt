@@ -12,6 +12,7 @@ add_executable(xbem_unit_tests
   unit/test_objects.cpp
   unit/test_platform.cpp
   unit/test_rdna2.cpp
+  unit/test_root_signature.cpp
 )
 target_link_libraries(xbem_unit_tests PRIVATE xbem_core)
 target_include_directories(xbem_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)

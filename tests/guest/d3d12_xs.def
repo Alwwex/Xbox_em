@@ -1,3 +1,5 @@
 LIBRARY d3d12_xs.dll
 EXPORTS
   D3D12XboxCreateDevice
+  D3D12SerializeVersionedRootSignature
+  D3D12CreateRootSignatureDeserializer

@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/root_signature.h"
 #include "hle/d3d12_device.h"
 #include "hle/discovery.h"
 #include "hle/heap.h"
@@ -403,6 +404,30 @@ const ProbeVtable g_heap_vtable = make_vtable({{8, fn(&heap_get_desc)},
                                                {9, fn(&heap_get_cpu_start)},
                                                {10, fn(&heap_get_gpu_start)}});
 
+// ------------------------------------------- blobs and root signatures
+
+struct BlobState {
+  std::vector<uint8_t> bytes;
+};
+void* XBEM_GUEST_ABI blob_get_pointer(ProbeObject* self) {
+  return static_cast<BlobState*>(self->state)->bytes.data();
+}
+SIZE_T XBEM_GUEST_ABI blob_get_size(ProbeObject* self) { return static_cast<BlobState*>(self->state)->bytes.size(); }
+const ProbeVtable g_blob_vtable = make_vtable({{3, fn(&blob_get_pointer)}, {4, fn(&blob_get_size)}});
+
+struct DeserializerState {
+  std::vector<uint8_t> desc;  // D3D12_ROOT_SIGNATURE_DESC and its arrays
+};
+const void* XBEM_GUEST_ABI deserializer_get_desc(ProbeObject* self) {
+  return static_cast<DeserializerState*>(self->state)->desc.data();
+}
+const ProbeVtable g_deserializer_vtable = make_vtable({{3, fn(&deserializer_get_desc)}});
+
+// ID3D12RootSignature: the parsed signature, kept for pipeline creation.
+struct RootSignatureState {
+  gpu::RootSignature rs;
+};
+
 // -------------------------------------------------------------- device
 
 std::atomic<int> g_object_counter{0};
@@ -690,6 +715,22 @@ HRESULT XBEM_GUEST_ABI device_create_placed_resource_x(ProbeObject* self, uint64
   return create_into(new_resource(child_name("resource"), desc, va), out);
 }
 
+// 16 CreateRootSignature(nodeMask, blob, size, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_root_signature(ProbeObject* self, uint32_t, const uint8_t* blob, SIZE_T size,
+                                                    const void*, void** out) {
+  auto* state = new RootSignatureState;
+  std::vector<uint8_t> bytes(std::min<SIZE_T>(size, 1 << 20));
+  std::string error;
+  const bool ok = blob && platform::safe_read(reinterpret_cast<uint64_t>(blob), bytes.data(), bytes.size()) &&
+                  gpu::deserialize_root_signature(bytes.data(), bytes.size(), state->rs, error);
+  probe_log(self, 16,
+            ok ? std::format("CreateRootSignature({})", state->rs.summary())
+               : std::format("CreateRootSignature({} bytes): not parsed ({}) - kept as an opaque signature", size,
+                             error),
+            XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(child_name("root_signature"), nullptr, state), out);
+}
+
 // 25 GetResourceAllocationInfo(visibleMask, numDescs, descs) -> {SizeInBytes, Alignment},
 // returned through the result buffer (see struct_return).
 void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -878,6 +919,7 @@ const ProbeVtable g_device_vtable = make_vtable({
     {30, fn(&device_create_reserved_resource)},
     {36, fn(&device_create_fence)},
     {37, fn(&device_get_removed_reason)},
+    {16, fn(&device_create_root_signature)},
     {25, fn(&device_get_resource_allocation_info)},
     {26, fn(&device_get_custom_heap_properties)},
     {48, fn(&device_create_command_queue_x)},
@@ -904,6 +946,17 @@ void* create_headless_d3d12_device(const void* iid) {
   }
   static void* device = make_probe_object("d3d12.device", &g_device_vtable);
   return device;
+}
+
+void* make_d3d_blob(std::vector<uint8_t> bytes) {
+  auto* state = new BlobState{std::move(bytes)};
+  return make_probe_object("d3d.blob", &g_blob_vtable, state);
+}
+
+void* make_root_signature_deserializer(const gpu::RootSignature& rs) {
+  auto* state = new DeserializerState;
+  gpu::build_root_signature_desc_1_0(rs, state->desc);
+  return make_probe_object("d3d12.root_signature_deserializer", &g_deserializer_vtable, state);
 }
 
 }  // namespace xbem::hle

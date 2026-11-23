@@ -64,6 +64,8 @@ IMP uint32_t SysStringLen(const WCHAR*);
 
 /* d3d12_xs.dll */
 IMP HRESULT D3D12XboxCreateDevice(void* adapter, const void* params, const void* iid, void** device);
+IMP HRESULT D3D12SerializeVersionedRootSignature(const void* desc, void** blob, void** error_blob);
+IMP HRESULT D3D12CreateRootSignatureDeserializer(const void* data, size_t size, const void* iid, void** out);
 
 /* xcrdapi.dll */
 IMP HRESULT DStorageGetFactory(const void* iid, void** factory);
@@ -569,6 +571,31 @@ static void test_headless_d3d12(void) {
   void* texture76 = 0;
   CHECK(((CreateCommittedFn)VT(device)[76])(device, heap_props, 0, tex, 0, 0, resource_iid, &texture76) == 0 &&
         texture76 && texture76 != back_buffer);
+
+  /* Root signatures, as XboxBvhBuilder makes them: a 1.1 description with a
+   * 32-bit constants parameter and a UAV descriptor -> serialized blob ->
+   * CreateRootSignature (16) and the deserializer. */
+  struct { uint32_t type, pad; uint64_t a, b; uint32_t vis, pad2; } rs_params[2] = {
+      {1, 0, 0, 6, 0, 0},           /* constants b0, 6 values */
+      {4, 0, 0, 0, 0, 0}};          /* UAV u0 */
+  struct { uint32_t version, pad, num_params, pad0; uint64_t params; uint32_t num_samplers, pad1; uint64_t samplers;
+           uint32_t flags, pad2; } rs_desc = {2, 0, 2, 0, (uint64_t)(uintptr_t)rs_params, 0, 0, 0, 0x03000000, 0};
+  typedef void* (*BlobPtrFn)(void*);
+  typedef size_t (*BlobSizeFn)(void*);
+  void* rs_blob = 0;
+  void* rs_error = (void*)1;
+  CHECK(D3D12SerializeVersionedRootSignature(&rs_desc, &rs_blob, &rs_error) == 0 && rs_blob && rs_error == 0);
+  const uint8_t* rs_bytes = ((BlobPtrFn)VT(rs_blob)[3])(rs_blob);
+  const size_t rs_size = ((BlobSizeFn)VT(rs_blob)[4])(rs_blob);
+  CHECK(rs_size > 40 && memcmp(rs_bytes, "DXBC", 4) == 0);
+  typedef HRESULT (*CreateRsFn)(void*, uint32_t, const void*, size_t, const void*, void**);
+  void* root_sig = 0;
+  CHECK(((CreateRsFn)VT(device)[16])(device, 0, rs_bytes, rs_size, iid, &root_sig) == 0 && root_sig);
+  void* deser = 0;
+  CHECK(D3D12CreateRootSignatureDeserializer(rs_bytes, rs_size, iid, &deser) == 0 && deser);
+  typedef const uint32_t* (*GetRsDescFn)(void*);
+  const uint32_t* rs_back = ((GetRsDescFn)VT(deser)[3])(deser);
+  CHECK(rs_back && rs_back[0] == 2 && rs_back[8] == 0x03000000);
 
   /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
   typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);

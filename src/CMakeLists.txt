@@ -52,6 +52,7 @@ add_library(xbem_core STATIC
 
   gpu/backend.cpp
   gpu/rdna2.cpp
+  gpu/root_signature.cpp
 )
 
 target_include_directories(xbem_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
