@@ -56,3 +56,4 @@ EXPORTS
   RtlCaptureStackBackTrace
   AddVectoredExceptionHandler
   RemoveVectoredExceptionHandler
+  GetEnvironmentVariableA

@@ -26,6 +26,7 @@ Registry::Registry() {
   modules_.push_back(make_kernelx_module());
   modules_.push_back(make_xgameruntime_module());
   modules_.push_back(make_d3d12_module());
+  modules_.push_back(make_ucrt_module());
 
   export_index_.resize(modules_.size());
   for (size_t i = 0; i < modules_.size(); ++i) {
@@ -34,6 +35,7 @@ Registry::Registry() {
     for (const std::string& alias : m.aliases) by_name_[normalize_dll_name(alias)] = i;
     for (size_t e = 0; e < m.exports.size(); ++e) export_index_[i].emplace(std::string(m.exports[e].name), e);
     if (m.name == "kernelx.dll") api_set_target_ = &modules_[i];
+    if (m.name == "ucrtbase.dll") crt_target_ = &modules_[i];
   }
 }
 
@@ -42,7 +44,9 @@ const ModuleDef* Registry::find_module(std::string_view dll_name) const {
   if (auto it = by_name_.find(n); it != by_name_.end()) return &modules_[it->second];
   // API sets (api-ms-win-core-synch-l1-2-0.dll, ...) are virtual DLL names that
   // the Windows loader redirects to a host DLL. We serve them all from kernelx.
-  if (is_api_set(n) && !istarts_with(n, "api-ms-win-crt-")) return api_set_target_;
+  // The C runtime API sets (api-ms-win-crt-*) are served by ucrtbase.dll.
+  if (istarts_with(n, "api-ms-win-crt-")) return crt_target_;
+  if (is_api_set(n)) return api_set_target_;
   return nullptr;
 }
 

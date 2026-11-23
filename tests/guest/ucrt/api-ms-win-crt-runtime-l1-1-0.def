@@ -1,0 +1,7 @@
+LIBRARY api-ms-win-crt-runtime-l1-1-0.dll
+EXPORTS
+  _errno
+  _initterm
+  _initialize_onexit_table
+  _register_onexit_function
+  _execute_onexit_table

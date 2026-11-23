@@ -1,0 +1,9 @@
+LIBRARY api-ms-win-crt-convert-l1-1-0.dll
+EXPORTS
+  strtol
+  strtoul
+  strtod
+  atoi
+  _itoa_s
+  _ui64toa_s
+  wcstol

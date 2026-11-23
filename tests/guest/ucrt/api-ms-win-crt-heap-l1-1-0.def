@@ -1,0 +1,9 @@
+LIBRARY api-ms-win-crt-heap-l1-1-0.dll
+EXPORTS
+  malloc
+  calloc
+  realloc
+  free
+  _msize
+  _aligned_malloc
+  _aligned_free

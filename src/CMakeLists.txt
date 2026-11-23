@@ -21,6 +21,11 @@ add_library(xbem_core STATIC
   hle/kernelx_sync.cpp
   hle/kernelx_file.cpp
   hle/kernelx_seh.cpp
+  hle/ucrt_runtime.cpp
+  hle/ucrt_string.cpp
+  hle/ucrt_stdio.cpp
+  hle/ucrt_math.cpp
+  hle/ucrt_misc.cpp
   hle/xgameruntime.cpp
   hle/d3d12.cpp
 

@@ -13,10 +13,38 @@
 #include <thread>
 
 #include "hle/hle_util.h"
+#include "hle/ucrt.h"
 #include "platform/cpu.h"
 #include "platform/thread.h"
 
 namespace xbem::hle {
+
+namespace crt {
+namespace {
+std::mutex g_env_mutex;
+std::map<std::string, std::u16string> g_env_vars;  // keys upper-case (Windows names are case-insensitive)
+
+std::string env_key(std::string name) {
+  for (char& c : name)
+    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+  return name;
+}
+}  // namespace
+
+std::optional<std::u16string> env_get(const std::string& name) {
+  std::lock_guard lock(g_env_mutex);
+  auto it = g_env_vars.find(env_key(name));
+  if (it == g_env_vars.end()) return std::nullopt;
+  return it->second;
+}
+
+void env_set(const std::string& name, const std::optional<std::u16string>& value) {
+  std::lock_guard lock(g_env_mutex);
+  if (value) g_env_vars[env_key(name)] = *value;
+  else g_env_vars.erase(env_key(name));
+}
+}  // namespace crt
+
 namespace {
 
 using namespace win;
@@ -357,6 +385,9 @@ INT XBEM_GUEST_ABI hle_WideCharToMultiByte(UINT cp, DWORD, LPCWSTR src, INT src_
   return static_cast<INT>(out.size());
 }
 
+BOOL XBEM_GUEST_ABI hle_IsDBCSLeadByte(BYTE) { return FALSE; }
+BOOL XBEM_GUEST_ABI hle_IsDBCSLeadByteEx(UINT, BYTE) { return FALSE; }
+
 INT XBEM_GUEST_ABI hle_lstrlenA(LPCSTR s) { return s ? static_cast<INT>(bounded_strlen(s)) : 0; }
 INT XBEM_GUEST_ABI hle_lstrlenW(LPCWSTR s) { return s ? static_cast<INT>(bounded_strlen16(s)) : 0; }
 
@@ -401,30 +432,17 @@ INT XBEM_GUEST_ABI hle_GetUserDefaultLocaleName(LPWSTR buf, INT size) {
 LPSTR XBEM_GUEST_ABI hle_GetCommandLineA() { return const_cast<char*>(proc().command_line_a().c_str()); }
 LPWSTR XBEM_GUEST_ABI hle_GetCommandLineW() { return const_cast<char16_t*>(proc().command_line_w().c_str()); }
 
-std::mutex g_env_mutex;
-std::map<std::string, std::u16string>& env_vars() {
-  static std::map<std::string, std::u16string> vars;
-  return vars;
-}
-
-std::string env_key(std::string name) {
-  for (char& c : name)
-    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-  return name;
-}
-
 template <class Char>
 DWORD get_env(const std::string& name, Char* buf, DWORD size) {
-  std::lock_guard lock(g_env_mutex);
-  auto it = env_vars().find(env_key(name));
-  if (it == env_vars().end()) {
+  const auto value = crt::env_get(name);
+  if (!value) {
     set_last_error(ERROR_ENVVAR_NOT_FOUND);
     return 0;
   }
   if constexpr (sizeof(Char) == 2) {
-    return copy_out_string<char16_t>(it->second, buf, size);
+    return copy_out_string<char16_t>(*value, buf, size);
   } else {
-    const std::string v = utf16_to_utf8(it->second);
+    const std::string v = utf16_to_utf8(*value);
     return copy_out_string<char>(v, buf, size);
   }
 }
@@ -434,17 +452,13 @@ DWORD XBEM_GUEST_ABI hle_GetEnvironmentVariableW(LPCWSTR name, LPWSTR buf, DWORD
 
 BOOL XBEM_GUEST_ABI hle_SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
   if (!name) return FALSE;
-  std::lock_guard lock(g_env_mutex);
-  if (value) env_vars()[env_key(narrow(name))] = std::u16string(guest_wstr(value));
-  else env_vars().erase(env_key(narrow(name)));
+  crt::env_set(narrow(name), value ? std::optional<std::u16string>(guest_wstr(value)) : std::nullopt);
   return TRUE;
 }
 
 BOOL XBEM_GUEST_ABI hle_SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   if (!name) return FALSE;
-  std::lock_guard lock(g_env_mutex);
-  if (value) env_vars()[env_key(narrow(name))] = utf8_to_utf16(guest_cstr(value));
-  else env_vars().erase(env_key(narrow(name)));
+  crt::env_set(narrow(name), value ? std::optional<std::u16string>(utf8_to_utf16(guest_cstr(value))) : std::nullopt);
   return TRUE;
 }
 
@@ -593,7 +607,7 @@ ModuleDef make_kernelx_module() {
       XBEM_HLE(GetModuleHandleExA), XBEM_HLE(GetModuleHandleExW), XBEM_HLE(GetProcAddress), XBEM_HLE(LoadLibraryA),
       XBEM_HLE(LoadLibraryW), XBEM_HLE(LoadLibraryExA), XBEM_HLE(LoadLibraryExW), XBEM_HLE(FreeLibrary),
       XBEM_HLE(DisableThreadLibraryCalls), XBEM_HLE(GetModuleFileNameA), XBEM_HLE(GetModuleFileNameW),
-      XBEM_HLE(MultiByteToWideChar), XBEM_HLE(WideCharToMultiByte), XBEM_HLE(lstrlenA), XBEM_HLE(lstrlenW),
+      XBEM_HLE(MultiByteToWideChar), XBEM_HLE(WideCharToMultiByte), XBEM_HLE(lstrlenA), XBEM_HLE(lstrlenW), XBEM_HLE(IsDBCSLeadByte), XBEM_HLE(IsDBCSLeadByteEx),
       XBEM_HLE(GetACP), XBEM_HLE(GetOEMCP), XBEM_HLE(IsValidCodePage), XBEM_HLE(GetCPInfo),
       XBEM_HLE(GetUserDefaultLCID), XBEM_HLE(GetSystemDefaultLCID), XBEM_HLE(GetUserDefaultUILanguage),
       XBEM_HLE(GetSystemDefaultUILanguage), XBEM_HLE(GetUserDefaultLocaleName), XBEM_HLE(GetCommandLineA),

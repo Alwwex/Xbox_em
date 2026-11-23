@@ -1,0 +1,13 @@
+LIBRARY api-ms-win-crt-string-l1-1-0.dll
+EXPORTS
+  strlen
+  strcmp
+  _stricmp
+  strcpy_s
+  strtok_s
+  wcslen
+  _wcsicmp
+  isalpha
+  toupper
+  towupper
+  memcpy_s

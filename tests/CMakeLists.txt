@@ -98,6 +98,41 @@ add_custom_command(
   COMMENT "Guest package layout files_pkg")
 list(APPEND GUEST_OUTPUTS ${PKG}/files.exe)
 
+# The C runtime test imports through the UCRT API-set names, like an MSVC title.
+file(GLOB UCRT_DEFS ${GSRC}/ucrt/*.def)
+set(UCRT_LIBS)
+foreach(def ${UCRT_DEFS})
+  get_filename_component(name ${def} NAME_WE)
+  add_custom_command(
+    OUTPUT ${GOUT}/lib${name}.a
+    COMMAND ${XBEM_MINGW_DLLTOOL} -d ${def} -l ${GOUT}/lib${name}.a
+    DEPENDS ${def}
+    COMMENT "Import library ${name}.dll (guest)")
+  list(APPEND UCRT_LIBS ${GOUT}/lib${name}.a)
+endforeach()
+add_custom_command(
+  OUTPUT ${GOUT}/crt.exe
+  COMMAND ${XBEM_MINGW_CC} ${GUEST_FLAGS} -o ${GOUT}/crt.exe ${GSRC}/crt.c ${GSRC}/guest_rt.c -Wl,-e,guest_main
+          ${UCRT_LIBS} ${GOUT}/libkernelx.a
+  DEPENDS ${GSRC}/crt.c ${GUEST_COMMON} ${UCRT_LIBS} ${GOUT}/libkernelx.a
+  COMMENT "Guest program crt.exe")
+list(APPEND GUEST_OUTPUTS ${GOUT}/crt.exe)
+
+# Real C++ exceptions need the MinGW C++ compiler (g++-mingw-w64-x86-64).
+find_program(XBEM_MINGW_CXX NAMES x86_64-w64-mingw32-g++)
+if(XBEM_MINGW_CXX)
+  add_custom_command(
+    OUTPUT ${GOUT}/cpp_exceptions.exe
+    COMMAND ${XBEM_MINGW_CXX} -O2 -nostartfiles -Wl,-e,guest_main -static-libgcc -static-libstdc++ -static
+            -o ${GOUT}/cpp_exceptions.exe ${GSRC}/cpp_exceptions.cpp
+            -Wl,--start-group -lmingw32 -lmingwex -lmsvcrt -lkernel32 -Wl,--end-group
+    DEPENDS ${GSRC}/cpp_exceptions.cpp
+    COMMENT "Guest program cpp_exceptions.exe (C++)")
+  list(APPEND GUEST_OUTPUTS ${GOUT}/cpp_exceptions.exe)
+else()
+  message(STATUS "xbem: x86_64-w64-mingw32-g++ not found - C++ exception test disabled")
+endif()
+
 add_custom_target(guest_programs ALL DEPENDS ${GUEST_OUTPUTS})
 set_tests_properties(unit PROPERTIES ENVIRONMENT XBEM_GUEST_DIR=${GOUT})
 
@@ -139,6 +174,10 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_unimplemented_strict COMMAND run ${GOUT}/unimplemented.exe --strict EXIT 125
                   EXPECT "XbemDefinitelyMissing \\(strict mode\\)")
   xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
+  xbem_guest_test(guest_crt COMMAND run ${GOUT}/crt.exe EXPECT "PASS crt")
+  if(XBEM_MINGW_CXX)
+    xbem_guest_test(guest_cpp_exceptions COMMAND run ${GOUT}/cpp_exceptions.exe EXPECT "PASS cpp_exceptions")
+  endif()
   xbem_guest_test(guest_seh_unhandled COMMAND run ${GOUT}/seh_unhandled.exe EXIT 173
                   EXPECT "unhandled guest exception 0xe0badbad" "frame  1: seh_unhandled.exe\\+0x")
   xbem_guest_test(guest_crash_report COMMAND run ${GOUT}/crash.exe EXIT 139

@@ -10,10 +10,64 @@
 #include <map>
 #include <mutex>
 
+#include "hle/heap.h"
 #include "hle/hle_util.h"
 #include "platform/memory.h"
 
 namespace xbem::hle {
+
+// ------------------------------------------------------- block allocator
+// Shared by HeapAlloc/LocalAlloc and the C runtime (malloc), like on Windows
+// where the CRT allocates from the process heap.
+
+namespace {
+constexpr uint64_t kHeapMagic = 0x48454D4258ull;  // "XBMEH"
+
+struct alignas(16) BlockHeader {
+  uint64_t size;
+  uint64_t magic;
+};
+
+BlockHeader* header_of(const void* p) { return const_cast<BlockHeader*>(reinterpret_cast<const BlockHeader*>(p) - 1); }
+}  // namespace
+
+void* heap_alloc(size_t size, bool zero) {
+  auto* h = static_cast<BlockHeader*>(zero ? std::calloc(1, sizeof(BlockHeader) + size)
+                                           : std::malloc(sizeof(BlockHeader) + size));
+  if (!h) return nullptr;
+  h->size = size;
+  h->magic = kHeapMagic;
+  return h + 1;
+}
+
+bool heap_owns(const void* p) { return p && header_of(p)->magic == kHeapMagic; }
+
+bool heap_free(void* p) {
+  if (!p) return true;
+  BlockHeader* h = header_of(p);
+  if (h->magic != kHeapMagic) {
+    XBEM_WARN("heap", "free of a pointer this heap did not allocate ({})", p);
+    return false;
+  }
+  h->magic = 0;
+  std::free(h);
+  return true;
+}
+
+void* heap_realloc(void* p, size_t size, bool zero_new) {
+  if (!p) return heap_alloc(size, zero_new);
+  BlockHeader* h = header_of(p);
+  if (h->magic != kHeapMagic) return nullptr;
+  const uint64_t old = h->size;
+  auto* nh = static_cast<BlockHeader*>(std::realloc(h, sizeof(BlockHeader) + size));
+  if (!nh) return nullptr;
+  nh->size = size;
+  if (zero_new && size > old) std::memset(reinterpret_cast<uint8_t*>(nh + 1) + old, 0, size - old);
+  return nh + 1;
+}
+
+size_t heap_block_size(const void* p) { return heap_owns(p) ? header_of(p)->size : ~size_t(0); }
+
 namespace {
 
 using namespace win;
@@ -204,40 +258,11 @@ SIZE_T XBEM_GUEST_ABI hle_VirtualQuery(const void* address, uint8_t* mbi, SIZE_T
 
 // ------------------------------------------------------------------- heaps
 
-constexpr uint64_t kHeapMagic = 0x48454D4258ull;  // "XBMEH"
 constexpr DWORD HEAP_GENERATE_EXCEPTIONS = 0x4;
 constexpr DWORD HEAP_ZERO_MEMORY = 0x8;
 constexpr DWORD HEAP_REALLOC_IN_PLACE_ONLY = 0x10;
 
-struct alignas(16) BlockHeader {
-  uint64_t size;
-  uint64_t magic;
-};
-
 uint64_t g_default_heap_storage[2] = {kHeapMagic, 0};
-
-BlockHeader* header_of(void* p) { return reinterpret_cast<BlockHeader*>(p) - 1; }
-
-void* heap_alloc(SIZE_T size, bool zero) {
-  auto* h = static_cast<BlockHeader*>(zero ? std::calloc(1, sizeof(BlockHeader) + size)
-                                           : std::malloc(sizeof(BlockHeader) + size));
-  if (!h) return nullptr;
-  h->size = size;
-  h->magic = kHeapMagic;
-  return h + 1;
-}
-
-bool heap_free(void* p) {
-  if (!p) return true;
-  BlockHeader* h = header_of(p);
-  if (h->magic != kHeapMagic) {
-    XBEM_WARN("kernelx", "HeapFree of a pointer not allocated by HeapAlloc ({})", p);
-    return false;
-  }
-  h->magic = 0;
-  std::free(h);
-  return true;
-}
 
 HANDLE XBEM_GUEST_ABI hle_GetProcessHeap() { return reinterpret_cast<HANDLE>(&g_default_heap_storage); }
 
@@ -265,35 +290,23 @@ BOOL XBEM_GUEST_ABI hle_HeapFree(HANDLE, DWORD, void* p) { return heap_free(p) ?
 
 void* XBEM_GUEST_ABI hle_HeapReAlloc(HANDLE heap, DWORD flags, void* p, SIZE_T size) {
   if (!p) return hle_HeapAlloc(heap, flags, size);
-  BlockHeader* h = header_of(p);
-  if (h->magic != kHeapMagic) {
+  if (!heap_owns(p)) {
     set_last_error(ERROR_INVALID_PARAMETER);
     return nullptr;
   }
-  const uint64_t old = h->size;
   if (flags & HEAP_REALLOC_IN_PLACE_ONLY) {
-    if (size > old) {
+    if (size > heap_block_size(p)) {
       set_last_error(ERROR_NOT_ENOUGH_MEMORY);
       return nullptr;
     }
-    h->size = size;
     return p;
   }
-  auto* nh = static_cast<BlockHeader*>(std::realloc(h, sizeof(BlockHeader) + size));
-  if (!nh) {
-    set_last_error(ERROR_NOT_ENOUGH_MEMORY);
-    return nullptr;
-  }
-  nh->size = size;
-  if ((flags & HEAP_ZERO_MEMORY) && size > old) std::memset(reinterpret_cast<uint8_t*>(nh + 1) + old, 0, size - old);
-  return nh + 1;
+  void* np = heap_realloc(p, size, flags & HEAP_ZERO_MEMORY);
+  if (!np) set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+  return np;
 }
 
-SIZE_T XBEM_GUEST_ABI hle_HeapSize(HANDLE, DWORD, const void* p) {
-  if (!p) return ~0ull;
-  const BlockHeader* h = reinterpret_cast<const BlockHeader*>(p) - 1;
-  return h->magic == kHeapMagic ? h->size : ~0ull;
-}
+SIZE_T XBEM_GUEST_ABI hle_HeapSize(HANDLE, DWORD, const void* p) { return heap_block_size(p); }
 
 BOOL XBEM_GUEST_ABI hle_HeapValidate(HANDLE, DWORD, const void*) { return TRUE; }
 BOOL XBEM_GUEST_ABI hle_HeapSetInformation(HANDLE, DWORD, void*, SIZE_T) { return TRUE; }

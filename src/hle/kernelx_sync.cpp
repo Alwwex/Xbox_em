@@ -15,6 +15,20 @@
 #include "platform/thread.h"
 
 namespace xbem::hle {
+
+void exit_guest_thread(uint32_t code) {
+  rt::GuestThread* t = rt::current_thread();
+  if (!t || !t->exit_jump_valid) {
+    XBEM_ERROR("kernelx", "ExitThread called outside a guest thread");
+    proc().exit_process(code);
+  }
+  {
+    std::lock_guard lock(rt::sync_mutex());
+    t->exit_code = code;
+  }
+  std::longjmp(t->exit_jump, 1);  // unwinds to the thread's start frame in Process::thread_main
+}
+
 namespace {
 
 using namespace win;
@@ -40,18 +54,7 @@ HANDLE XBEM_GUEST_ABI hle_CreateThread(void*, SIZE_T stack_size, uint64_t start,
   return proc().handles().insert(t);
 }
 
-[[noreturn]] void XBEM_GUEST_ABI hle_ExitThread(DWORD code) {
-  GuestThread* t = rt::current_thread();
-  if (!t || !t->exit_jump_valid) {
-    XBEM_ERROR("kernelx", "ExitThread called outside a guest thread");
-    proc().exit_process(code);
-  }
-  {
-    std::lock_guard lock(rt::sync_mutex());
-    t->exit_code = code;
-  }
-  std::longjmp(t->exit_jump, 1);  // unwinds to the thread's start frame in Process::thread_main
-}
+[[noreturn]] void XBEM_GUEST_ABI hle_ExitThread(DWORD code) { exit_guest_thread(code); }
 
 BOOL XBEM_GUEST_ABI hle_GetExitCodeThread(HANDLE h, DWORD* code) {
   auto t = std::dynamic_pointer_cast<GuestThread>(lookup_handle(h));

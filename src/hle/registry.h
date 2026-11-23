@@ -51,12 +51,14 @@ class Registry {
   std::unordered_map<std::string, size_t> by_name_;
   std::vector<std::unordered_map<std::string, size_t>> export_index_;
   const ModuleDef* api_set_target_ = nullptr;
+  const ModuleDef* crt_target_ = nullptr;
 };
 
 // Implemented by the individual module files.
 ModuleDef make_kernelx_module();
 ModuleDef make_xgameruntime_module();
 ModuleDef make_d3d12_module();
+ModuleDef make_ucrt_module();
 
 // Pieces of kernelx implemented in separate files.
 void add_kernelx_memory_exports(std::vector<ExportDef>& out);

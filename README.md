@@ -27,16 +27,19 @@ PC build z nějakého důvodu není možný.
 
 - **PE loader** pro x64 obrazy: mapování sekcí, relokace, importy (i podle ordinálu), exporty a forwardery, ochrany stránek, načítání DLL přibalených ke hře (statické i `LoadLibrary`), `DllMain`.
 - **Prostředí vlákna jako ve Windows**: emulovaný TEB/PEB přes segment `GS` (stejně jako Wine), implicitní TLS (`__declspec(thread)`), TLS callbacky, `TlsAlloc`/`FlsAlloc`, `GetLastError` přímo v TEB.
-- **HLE `kernelx.dll`** (~190 funkcí): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace. API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
+- **HLE `kernelx.dll`** (~210 funkcí): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace. API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
+- **Výjimky (SEH)**: `RaiseException`, `RtlUnwindEx`, `RtlVirtualUnwind`, `RtlCaptureContext` a spol. nad unwind daty hry (`.pdata`/`.xdata`). Funguje dvoufázové doručení, kolidující unwind, „consolidate“ mechanismus, kterým MSVC spouští `catch` bloky, vektorové handlery i `RtlCaptureStackBackTrace`. Ověřeno skutečnými C++ výjimkami (`throw`/`catch`, rethrow, výjimky ve vláknech). Neošetřená výjimka vypíše typ C++ výjimky a zásobník.
+- **C knihovna (UCRT)** (~660 funkcí za `api-ms-win-crt-*`, tedy to, co hry importují, ale nepřibalují): start/ukončení programu, `atexit`, `errno`, `malloc` a zarovnaná alokace, řetězce a wide řetězce (16bitový `wchar_t`), vlastní `printf`/`scanf` s Windows specifikátory (`%I64d`, `%ls`, …), `FILE` i `_open`/`_read` přes VFS (včetně CRLF v textovém režimu), matematika a `_controlfp`/`fenv`, čas, `qsort`, MSVC `rand()`, `_stat`/`_findfirst`, prostředí, „C“ locale. Pod jménem `msvcrt.dll` slouží i programům z MinGW.
 - **HLE `xgameruntime.dll`**: `XGameRuntimeInitialize`, `XSystemGetDeviceType` (Series X / Series S / devkit), `XPackage*`, kompletní **XTaskQueue** (režimy Manual / Immediate / ThreadPool). `XUser`, `XGameSave`, `XStore` atd. zatím vracejí `E_NOTIMPL`.
 - **Virtuální souborový systém**: balíček hry jako read‑only `G:\`, zapisovatelný `T:\`, další disky přes `--mount`, **case‑insensitive** cesty i na Linuxu, `..` nemůže utéct z kořene.
 - **Diagnostika**: volání neimplementované funkce se zaloguje a na konci běhu vypíše seřazený seznam „implementuj tohle dál“; `--strict` zastaví na první takové funkci; při pádu crash report s registry a pozicí `hra.exe+0x…`.
 - **Analýza**: `inspect`, `coverage` (JSON/Markdown report pokrytí importů celé hry), `package` (čte `MicrosoftGame.config`), `xvd` (metadata kontejneru, pozná šifrovaný balíček), `cpu`.
 - **Komunikace PC ↔ konzole**: [`tools/xbdp`](tools/xbdp/xbdp.py) – klient Xbox Device Portalu (informace, balíčky, spuštění/ukončení aplikace, instalace, přenos souborů včetně rekurzivního stažení loose buildu, screenshot). Viz [docs/DEVKIT.md](docs/DEVKIT.md).
 
-Všechno výše je pokryté testy: 34 unit testů, 8 testů devkit klienta proti
-mock serveru a 13 integračních testů, které spouští **skutečné Windows PE
-binárky** (sestavené MinGW) importující z `kernelx.dll` / `xgameruntime.dll`.
+Všechno výše je pokryté testy: 35 unit testů, 8 testů devkit klienta proti
+mock serveru a 17 integračních testů, které spouští **skutečné Windows PE
+binárky** (sestavené MinGW) importující z `kernelx.dll`, `xgameruntime.dll`
+a `api-ms-win-crt-*`, včetně C++ programu s výjimkami a `libstdc++`.
 
 ## Sestavení
 
@@ -44,7 +47,7 @@ Spouštění her vyžaduje **Linux x86‑64 nebo WSL2 na Windows** (kvůli nasta
 segmentu `GS`). Analytické nástroje fungují i nativně na Windows.
 
 ```bash
-sudo apt install cmake ninja-build g++ gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+sudo apt install cmake ninja-build g++ gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 ```
 
 ```bash
@@ -136,13 +139,14 @@ Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Roadmapa
 
-1. **SEH / výjimky** – rozbalování zásobníku podle `.pdata`/`.xdata` (C++ výjimky, `__try/__except`). Dnes `RaiseException` proces ukončí s jasnou hláškou.
-2. **Ověření na reálném titulu** – podle `xbem coverage` doplnit chybějící `kernelx`/GDK funkce a potvrdit skutečné názvy DLL a způsob vazby GDK runtime.
-3. **GPU backend nad Vulkanem** – D3D12.X COM rozhraní, fronty, command listy, haldy; prezentace do okna.
-4. **Shadery** – buď DXIL/PC shadery od vývojáře, nebo rekompilátor RDNA2 ISA → SPIR‑V.
-5. **Vstup a zvuk** – `GameInput` → SDL/evdev, XAudio2 → host audio.
-6. **Služby** – offline `XUser`, `XGameSave` do lokální složky.
-7. **Nativní Windows host** – přesměrování TEB/TLS bez WSL2.
+1. **Ověření na reálném titulu** – podle `xbem coverage` doplnit chybějící `kernelx`/GDK funkce a potvrdit skutečné názvy DLL a způsob vazby GDK runtime.
+2. **GPU backend nad Vulkanem** – D3D12.X COM rozhraní, fronty, command listy, haldy; prezentace do okna.
+3. **Shadery** – buď DXIL/PC shadery od vývojáře, nebo rekompilátor RDNA2 ISA → SPIR‑V.
+4. **Vstup a zvuk** – `GameInput` → SDL/evdev, XAudio2 → host audio.
+5. **Služby** – offline `XUser`, `XGameSave` do lokální složky.
+6. **Nativní Windows host** – přesměrování TEB/TLS bez WSL2.
+7. **Hardwarové výjimky jako SEH** – převod `SIGSEGV`/`SIGFPE` v herním kódu na `EXCEPTION_ACCESS_VIOLATION` atd. pro `__try/__except`.
+8. **Threadpool, WinRT/COM, registry, XAudio2, XMem** – další API, která hry importují (podle `xbem coverage`).
 
 ## Právní rámec
 

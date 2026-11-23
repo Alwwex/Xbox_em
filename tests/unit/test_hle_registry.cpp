@@ -13,7 +13,10 @@ TEST(registry_module_lookup) {
   CHECK(reg.find_module("kernelx") == kx);
   CHECK(reg.find_module("C:\\Windows\\System32\\kernel32.dll") == kx);
   CHECK(reg.find_module("api-ms-win-core-synch-l1-2-0.dll") == kx);
-  CHECK(reg.find_module("api-ms-win-crt-runtime-l1-1-0.dll") == nullptr);  // CRT is not provided by the OS layer
+  const auto* crt = reg.find_module("ucrtbase.dll");
+  CHECK(crt != nullptr && crt != kx);
+  CHECK(reg.find_module("api-ms-win-crt-runtime-l1-1-0.dll") == crt);  // C runtime API sets -> ucrtbase
+  CHECK(reg.find_module("msvcrt.dll") == crt);
   CHECK(reg.find_module("d3d12_x.dll") == reg.find_module("d3d12_xs.dll"));
   CHECK(reg.find_module("totally-unknown.dll") == nullptr);
 }

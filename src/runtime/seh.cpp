@@ -10,6 +10,13 @@
 #include "loader/pe_format.h"
 #include "runtime/process.h"
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define XBEM_FRAME_ADDRESS() reinterpret_cast<uintptr_t>(_AddressOfReturnAddress())
+#else
+#define XBEM_FRAME_ADDRESS() reinterpret_cast<uintptr_t>(__builtin_frame_address(0))
+#endif
+
 namespace xbem::seh {
 
 static_assert(sizeof(Context) == 0x4D0);
@@ -55,27 +62,34 @@ const RuntimeFunction* search_table(const RuntimeFunction* table, size_t count, 
 // ----------------------------------------------- per-thread dispatch records
 //
 // While the dispatcher calls an exception handler, or RtlUnwindEx calls an
-// unwind handler, host frames sit on the guest stack. A nested RtlUnwindEx
-// whose walk reaches them continues from the innermost record: from the
-// raise point (dispatch) or by taking over the colliding unwind.
+// unwind handler, host frames sit on the guest stack between the handler and
+// the frames being processed. A walk that reaches such a host frame looks up
+// the record that owns it (the innermost record above the walk position) and
+// continues the way Windows' own dispatcher frames would make it continue:
+//   unwind   -> dispatch record: continue from the raise point
+//   unwind   -> unwind record:   collided unwind, take over its current frame
+//   dispatch -> unwind record:   exception raised by an unwind handler; the
+//                                search continues at the frame being unwound
+//   dispatch -> dispatch record: nested exception; continue after the frame
+//                                whose handler raised it
 
 struct ActiveRecord {
   enum Kind { Dispatch, Unwind } kind;
-  uintptr_t marker;          // host frame address; lower = more recent
-  const Context* raise_context;  // Dispatch
-  DispatcherContext* dc;     // Unwind: frame whose handler is running
+  uintptr_t marker;              // host frame address; lower = more recent
+  const Context* raise_point;    // Dispatch: private copy of the raise context
+  DispatcherContext* dc;         // frame being processed (its ContextRecord included)
 };
 
 constexpr int kMaxRecords = 64;
 thread_local ActiveRecord t_records[kMaxRecords];
 thread_local int t_record_count = 0;
 
-int push_record(ActiveRecord::Kind kind, uintptr_t marker, const Context* raise_context, DispatcherContext* dc) {
+int push_record(ActiveRecord::Kind kind, uintptr_t marker, const Context* raise_point, DispatcherContext* dc) {
   if (t_record_count >= kMaxRecords) {
     XBEM_ERROR("seh", "exception nesting too deep");
     rt::Process::current().exit_process(kStatusNoncontinuableException);
   }
-  t_records[t_record_count] = {kind, marker, raise_context, dc};
+  t_records[t_record_count] = {kind, marker, raise_point, dc};
   return t_record_count++;
 }
 
@@ -83,6 +97,23 @@ void pop_records(int index) { t_record_count = std::min(t_record_count, index); 
 
 void purge_records_below(uint64_t rsp) {
   while (t_record_count > 0 && t_records[t_record_count - 1].marker < rsp) --t_record_count;
+}
+
+// The record whose host frame is the first one above stack position `rsp`.
+const ActiveRecord* owner_of_host_frame(uint64_t rsp) {
+  for (int i = t_record_count - 1; i >= 0; --i)
+    if (t_records[i].marker > rsp) return &t_records[i];
+  return nullptr;
+}
+
+void take_over_frame(DispatcherContext& dc, const DispatcherContext& o) {
+  dc.ControlPc = o.ControlPc;
+  dc.ImageBase = o.ImageBase;
+  dc.FunctionEntry = o.FunctionEntry;
+  dc.EstablisherFrame = o.EstablisherFrame;
+  dc.LanguageHandler = o.LanguageHandler;
+  dc.HandlerData = o.HandlerData;
+  dc.ScopeIndex = o.ScopeIndex;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -329,17 +360,40 @@ enum class DispatchResult { ContinueExecution, Unhandled };
 
 DispatchResult dispatch_frames(ExceptionRecord* rec, Context* orig) {
   alignas(16) Context context = *orig;
+  // Handlers may pass `orig` to RtlUnwindEx as its scratch context (libgcc
+  // does), which overwrites it. Unwinds that cross back into this dispatcher
+  // continue from this private copy of the raise point.
+  alignas(16) const Context raise_point = *orig;
   DispatcherContext dc{};
   dc.ContextRecord = &context;
-  const int index = push_record(ActiveRecord::Dispatch, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)), orig,
-                                nullptr);
+  const int index = push_record(ActiveRecord::Dispatch, XBEM_FRAME_ADDRESS(),
+                                &raise_point, &dc);
   bool have_frame = false;
   DispatchResult result = DispatchResult::Unhandled;
   for (int n = 0; n < kMaxFrames; ++n) {
     if (!have_frame) {
       const uint64_t before = context.Gpr[kRsp];
-      if (!unwind_one_frame(kUnwFlagEHandler, dc, context)) break;  // reached host code: nobody handled it
-      if (context.Gpr[kRsp] <= before && dc.ControlPc != reinterpret_cast<uint64_t>(&xbem_seh_consolidate_return)) {
+      if (!unwind_one_frame(kUnwFlagEHandler, dc, context)) {
+        // Host code. Either the bottom of the guest stack (unhandled), or a
+        // dispatcher/unwinder that called the handler which raised this.
+        const ActiveRecord* owner = owner_of_host_frame(context.Gpr[kRsp]);
+        if (!owner || owner == &t_records[index]) break;
+        if (owner->kind == ActiveRecord::Unwind) {
+          // Raised by an unwind handler: search on from the frame being unwound.
+          take_over_frame(dc, *owner->dc);
+          context = *owner->dc->ContextRecord;
+          dc.ContextRecord = &context;
+          redo_unwind(dc, context);
+          have_frame = true;
+        } else {
+          // Raised by an exception handler: skip the frames the outer search covered.
+          context = *owner->dc->ContextRecord;
+          dc.ContextRecord = &context;
+          rec->Flags |= kExceptionNestedCall;
+          continue;
+        }
+      } else if (context.Gpr[kRsp] <= before &&
+                 dc.ControlPc != reinterpret_cast<uint64_t>(&xbem_seh_consolidate_return)) {
         rec->Flags |= kExceptionStackInvalid;
         break;
       }
@@ -629,7 +683,7 @@ void unwind_ex(uint64_t end_frame, uint64_t target_ip, ExceptionRecord* rec, uin
   dc.EstablisherFrame = context->Gpr[kRsp];
   dc.TargetIp = target_ip;
   dc.ContextRecord = context;
-  const int index = push_record(ActiveRecord::Unwind, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)), nullptr,
+  const int index = push_record(ActiveRecord::Unwind, XBEM_FRAME_ADDRESS(), nullptr,
                                 &dc);
 
   bool have_frame = false;
@@ -637,31 +691,26 @@ void unwind_ex(uint64_t end_frame, uint64_t target_ip, ExceptionRecord* rec, uin
     if (n > kMaxFrames) fatal("RtlUnwindEx: stack walk does not terminate", kStatusInvalidDisposition);
     if (!have_frame && !unwind_one_frame(kUnwFlagUHandler, dc, new_context)) {
       // Host code: the frames we came through belong to a handler invocation.
-      if (index == 0) fatal("RtlUnwindEx: unwind target not found on the guest stack", kStatusInvalidDisposition);
-      const ActiveRecord outer = t_records[index - 1];
-      if (outer.kind == ActiveRecord::Dispatch) {
+      const ActiveRecord* owner = owner_of_host_frame(new_context.Gpr[kRsp]);
+      if (!owner || owner == &t_records[index])
+        fatal("RtlUnwindEx: unwind target not found on the guest stack", kStatusInvalidDisposition);
+      if (owner->kind == ActiveRecord::Dispatch) {
         // Called from an exception handler: continue from the raise point.
-        *context = *outer.raise_context;
+        *context = *owner->raise_point;
         new_context = *context;
         continue;
       }
       // Called from an unwind handler: a collided unwind. Take over the frame
       // the outer unwind is processing; frames below it are already unwound.
-      const DispatcherContext& o = *outer.dc;
-      *context = *o.ContextRecord;
+      take_over_frame(dc, *owner->dc);
+      *context = *owner->dc->ContextRecord;
       new_context = *context;
-      dc.ControlPc = o.ControlPc;
-      dc.ImageBase = o.ImageBase;
-      dc.FunctionEntry = o.FunctionEntry;
-      dc.EstablisherFrame = o.EstablisherFrame;
-      dc.LanguageHandler = o.LanguageHandler;
-      dc.HandlerData = o.HandlerData;
-      dc.ScopeIndex = o.ScopeIndex;
       dc.ContextRecord = context;
       redo_unwind(dc, new_context);
       rec->Flags |= kExceptionCollidedUnwind;
     }
     have_frame = false;
+    XBEM_TRACE("seh", "unwind step: pc {} frame {:#x}", describe(dc.ControlPc), dc.EstablisherFrame);
 
     if (!dc.EstablisherFrame) break;
     if (!valid_frame(dc.EstablisherFrame)) fatal("RtlUnwindEx: invalid frame on the stack", kStatusInvalidDisposition);

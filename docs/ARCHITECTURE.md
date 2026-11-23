@@ -146,6 +146,39 @@ Funkce mají dva druhy:
    unwind informace pro hostitelský runtime.
 5. Přidej test: ideálně guest program v `tests/guest/` (viz `hello.c`).
 
+## Výjimky (SEH)
+
+MSVC C++ výjimky, `__try/__except/__finally` i unwinder z libgcc stojí na
+stejných primitivech jádra, která xbem implementuje nad unwind daty hry
+(`src/runtime/seh.*`):
+
+- `RtlVirtualUnwind` interpretuje `UNWIND_INFO` (všechny unwind kódy,
+  řetězené záznamy, detekce epilogu podle pravidel x64 ABI).
+- `RaiseException` zachytí registry volajícího (assemblerový thunk v
+  `seh_asm.cpp`), zavolá vektorové handlery a pak prochází rámce a volá jejich
+  jazykové handlery (`__CxxFrameHandler*`, `__C_specific_handler`, …).
+- `RtlUnwindEx` rozbaluje k cílovému rámci, volá unwind handlery
+  (destruktory) a nakonec obnoví kontext. U `STATUS_UNWIND_CONSOLIDATE`
+  (tak MSVC spouští `catch` blok) zavolá callback přes trampolínu, která si
+  uloží kopii cílového kontextu – výjimka vyhozená uvnitř `catch` se pak
+  rozbalí správně ven.
+
+Mezi handlerem a rámci, které zpracovává, leží na zásobníku hostitelské
+rámce xbem bez Windows unwind dat. Každý dispatch/unwind si proto zapisuje
+per-vláknový záznam; procházení, které narazí na hostitelský rámec, najde jeho
+vlastníka a pokračuje stejně, jako by to zařídily dispatcher rámce Windows
+(od místa vyhození, kolidující unwind, vnořená výjimka).
+
+## C knihovna (UCRT)
+
+Konzole má C runtime jako součást systému (`ucrtbase.dll` za API‑sety
+`api-ms-win-crt-*`), hra ho tedy importuje, ale nepřibaluje. `src/hle/ucrt_*.cpp`
+ho reimplementuje s Windows sémantikou: `long` je 32bitový, `wchar_t`
+16bitový, `printf` má vlastní engine (Microsoft va_list jsou prostě ukazatele
+na 8bajtové sloty), soubory jdou přes VFS a `malloc` sdílí alokátor s
+`HeapAlloc`. `vcruntime140.dll` a `msvcp140.dll` hra přibaluje sama a ty se
+načtou jako běžné DLL hry.
+
 ## Virtuální souborový systém
 
 `src/runtime/vfs.*`: písmena disků → hostitelské složky. Výchozí:
@@ -184,9 +217,9 @@ grafiky a „čistě“ selže tam.
 
 ## Známá omezení
 
-- **SEH/C++ výjimky** nejsou doručovány (chybí unwinder nad `.pdata`/`.xdata`;
-  `RtlLookupFunctionEntry` už je hotové jako první krok). `RaiseException`
-  s kódem C++ výjimky proces ukončí s vysvětlením.
+- Hardwarové výjimky (neplatný přístup do paměti, dělení nulou) se zatím
+  nepřevádějí na SEH: místo doručení do `__try/__except` skončí crash reportem.
+- C knihovna běží v „C“ locale; `setlocale` jiné locale nepřepne.
 - `SuspendThread`, APC a alertable waity nejsou podporované.
 - Pojmenované kernel objekty se chovají jako nepojmenované.
 - `VirtualProtect` nevrací skutečnou původní ochranu.

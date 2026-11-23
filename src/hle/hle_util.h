@@ -32,6 +32,9 @@ inline std::shared_ptr<rt::KernelObject> lookup_handle(win::HANDLE h) {
   return proc().handles().get(h);
 }
 
+// Ends the calling guest thread (ExitThread / _endthreadex).
+[[noreturn]] void exit_guest_thread(uint32_t code);
+
 // Copies `s` into a guest buffer of `capacity` characters (including NUL).
 // Returns the number of characters written excluding NUL, or the required
 // size including NUL if the buffer is too small (Win32 convention).
