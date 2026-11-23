@@ -106,13 +106,20 @@ std::map<uint64_t, Reservation>::iterator find_reservation(uint64_t addr) {
   return (addr - it->first < it->second.size) ? it : g_reservations.end();
 }
 
-void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DWORD protect) {
+}  // namespace
+
+void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment) {
   if (size == 0) {
     set_last_error(ERROR_INVALID_PARAMETER);
     return nullptr;
   }
   constexpr DWORD kKnown = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_LARGE_PAGES |
-                           0x200000 /*MEM_WRITE_WATCH*/ | 0x400000 /*MEM_PHYSICAL*/;
+                           0x200000 /*MEM_WRITE_WATCH*/ | 0x400000 /*MEM_PHYSICAL*/ | 0x80000000u /*MEM_4MB_PAGES*/;
+  if (alignment == 0) {
+    // Large-page allocations come back aligned to their page size on the console.
+    alignment = (type & 0x80000000u) ? 4ull << 20 : (type & MEM_LARGE_PAGES) ? 2ull << 20 : kGranularity;
+  }
+  alignment = std::max<uint64_t>(alignment, kGranularity);
   if (type & ~kKnown)
     XBEM_WARN_ONCE("kernelx", "VirtualAlloc: console-specific allocation flags {:#x} ignored (plain host memory)",
                    type & ~kKnown);
@@ -133,7 +140,7 @@ void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DW
       p = platform::map_fixed(base, length, prot);
     } else {
       length = platform::align_up(size, ps);
-      p = platform::map_anywhere(length, kGranularity, prot);
+      p = platform::map_anywhere(length, alignment, prot);
       base = reinterpret_cast<uint64_t>(p);
     }
     if (!p) {
@@ -158,6 +165,12 @@ void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DW
     return nullptr;
   }
   return reinterpret_cast<void*>(start);
+}
+
+namespace {
+
+void* XBEM_GUEST_ABI hle_VirtualAlloc(void* address, SIZE_T size, DWORD type, DWORD protect) {
+  return virtual_alloc(address, size, type, protect, 0);
 }
 
 BOOL XBEM_GUEST_ABI hle_VirtualFree(void* address, SIZE_T size, DWORD type) {
@@ -322,6 +335,10 @@ void* XBEM_GUEST_ABI hle_GlobalAlloc(UINT flags, SIZE_T size) { return heap_allo
 void* XBEM_GUEST_ABI hle_GlobalFree(void* p) { return heap_free(p) ? nullptr : p; }
 
 }  // namespace
+
+bool virtual_free(void* address, uint64_t size, uint32_t type) { return hle_VirtualFree(address, size, type) != 0; }
+
+size_t virtual_query(const void* address, uint8_t* mbi, size_t length) { return hle_VirtualQuery(address, mbi, length); }
 
 uint64_t default_process_heap() { return reinterpret_cast<uint64_t>(&g_default_heap_storage); }
 

@@ -309,6 +309,7 @@ int32_t case_s(C* s, SIZE_T size, bool upper) {
 
 SIZE_T XBEM_GUEST_ABI hle_strlen(const char* s) { return slen(s); }
 SIZE_T XBEM_GUEST_ABI hle_strnlen(const char* s, SIZE_T max) { return s ? bounded_strlen(s, max) : 0; }
+SIZE_T XBEM_GUEST_ABI hle___strncnt(const char* s, SIZE_T max) { return hle_strnlen(s, max); }
 int32_t XBEM_GUEST_ABI hle_strcmp(const char* a, const char* b) { return scmp(a, b); }
 int32_t XBEM_GUEST_ABI hle_strncmp(const char* a, const char* b, SIZE_T n) { return sncmp(a, b, n); }
 int32_t XBEM_GUEST_ABI hle__stricmp(const char* a, const char* b) { return sicmp(a, b); }
@@ -887,7 +888,7 @@ void XBEM_GUEST_ABI hle__unlock_locales() {}
 
 void add_ucrt_string_exports(std::vector<ExportDef>& out) {
   out.insert(out.end(), {
-      XBEM_HLE(isalpha), XBEM_HLE(isupper), XBEM_HLE(islower), XBEM_HLE(isdigit), XBEM_HLE(isxdigit),
+      XBEM_HLE(__strncnt), XBEM_HLE(isalpha), XBEM_HLE(isupper), XBEM_HLE(islower), XBEM_HLE(isdigit), XBEM_HLE(isxdigit),
       XBEM_HLE(isspace), XBEM_HLE(ispunct), XBEM_HLE(isalnum), XBEM_HLE(isgraph), XBEM_HLE(iscntrl),
       XBEM_HLE(isblank), XBEM_HLE(_isalpha_l), XBEM_HLE(_isupper_l), XBEM_HLE(_islower_l), XBEM_HLE(_isdigit_l),
       XBEM_HLE(_isxdigit_l), XBEM_HLE(_isspace_l), XBEM_HLE(_ispunct_l), XBEM_HLE(_isalnum_l), XBEM_HLE(_isgraph_l),

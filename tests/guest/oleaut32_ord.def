@@ -1,0 +1,5 @@
+LIBRARY oleaut32.dll
+EXPORTS
+  SysAllocString @2 NONAME
+  SysFreeString @6 NONAME
+  SysStringLen @7 NONAME

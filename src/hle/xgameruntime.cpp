@@ -15,6 +15,7 @@
 #include <mutex>
 #include <thread>
 
+#include "hle/discovery.h"
 #include "hle/hle_util.h"
 #include "platform/memory.h"
 
@@ -322,26 +323,6 @@ XBEM_NOTIMPL_HR(XPackageGetMountPath)
 // then QueryApiImpl to obtain the implementation of each API family. That
 // interface is undocumented, so for now these entry points only log what the
 // title passes (pointer arguments are dumped as GUIDs and strings) to map it.
-
-std::string describe_arg(uint64_t v) {
-  std::string out = std::format("{:#x}", v);
-  uint8_t bytes[48];
-  if (v < 0x10000 || !platform::safe_read(v, bytes, 16)) return out;
-  out += " -> {" + guid_to_string(bytes) + "}";
-  if (platform::safe_read(v, bytes, sizeof bytes)) {
-    std::string text;
-    for (uint8_t b : bytes) {
-      if (b == 0) break;
-      if (b < 0x20 || b > 0x7E) {
-        text.clear();
-        break;
-      }
-      text.push_back(static_cast<char>(b));
-    }
-    if (text.size() >= 3) out += " \"" + text + "\"";
-  }
-  return out;
-}
 
 void log_binding_call(const char* name, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   XBEM_WARN("xgameruntime", "{}({}, {}, {}, {})", name, describe_arg(a), describe_arg(b), describe_arg(c),

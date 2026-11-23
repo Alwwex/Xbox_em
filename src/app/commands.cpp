@@ -72,8 +72,7 @@ struct GuestIndex {
 Status classify(const std::string& dll, const pe::ImportEntry& e, const GuestIndex& guest) {
   const auto& reg = hle::Registry::instance();
   if (reg.find_module(dll)) {
-    if (e.by_ordinal) return Status::MissingInHle;
-    const auto look = reg.find(dll, e.name);
+    const auto look = e.by_ordinal ? reg.find_ordinal(dll, e.ordinal) : reg.find(dll, e.name);
     if (!look.exp) return Status::MissingInHle;
     return look.exp->kind == hle::ExportKind::Stub ? Status::Stub : Status::Implemented;
   }

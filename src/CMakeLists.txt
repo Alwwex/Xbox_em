@@ -23,6 +23,14 @@ add_library(xbem_core STATIC
   hle/kernelx_seh.cpp
   hle/kernelx_system.cpp
   hle/kernelx_threadpool.cpp
+  hle/kernelx_locale.cpp
+  hle/kernelx_process.cpp
+  hle/discovery.cpp
+  hle/xmem.cpp
+  hle/net.cpp
+  hle/media.cpp
+  hle/console_devices.cpp
+  hle/user32.cpp
   hle/ucrt_runtime.cpp
   hle/ucrt_string.cpp
   hle/ucrt_stdio.cpp

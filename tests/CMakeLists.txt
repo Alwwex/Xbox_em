@@ -49,7 +49,7 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -73,7 +73,7 @@ add_custom_command(
   COMMENT "Guest DLL plugin.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "system")
@@ -92,6 +92,28 @@ foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhand
     COMMENT "Guest program ${prog}.exe")
   list(APPEND GUEST_OUTPUTS ${GOUT}/${prog}.exe)
 endforeach()
+
+# Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
+find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
+if(XBEM_MINGW_WINDRES)
+  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser)
+  set(CONSOLE_DEPS)
+  foreach(lib ${CONSOLE_LIBS})
+    list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)
+  endforeach()
+  add_custom_command(
+    OUTPUT ${GOUT}/console_res.o
+    COMMAND ${XBEM_MINGW_WINDRES} ${GSRC}/console.rc -O coff -o ${GOUT}/console_res.o
+    DEPENDS ${GSRC}/console.rc
+    COMMENT "Guest resources console.rc")
+  add_custom_command(
+    OUTPUT ${GOUT}/console.exe
+    COMMAND ${XBEM_MINGW_CC} ${GUEST_FLAGS} -o ${GOUT}/console.exe ${GSRC}/console.c ${GSRC}/guest_rt.c
+            ${GOUT}/console_res.o -Wl,-e,guest_main ${CONSOLE_DEPS}
+    DEPENDS ${GSRC}/console.c ${GUEST_COMMON} ${CONSOLE_DEPS} ${GOUT}/console_res.o
+    COMMENT "Guest program console.exe")
+  list(APPEND GUEST_OUTPUTS ${GOUT}/console.exe)
+endif()
 
 # A loose package layout: MicrosoftGame.config + exe + content.
 set(PKG ${GOUT}/files_pkg)
@@ -157,7 +179,7 @@ endfunction()
 
 # Analysis commands work on every host.
 xbem_guest_test(inspect_imports COMMAND inspect ${GOUT}/unimplemented.exe
-                EXPECT "kernelx.dll  \\[HLE\\]  3/4 resolved" "- XbemDefinitelyMissing")
+                EXPECT "kernelx.dll  \\[HLE\\]  3/5 resolved" "- XbemDefinitelyMissing" "- XbemMissingWithArgs")
 xbem_guest_test(package_summary COMMAND package ${PKG}
                 EXPECT "Identity: +Xbem.FilesTest" "Main executable: .*files.exe")
 xbem_guest_test(coverage_report COMMAND coverage ${GOUT}
@@ -174,12 +196,22 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_xgameruntime_series_s COMMAND run ${GOUT}/xgr.exe --device series-s
                   EXPECT "device type=6" "PASS xgr")
   xbem_guest_test(guest_unimplemented COMMAND run ${GOUT}/unimplemented.exe
-                  EXPECT "unimplemented: kernelx.dll!XbemDefinitelyMissing" "2 x +kernelx.dll!XbemDefinitelyMissing"
+                  EXPECT "unimplemented: kernelx.dll!XbemDefinitelyMissing\\(" "2 x +kernelx.dll!XbemDefinitelyMissing"
+                         "XbemMissingWithArgs\\(0x11, 0x22, 0x33, 0x44\\) from unimplemented.exe\\+0x"
                          "PASS unimplemented")
   xbem_guest_test(guest_unimplemented_strict COMMAND run ${GOUT}/unimplemented.exe --strict EXIT 125
-                  EXPECT "XbemDefinitelyMissing \\(strict mode\\)")
+                  EXPECT "XbemDefinitelyMissing\\(.*\\) from unimplemented.exe\\+0x[0-9a-f]+ \\(strict mode\\)")
   xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
   xbem_guest_test(guest_crt COMMAND run ${GOUT}/crt.exe EXPECT "PASS crt")
+  if(XBEM_MINGW_WINDRES)
+    xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe EXPECT "PASS console")
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME guest_thread_dump
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/thread_dump_test.py $<TARGET_FILE:xbem>
+                     ${GOUT}/hang.exe
+             WORKING_DIRECTORY ${GOUT})
+  endif()
   xbem_guest_test(guest_system COMMAND run ${GOUT}/system.exe EXPECT "PASS system")
   if(XBEM_MINGW_CXX)
     xbem_guest_test(guest_cpp_exceptions COMMAND run ${GOUT}/cpp_exceptions.exe EXPECT "PASS cpp_exceptions")

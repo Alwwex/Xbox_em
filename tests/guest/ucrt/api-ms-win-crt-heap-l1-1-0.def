@@ -7,3 +7,4 @@ EXPORTS
   _msize
   _aligned_malloc
   _aligned_free
+  _aligned_offset_malloc

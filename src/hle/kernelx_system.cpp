@@ -519,8 +519,9 @@ ModuleDef make_oleaut32_module() {
   m.name = "oleaut32.dll";
   m.description = "OLE automation: BSTR and VARIANT basics";
   m.exports = {
-      XBEM_HLE(SysAllocString), XBEM_HLE(SysAllocStringLen), XBEM_HLE(SysFreeString), XBEM_HLE(SysStringLen),
-      XBEM_HLE(SysStringByteLen), XBEM_HLE(VariantInit), XBEM_HLE(VariantClear),
+      XBEM_HLE_ORD(SysAllocString, 2), XBEM_HLE_ORD(SysAllocStringLen, 4), XBEM_HLE_ORD(SysFreeString, 6),
+      XBEM_HLE_ORD(SysStringLen, 7), XBEM_HLE_ORD(SysStringByteLen, 149), XBEM_HLE_ORD(VariantInit, 8),
+      XBEM_HLE_ORD(VariantClear, 9),
   };
   return m;
 }

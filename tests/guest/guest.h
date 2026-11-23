@@ -80,6 +80,7 @@ IMP HANDLE FindFirstFileA(const char*, void*);
 IMP BOOL FindNextFileA(HANDLE, void*);
 IMP BOOL FindClose(HANDLE);
 IMP DWORD XbemDefinitelyMissing(void); /* deliberately not implemented by xbem */
+IMP uint64_t XbemMissingWithArgs(uint64_t, uint64_t, uint64_t, uint64_t); /* ditto */
 
 /* xgameruntime.dll */
 typedef void (*XTaskQueueCallback)(void* context, _Bool canceled);

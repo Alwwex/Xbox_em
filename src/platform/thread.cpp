@@ -26,6 +26,27 @@ unsigned hardware_threads() {
 void yield_thread() { std::this_thread::yield(); }
 
 #if defined(_WIN32)
+void flush_process_write_buffers() { FlushProcessWriteBuffers(); }
+#else
+void flush_process_write_buffers() {
+  // membarrier(PRIVATE_EXPEDITED) issues a barrier on every CPU running a
+  // thread of this process. Fall back to the classic mprotect trick, whose
+  // TLB shootdown has the same effect, if the kernel lacks it.
+  constexpr int kRegisterPrivateExpedited = 1 << 4, kPrivateExpedited = 1 << 3;
+  static const bool have_membarrier = syscall(SYS_membarrier, kRegisterPrivateExpedited, 0, 0) == 0;
+  if (have_membarrier && syscall(SYS_membarrier, kPrivateExpedited, 0, 0) == 0) return;
+  static void* page = map_anywhere(page_size(), page_size(), Prot::RW);
+  if (!page) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return;
+  }
+  static_cast<volatile char*>(page)[0] = 1;  // make sure it is populated
+  protect(page, page_size(), Prot::R);
+  protect(page, page_size(), Prot::RW);
+}
+#endif
+
+#if defined(_WIN32)
 
 bool guest_execution_supported(std::string* reason) {
   if (reason)

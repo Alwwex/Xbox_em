@@ -5,3 +5,4 @@ EXPORTS
   floor
   _dclass
   _controlfp_s
+  nexttowardf

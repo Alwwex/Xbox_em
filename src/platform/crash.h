@@ -17,4 +17,16 @@ void install_crash_handler(AddressDescriber describer);
 // guest code can still be reported.
 void setup_thread_signal_stack();
 
+// Describes what the call instruction before a return address calls, e.g.
+// "calls kernelx.dll!WaitForSingleObject" (empty if unknown). Signal-safe.
+using CallSiteDescriber = void (*)(uint64_t return_address, char* out, size_t out_size);
+
+// Thread dump for hangs: Ctrl+C (SIGINT) prints where every registered guest
+// thread is - its instruction pointer and the guest return addresses on its
+// stack, with the imported function each call site calls - and exits.
+// Ctrl+\ (SIGQUIT) prints the same dump and lets the title continue.
+void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site);
+void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_high);
+void unregister_dump_thread();
+
 }  // namespace xbem::platform

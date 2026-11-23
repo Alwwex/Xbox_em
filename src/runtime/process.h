@@ -129,6 +129,7 @@ class Process {
   // Returns the previous suspend count, or -1 on failure.
   int resume_thread(GuestThread& thread);
   std::shared_ptr<GuestThread> current_thread_shared();
+  std::shared_ptr<GuestThread> find_thread(uint32_t id);
   size_t live_thread_count();
 
   uint32_t tls_alloc();

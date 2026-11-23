@@ -30,6 +30,17 @@ bool protect(void* address, size_t size, Prot prot);
 // the address range reserved (Windows MEM_DECOMMIT).
 bool decommit(void* address, size_t size);
 
+// "Physical memory": a shared memory object whose pages can be mapped at one or
+// more virtual addresses (console titles alias physical pages this way).
+// Returns an opaque handle, or -1 on failure / unsupported host.
+intptr_t create_shared_memory(uint64_t size);
+// Maps [offset, offset+size) of `memory` at `address`, replacing whatever is there.
+bool map_shared(uint64_t address, size_t size, Prot prot, intptr_t memory, uint64_t offset);
+// Replaces [address, address+size) with fresh anonymous memory of protection `prot`.
+bool remap_anonymous(uint64_t address, size_t size, Prot prot);
+// Releases the host memory behind a range of the shared object (contents become zero).
+bool discard_shared(intptr_t memory, uint64_t offset, size_t size);
+
 inline uint64_t align_down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 inline uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 

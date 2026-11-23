@@ -33,4 +33,8 @@ uint32_t host_process_id();
 unsigned hardware_threads();
 void yield_thread();
 
+// Makes all writes of every thread of the process visible to the others
+// (Windows FlushProcessWriteBuffers: a process-wide memory barrier).
+void flush_process_write_buffers();
+
 }  // namespace xbem::platform

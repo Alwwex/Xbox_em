@@ -193,10 +193,9 @@ void ModuleLoader::resolve_imports(LoadedModule& m) {
       uint64_t addr = 0;
       if (dep) {
         if (dep->hle) {
-          if (!e.by_ordinal) {
-            const auto look = hle::Registry::instance().find(imp.dll_name, e.name);
-            if (look.exp) addr = reinterpret_cast<uint64_t>(look.exp->address);
-          }
+          const auto& reg = hle::Registry::instance();
+          const auto look = e.by_ordinal ? reg.find_ordinal(imp.dll_name, e.ordinal) : reg.find(imp.dll_name, e.name);
+          if (look.exp) addr = reinterpret_cast<uint64_t>(look.exp->address);
         } else {
           addr = e.by_ordinal ? get_proc_address(*dep, e.ordinal) : get_proc_address_impl(*dep, e.name, 0);
         }
@@ -297,7 +296,10 @@ uint64_t ModuleLoader::get_proc_address_impl(LoadedModule& m, std::string_view n
 
 uint64_t ModuleLoader::get_proc_address(LoadedModule& m, uint16_t ordinal) {
   std::lock_guard lock(mutex_);
-  if (m.hle) return 0;  // HLE modules export by name only
+  if (m.hle) {
+    const auto look = hle::Registry::instance().find_ordinal(m.hle->name, ordinal);
+    return look.exp ? reinterpret_cast<uint64_t>(look.exp->address) : 0;
+  }
   auto it = m.exports_by_ordinal.find(ordinal);
   return it == m.exports_by_ordinal.end() ? 0 : resolve_export(m, it->second, 0);
 }

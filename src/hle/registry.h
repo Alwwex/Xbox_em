@@ -17,6 +17,7 @@ struct ExportDef {
   std::string_view name;
   void* address;
   ExportKind kind = ExportKind::Implemented;
+  uint16_t ordinal = 0;  // 0 = not exported by ordinal
 };
 
 struct ModuleDef {
@@ -40,6 +41,9 @@ class Registry {
 
   const ModuleDef* find_module(std::string_view dll_name) const;
   Lookup find(std::string_view dll_name, std::string_view function) const;
+  Lookup find_ordinal(std::string_view dll_name, uint16_t ordinal) const;
+  // Reverse lookup for diagnostics: "module!Function" of an HLE entry point, or nullptr.
+  const std::string* name_of(uint64_t address) const;
   const std::vector<ModuleDef>& modules() const { return modules_; }
 
   static std::string normalize_dll_name(std::string_view dll_name);
@@ -50,7 +54,10 @@ class Registry {
   std::vector<ModuleDef> modules_;
   std::unordered_map<std::string, size_t> by_name_;
   std::vector<std::unordered_map<std::string, size_t>> export_index_;
+  std::vector<std::unordered_map<uint16_t, size_t>> ordinal_index_;
+  std::unordered_map<uint64_t, std::string> names_by_address_;
   const ModuleDef* api_set_target_ = nullptr;
+  const ModuleDef* user_target_ = nullptr;
   const ModuleDef* crt_target_ = nullptr;
 };
 
@@ -61,6 +68,13 @@ ModuleDef make_d3d12_module();
 ModuleDef make_ucrt_module();
 ModuleDef make_oleaut32_module();
 ModuleDef make_bcrypt_module();
+ModuleDef make_xmem_module();
+ModuleDef make_user32_module();
+ModuleDef make_ws2_32_module();
+ModuleDef make_winhttp_module();
+ModuleDef make_crypt32_module();
+std::vector<ModuleDef> make_media_modules();    // mfplat, mfreadwrite, gameinput, xaudio2_9
+std::vector<ModuleDef> make_console_modules();  // acphal, chad, xapu, xcrdapi, xg_xs
 
 // Pieces of kernelx implemented in separate files.
 void add_kernelx_memory_exports(std::vector<ExportDef>& out);
@@ -69,6 +83,8 @@ void add_kernelx_file_exports(std::vector<ExportDef>& out);
 void add_kernelx_seh_exports(std::vector<ExportDef>& out);
 void add_kernelx_system_exports(std::vector<ExportDef>& out);
 void add_kernelx_threadpool_exports(std::vector<ExportDef>& out);
+void add_kernelx_locale_exports(std::vector<ExportDef>& out);
+void add_kernelx_process_exports(std::vector<ExportDef>& out);
 
 // Handle value returned by GetProcessHeap() (also stored in the PEB).
 uint64_t default_process_heap();
@@ -79,3 +95,8 @@ uint64_t default_process_heap();
 #define XBEM_HLE(fn) ::xbem::hle::ExportDef{#fn, reinterpret_cast<void*>(&hle_##fn)}
 #define XBEM_HLE_STUB(fn) \
   ::xbem::hle::ExportDef{#fn, reinterpret_cast<void*>(&hle_##fn), ::xbem::hle::ExportKind::Stub}
+// Also exported by ordinal (ws2_32, oleaut32, ... are commonly imported that way).
+#define XBEM_HLE_ORD(fn, ord) \
+  ::xbem::hle::ExportDef{#fn, reinterpret_cast<void*>(&hle_##fn), ::xbem::hle::ExportKind::Implemented, ord}
+#define XBEM_HLE_STUB_ORD(fn, ord) \
+  ::xbem::hle::ExportDef{#fn, reinterpret_cast<void*>(&hle_##fn), ::xbem::hle::ExportKind::Stub, ord}

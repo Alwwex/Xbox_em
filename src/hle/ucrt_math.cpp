@@ -292,6 +292,12 @@ int32_t XBEM_GUEST_ABI hle_fesetexceptflag(const uint32_t* flags, int32_t e) {
   return 0;
 }
 
+// MSVC's long double is double, so nexttoward takes a double direction.
+double XBEM_GUEST_ABI hle_nexttoward(double x, double y) { return std::nextafter(x, y); }
+float XBEM_GUEST_ABI hle_nexttowardf(float x, double y) {
+  return std::nexttoward(x, static_cast<long double>(y));
+}
+
 #define XBEM_MATH_EXPORTS(name) XBEM_HLE(name), XBEM_HLE(name##f)
 
 }  // namespace
@@ -320,6 +326,8 @@ void add_ucrt_math_exports(std::vector<ExportDef>& out) {
       ExportDef{"_nextafterf", reinterpret_cast<void*>(&hle_nextafterf)},
       ExportDef{"_scalb", reinterpret_cast<void*>(&hle_scalbln)},
       ExportDef{"_scalbf", reinterpret_cast<void*>(&hle_scalblnf)}, XBEM_HLE(_chgsign), XBEM_HLE(_chgsignf),
+      XBEM_HLE(nexttoward), XBEM_HLE(nexttowardf),
+      ExportDef{"nexttowardl", reinterpret_cast<void*>(&hle_nexttoward)},
       XBEM_HLE(_finite), XBEM_HLE(_finitef), XBEM_HLE(_isnan), XBEM_HLE(_isnanf), XBEM_HLE(_dclass),
       XBEM_HLE(_fdclass), XBEM_HLE(_dtest), XBEM_HLE(_fdtest), XBEM_HLE(_dsign), XBEM_HLE(_fdsign),
       XBEM_HLE(_dpcomp), XBEM_HLE(_fdpcomp), XBEM_HLE(_fpclass), XBEM_HLE(_set_FMA3_enable),

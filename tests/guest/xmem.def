@@ -1,0 +1,9 @@
+LIBRARY xmem.dll
+EXPORTS
+  XMemAlloc
+  XMemFree
+  XMemVirtualAlloc
+  XMemAllocatePhysicalPages
+  XMemMapPhysicalPages
+  XMemFreePhysicalPages
+  XMemIsToolsMemAvailable

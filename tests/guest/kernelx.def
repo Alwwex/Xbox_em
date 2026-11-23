@@ -48,6 +48,7 @@ EXPORTS
   FindNextFileA
   FindClose
   XbemDefinitelyMissing
+  XbemMissingWithArgs
   RaiseException
   RtlUnwindEx
   RtlCaptureContext
@@ -83,3 +84,24 @@ EXPORTS
   StringFromGUID2
   CLSIDFromString
   CoCreateInstance
+  FormatMessageA
+  GetLocaleInfoEx
+  CompareStringEx
+  lstrcmpiW
+  LCMapStringEx
+  GetDateFormatEx
+  GetTimeFormatEx
+  SystemTimeToFileTime
+  FileTimeToSystemTime
+  GetLogicalProcessorInformationEx
+  FindResourceW
+  LoadResource
+  LockResource
+  SizeofResource
+  CoMarshalInterThreadInterfaceInStream
+  CoGetInterfaceAndReleaseStream
+  GetCurrentThreadStackLimits
+  OpenThread
+  FlushProcessWriteBuffers
+  LocalFree
+  InitializeProcThreadAttributeList

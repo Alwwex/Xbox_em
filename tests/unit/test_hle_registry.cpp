@@ -47,3 +47,36 @@ TEST(registry_normalize) {
   CHECK_EQ(hle::Registry::normalize_dll_name("bar.EXE"), std::string("bar.exe"));
   CHECK_EQ(hle::Registry::normalize_dll_name("a/b\\Baz.dll"), std::string("baz.dll"));
 }
+
+TEST(registry_ordinal_lookup) {
+  const auto& reg = hle::Registry::instance();
+  auto startup = reg.find_ordinal("WS2_32.dll", 115);
+  CHECK(startup.exp != nullptr && startup.exp->name == "WSAStartup");
+  CHECK(reg.find_ordinal("ws2_32.dll", 9).exp == reg.find("ws2_32.dll", "htons").exp);
+  CHECK(reg.find_ordinal("oleaut32.dll", 6).exp != nullptr);
+  CHECK(reg.find_ordinal("ws2_32.dll", 4000).exp == nullptr);
+  CHECK(reg.find_ordinal("kernelx.dll", 1).exp == nullptr);  // name-only module
+}
+
+TEST(registry_ordinals_unique) {
+  for (const auto& m : hle::Registry::instance().modules()) {
+    std::set<uint16_t> seen;
+    for (const auto& e : m.exports)
+      if (e.ordinal && !seen.insert(e.ordinal).second)
+        xbt::report_failure(__FILE__, __LINE__, m.name + ": duplicate ordinal " + std::to_string(e.ordinal));
+  }
+}
+
+TEST(registry_routes_new_modules) {
+  const auto& reg = hle::Registry::instance();
+  CHECK(reg.find("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", "CreateWindowExA").exp != nullptr);
+  CHECK(reg.find("ext-ms-win-rtcore-ntuser-message-l1-1-0.dll", "TranslateMessage").exp != nullptr);
+  CHECK(reg.find("xmem.dll", "XMemVirtualAlloc").exp != nullptr);
+  CHECK(reg.find("WINHTTP.dll", "WinHttpOpen").exp != nullptr);
+  CHECK(reg.find("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW").exp != nullptr);
+  CHECK(reg.find("api-ms-win-crt-time-l1-1-0.dll", "_Getdays").exp != nullptr);
+  CHECK(reg.find_ordinal("GameInput.dll", 1).exp != nullptr);
+  const auto look = reg.find("kernelx.dll", "CreateThread");
+  const std::string* name = reg.name_of(reinterpret_cast<uint64_t>(look.exp->address));
+  CHECK(name != nullptr && *name == "kernelx.dll!CreateThread");
+}

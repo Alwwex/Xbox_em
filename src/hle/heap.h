@@ -5,6 +5,7 @@
 // aligned and remember their size.
 
 #include <cstddef>
+#include <cstdint>
 
 namespace xbem::hle {
 
@@ -13,5 +14,11 @@ bool heap_free(void* p);  // false if `p` was not allocated here
 void* heap_realloc(void* p, size_t size, bool zero_new);
 bool heap_owns(const void* p);
 size_t heap_block_size(const void* p);  // ~0 if not owned
+
+// Virtual memory (VirtualAlloc/VirtualFree/VirtualQuery semantics, Win32 last
+// error set on failure). `alignment` 0 = default for the allocation type.
+void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protect, uint64_t alignment);
+bool virtual_free(void* address, uint64_t size, uint32_t type);
+size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
 
 }  // namespace xbem::hle

@@ -11,3 +11,4 @@ EXPORTS
   toupper
   towupper
   memcpy_s
+  __strncnt

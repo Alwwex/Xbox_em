@@ -512,8 +512,69 @@ void* XBEM_GUEST_ABI hle__aligned_recalloc(void* p, SIZE_T count, SIZE_T size, S
   return np;
 }
 
-int32_t XBEM_GUEST_ABI hle__callnewh(SIZE_T) { return 0; }  // no new handler installed
-uint64_t XBEM_GUEST_ABI hle__query_new_handler() { return 0; }
+std::atomic<uint64_t> g_new_handler{0};
+using NewHandler = int32_t(XBEM_GUEST_ABI*)(SIZE_T);
+
+int32_t XBEM_GUEST_ABI hle__callnewh(SIZE_T size) {
+  const uint64_t h = g_new_handler.load();
+  return h && reinterpret_cast<NewHandler>(h)(size) ? 1 : 0;
+}
+uint64_t XBEM_GUEST_ABI hle__query_new_handler() { return g_new_handler.load(); }
+uint64_t XBEM_GUEST_ABI hle__set_new_handler(uint64_t handler) { return g_new_handler.exchange(handler); }
+
+void* XBEM_GUEST_ABI hle__aligned_offset_malloc(SIZE_T size, SIZE_T alignment, SIZE_T offset) {
+  if (alignment == 0 || (alignment & (alignment - 1)) || (offset >= size && size != 0)) {
+    set_errno(crt::kEINVAL);
+    return nullptr;
+  }
+  alignment = std::max<SIZE_T>(alignment, 16);
+  auto* raw = static_cast<uint8_t*>(heap_alloc(size + alignment + 16, false));
+  if (!raw) {
+    set_errno(crt::kENOMEM);
+    return nullptr;
+  }
+  // (p + offset) is aligned; the two header words live right below p.
+  const uint64_t p = ((reinterpret_cast<uint64_t>(raw) + 16 + offset + alignment - 1) & ~(alignment - 1)) - offset;
+  const uint64_t raw_value = reinterpret_cast<uint64_t>(raw), size_value = size;
+  std::memcpy(reinterpret_cast<void*>(p - 8), &raw_value, 8);
+  std::memcpy(reinterpret_cast<void*>(p - 16), &size_value, 8);
+  return reinterpret_cast<void*>(p);
+}
+
+void* XBEM_GUEST_ABI hle__aligned_offset_realloc(void* p, SIZE_T size, SIZE_T alignment, SIZE_T offset) {
+  if (!p) return hle__aligned_offset_malloc(size, alignment, offset);
+  if (size == 0) {
+    hle__aligned_free(p);
+    return nullptr;
+  }
+  void* np = hle__aligned_offset_malloc(size, alignment, offset);
+  if (!np) return nullptr;
+  uint64_t old;
+  std::memcpy(&old, static_cast<uint8_t*>(p) - 16, 8);
+  std::memcpy(np, p, std::min<SIZE_T>(size, old));
+  hle__aligned_free(p);
+  return np;
+}
+
+[[noreturn]] void XBEM_GUEST_ABI hle__invoke_watson(const char16_t* expr, const char16_t* func, const char16_t* file,
+                                                    UINT line, uint64_t) {
+  XBEM_ERROR("ucrt", "_invoke_watson: fatal invalid parameter{}{}{} - terminating",
+             expr ? " in '" + narrow(expr) + "'" : std::string(), func ? " (" + narrow(func) + ")" : std::string(),
+             file ? std::format(" at {}:{}", narrow(file), line) : std::string());
+  flush_all();
+  proc().exit_process(0xC0000409);  // STATUS_STACK_BUFFER_OVERRUN (fast fail), as on Windows
+}
+
+[[noreturn]] void XBEM_GUEST_ABI hle__wassert(const char16_t* message, const char16_t* file, UINT line) {
+  XBEM_ERROR("ucrt", "Assertion failed: {}, file {}, line {}", narrow(message), narrow(file), line);
+  flush_all();
+  proc().exit_process(3);
+}
+[[noreturn]] void XBEM_GUEST_ABI hle__assert(const char* message, const char* file, UINT line) {
+  XBEM_ERROR("ucrt", "Assertion failed: {}, file {}, line {}", narrow(message), narrow(file), line);
+  flush_all();
+  proc().exit_process(3);
+}
 int32_t g_new_mode = 0;
 int32_t XBEM_GUEST_ABI hle__set_new_mode(int32_t m) { return std::exchange(g_new_mode, m); }
 int32_t XBEM_GUEST_ABI hle__query_new_mode() { return g_new_mode; }
@@ -549,6 +610,8 @@ void add_ucrt_runtime_exports(std::vector<ExportDef>& out) {
       XBEM_HLE(_aligned_malloc), XBEM_HLE(_aligned_free), XBEM_HLE(_aligned_msize), XBEM_HLE(_aligned_realloc),
       XBEM_HLE(_aligned_recalloc), XBEM_HLE(_callnewh), XBEM_HLE(_query_new_handler), XBEM_HLE(_set_new_mode),
       XBEM_HLE(_query_new_mode), XBEM_HLE(_heapchk), XBEM_HLE(_heapmin), XBEM_HLE(_get_heap_handle),
+      XBEM_HLE(_set_new_handler), XBEM_HLE(_aligned_offset_malloc), XBEM_HLE(_aligned_offset_realloc),
+      XBEM_HLE(_invoke_watson), XBEM_HLE(_wassert), XBEM_HLE(_assert),
       // UCRT also exports the allocator under *_base names.
       ExportDef{"_malloc_base", reinterpret_cast<void*>(&hle_malloc)},
       ExportDef{"_free_base", reinterpret_cast<void*>(&hle_free)},

@@ -39,6 +39,38 @@ void describe_address(uint64_t address, char* out, size_t out_size) {
   if (p->trampolines().contains(address)) std::snprintf(out, out_size, "<xbem import stub>");
 }
 
+// For thread dumps: what the call instruction ending at `ret` calls. Handles
+// "call [rip+disp32]" (imports through the IAT) and "call rel32".
+void describe_call_site(uint64_t ret, char* out, size_t out_size) {
+  out[0] = 0;
+  Process* p = Process::current_or_null();
+  if (!p) return;
+  const auto* code = reinterpret_cast<const uint8_t*>(ret);
+  uint64_t target = 0;
+  if (code[-6] == 0xFF && code[-5] == 0x15) {
+    int32_t disp;
+    std::memcpy(&disp, code - 4, 4);
+    const uint64_t slot = ret + static_cast<int64_t>(disp);
+    if (!p->loader().describe(slot, out, out_size)) return;  // the IAT lives inside the module
+    std::memcpy(&target, reinterpret_cast<const void*>(slot), 8);
+  } else if (code[-5] == 0xE8) {
+    int32_t rel;
+    std::memcpy(&rel, code - 4, 4);
+    target = ret + static_cast<int64_t>(rel);
+  } else {
+    return;
+  }
+  out[0] = 0;
+  if (const std::string* name = hle::Registry::instance().name_of(target)) {
+    std::snprintf(out, out_size, "-> calls %s", name->c_str());
+  } else if (const UnimplementedImport* imp = p->trampolines().find_by_stub(target)) {
+    std::snprintf(out, out_size, "-> calls UNIMPLEMENTED %s!%s", imp->dll.c_str(), imp->function.c_str());
+  } else {
+    char where[200];
+    if (p->loader().describe(target, where, sizeof where)) std::snprintf(out, out_size, "-> calls %s", where);
+  }
+}
+
 std::string quote_arg(const std::string& a) {
   if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
   std::string out = "\"";
@@ -144,6 +176,7 @@ int Process::run() {
   command_line_w_ = utf8_to_utf16(command_line_a_);
 
   platform::install_crash_handler(&describe_address);
+  platform::install_thread_dump(&describe_address, &describe_call_site);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   const size_t stack = static_cast<size_t>(std::max<uint64_t>(reserve, 1u << 20)) + (512u << 10);
@@ -284,6 +317,11 @@ void Process::thread_main(GuestThread& t) {
     return;
   }
   {
+    uint64_t stack_high = 0;
+    std::memcpy(&stack_high, t.teb + teb::kStackBase, 8);
+    platform::register_dump_thread(t.id, stack_high);
+  }
+  {
     std::unique_lock lock(sync_mutex());
     sync_cv().wait(lock, [&] { return t.suspend_count <= 0; });
   }
@@ -311,6 +349,7 @@ void Process::thread_main(GuestThread& t) {
     notify_modules(win::DLL_THREAD_DETACH, mods, false);
   }
   run_fls_callbacks(t);
+  platform::unregister_dump_thread();
 
   {
     std::lock_guard lock(sync_mutex());
@@ -373,6 +412,13 @@ std::shared_ptr<GuestThread> Process::current_thread_shared() {
   std::lock_guard lock(threads_mutex_);
   for (auto& t : threads_)
     if (t.get() == self) return t;
+  return nullptr;
+}
+
+std::shared_ptr<GuestThread> Process::find_thread(uint32_t id) {
+  std::lock_guard lock(threads_mutex_);
+  for (auto& t : threads_)
+    if (t->id == id) return t;
   return nullptr;
 }
 

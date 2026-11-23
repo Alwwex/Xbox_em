@@ -1062,6 +1062,16 @@ uint32_t XBEM_GUEST_ABI hle_fgetwc(void* stream) {
   return w.empty() ? 0xFFFF : w[0];
 }
 
+// wint_t ungetwc(wint_t c, FILE*): pushes back the UTF-8 encoding of c.
+uint32_t XBEM_GUEST_ABI hle_ungetwc(uint32_t c, void* stream) {
+  c &= 0xFFFF;
+  if (c == 0xFFFF) return 0xFFFF;  // WEOF
+  const std::string bytes = crt::to_narrow(std::u16string(1, static_cast<char16_t>(c)));
+  for (auto it = bytes.rbegin(); it != bytes.rend(); ++it)
+    if (hle_ungetc(static_cast<uint8_t>(*it), stream) == EOF) return 0xFFFF;
+  return c;
+}
+
 int32_t XBEM_GUEST_ABI hle_fputws(const char16_t* s, void* stream) {
   GuestFile* f = crt::guest_file(stream);
   if (!f || !s) return EOF;
@@ -1256,7 +1266,8 @@ void add_ucrt_stdio_exports(std::vector<ExportDef>& out) {
       ExportDef{"_fseeki64_nolock", reinterpret_cast<void*>(&hle__fseeki64)},
       ExportDef{"_ftelli64_nolock", reinterpret_cast<void*>(&hle__ftelli64)},
       ExportDef{"_fclose_nolock", reinterpret_cast<void*>(&hle_fclose)},
-      ExportDef{"_ungetc_nolock", reinterpret_cast<void*>(&hle_ungetc)},
+      ExportDef{"_ungetc_nolock", reinterpret_cast<void*>(&hle_ungetc)}, XBEM_HLE(ungetwc),
+      ExportDef{"_ungetwc_nolock", reinterpret_cast<void*>(&hle_ungetwc)},
       ExportDef{"getwc", reinterpret_cast<void*>(&hle_fgetwc)}, ExportDef{"putwc", reinterpret_cast<void*>(&hle_fputwc)},
       ExportDef{"_tell", reinterpret_cast<void*>(&hle__telli64)},
   });

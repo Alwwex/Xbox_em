@@ -61,6 +61,13 @@ IMP int* _errno(void);
 IMP int64_t _time64(int64_t*);
 IMP int _gmtime64_s(int* tm, const int64_t*);
 IMP size_t strftime(char*, size_t, const char*, const int* tm);
+IMP char* _Getdays(void);
+IMP char* _Getmonths(void);
+IMP void* _Gettnames(void);
+IMP size_t _Strftime(char*, size_t, const char*, const int* tm, void*);
+IMP void* _aligned_offset_malloc(size_t, size_t, size_t);
+IMP size_t __strncnt(const char*, size_t);
+IMP float nexttowardf(float, double);
 /* api-ms-win-crt-filesystem / environment */
 IMP int _stat64(const char*, void*);
 IMP int _access(const char*, int);
@@ -173,6 +180,11 @@ DWORD guest_main(void* peb) {
   void* a = _aligned_malloc(100, 64);
   CHECK(a && ((uintptr_t)a & 63) == 0);
   _aligned_free(a);
+  char* ao = (char*)_aligned_offset_malloc(100, 64, 8);
+  CHECK(ao && (((uintptr_t)ao + 8) & 63) == 0);
+  _aligned_free(ao);
+  CHECK(__strncnt("abcdef", 4) == 4 && __strncnt("ab", 10) == 2);
+  CHECK(nexttowardf(1.0f, 2.0) > 1.0f && nexttowardf(1.0f, 0.0) < 1.0f);
 
   /* ---- math & floating-point control ---- */
   CHECK(sqrt(16.0) == 4.0 && pow(2.0, 10.0) == 1024.0 && floor(-1.5) == -2.0);
@@ -197,6 +209,15 @@ DWORD guest_main(void* peb) {
   int64_t epoch = 0;
   CHECK(_gmtime64_s(tm, &epoch) == 0 && tm[5] == 70);
   CHECK(strftime(buf, sizeof buf, "%Y-%m-%d", tm) == 10 && gstreq(buf, "1970-01-01"));
+  void* names = _Gettnames();
+  CHECK(names && _Strftime(buf, sizeof buf, "%Y", tm, names) == 4 && gstreq(buf, "1970"));
+  free(names);
+  char* days = _Getdays();
+  CHECK(days && memcmp(days, ":Sun:Sunday:Mon:Monday", 22) == 0);
+  free(days);
+  char* months = _Getmonths();
+  CHECK(months && memcmp(months, ":Jan:January:Feb:February", 25) == 0);
+  free(months);
 
   /* ---- files: binary write, text-mode read (CRLF -> LF) ---- */
   void* f = fopen("T:\\crt_test.txt", "wb");

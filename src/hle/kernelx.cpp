@@ -126,6 +126,10 @@ void fill_systemtime(void* out, bool local) {
   std::memcpy(out, st, sizeof st);
 }
 
+}  // namespace
+void fill_local_systemtime(void* out) { fill_systemtime(out, true); }
+namespace {
+
 void XBEM_GUEST_ABI hle_GetSystemTime(void* st) { fill_systemtime(st, false); }
 void XBEM_GUEST_ABI hle_GetLocalTime(void* st) { fill_systemtime(st, true); }
 
@@ -624,6 +628,8 @@ ModuleDef make_kernelx_module() {
   add_kernelx_seh_exports(m.exports);
   add_kernelx_system_exports(m.exports);
   add_kernelx_threadpool_exports(m.exports);
+  add_kernelx_locale_exports(m.exports);
+  add_kernelx_process_exports(m.exports);
   add_kernelx_memory_exports(m.exports);
   add_kernelx_sync_exports(m.exports);
   add_kernelx_file_exports(m.exports);

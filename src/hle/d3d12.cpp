@@ -5,6 +5,7 @@
 // E_NOTIMPL, which lets a title reach - and report - its graphics init.
 
 #include "gpu/backend.h"
+#include "hle/discovery.h"
 #include "hle/hle_util.h"
 
 namespace xbem::hle {
@@ -47,6 +48,20 @@ HRESULT XBEM_GUEST_ABI hle_D3D12SerializeVersionedRootSignature(const void*, voi
   return hle_D3D12SerializeRootSignature(nullptr, 0, blob, error_blob);
 }
 
+// Reserves/configures the GPU virtual address space before device creation.
+// Nothing to configure with host memory; report success (titles proceed).
+HRESULT XBEM_GUEST_ABI hle_D3D12ConfigureVirtualMemoryX(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  XBEM_LOG_CALL("d3d12", "S_OK", a, b, c, d);
+  return S_OK;
+}
+
+// HRESULT D3D12CreateRootSignatureDeserializer(const void* data, SIZE_T size, REFIID, void** out)
+HRESULT XBEM_GUEST_ABI hle_D3D12CreateRootSignatureDeserializer(const void*, SIZE_T, const void*, void** out) {
+  if (out) *out = nullptr;
+  XBEM_WARN_ONCE("d3d12", "D3D12CreateRootSignatureDeserializer not implemented -> E_NOTIMPL");
+  return E_NOTIMPL;
+}
+
 }  // namespace
 
 ModuleDef make_d3d12_module() {
@@ -57,7 +72,8 @@ ModuleDef make_d3d12_module() {
   m.exports = {
       XBEM_HLE_STUB(D3D12XboxCreateDevice),   XBEM_HLE_STUB(D3D12CreateDevice),
       XBEM_HLE_STUB(D3D12GetDebugInterface),  XBEM_HLE_STUB(D3D12SerializeRootSignature),
-      XBEM_HLE_STUB(D3D12SerializeVersionedRootSignature),
+      XBEM_HLE_STUB(D3D12SerializeVersionedRootSignature), XBEM_HLE(D3D12ConfigureVirtualMemoryX),
+      XBEM_HLE_STUB(D3D12CreateRootSignatureDeserializer),
   };
   return m;
 }

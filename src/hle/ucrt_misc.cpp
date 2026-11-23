@@ -6,6 +6,7 @@
 #include <ctime>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 
@@ -180,6 +181,79 @@ int32_t XBEM_GUEST_ABI hle__ftime64_s(Timeb64* tb) {
 }
 
 // ------------------------------------------------------- sort & search
+
+void XBEM_GUEST_ABI hle__ftime64(Timeb64* tb) { hle__ftime64_s(tb); }
+
+// Locale time names used by msvcp140 (time_get/time_put). The C locale.
+constexpr const char* kCDayAbbr[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+constexpr const char* kCDay[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+constexpr const char* kCMonAbbr[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+constexpr const char* kCMon[12] = {"January", "February", "March",     "April",   "May",      "June",
+                                   "July",    "August",   "September", "October", "November", "December"};
+
+std::string joined_names(const char* const* abbr, const char* const* full, int n) {
+  std::string s;
+  for (int i = 0; i < n; ++i) s += std::string(":") + abbr[i] + ":" + full[i];
+  return s;
+}
+
+template <class Char>
+Char* heap_string(const std::basic_string<Char>& s) {
+  auto* p = static_cast<Char*>(heap_alloc((s.size() + 1) * sizeof(Char), false));  // released with free()
+  if (!p) return nullptr;
+  std::memcpy(p, s.data(), s.size() * sizeof(Char));
+  p[s.size()] = 0;
+  return p;
+}
+
+char* XBEM_GUEST_ABI hle__Getdays() { return heap_string(joined_names(kCDayAbbr, kCDay, 7)); }
+char* XBEM_GUEST_ABI hle__Getmonths() { return heap_string(joined_names(kCMonAbbr, kCMon, 12)); }
+char16_t* XBEM_GUEST_ABI hle__W_Getdays() { return heap_string(crt::to_wide(joined_names(kCDayAbbr, kCDay, 7))); }
+char16_t* XBEM_GUEST_ABI hle__W_Getmonths() {
+  return heap_string(crt::to_wide(joined_names(kCMonAbbr, kCMon, 12)));
+}
+
+// __crt_lc_time_data for the C locale, allocated like the UCRT does (the
+// caller releases it with free()). Pointers refer to static strings.
+void* make_time_names() {
+  constexpr size_t kSize = 0x300;
+  auto* p = static_cast<uint64_t*>(heap_alloc(kSize, true));
+  if (!p) return nullptr;
+  static const char* narrow_names[43];
+  static std::u16string wide_storage[44];
+  static std::once_flag once;
+  std::call_once(once, [] {
+    int k = 0;
+    for (auto* n : kCDayAbbr) narrow_names[k++] = n;
+    for (auto* n : kCDay) narrow_names[k++] = n;
+    for (auto* n : kCMonAbbr) narrow_names[k++] = n;
+    for (auto* n : kCMon) narrow_names[k++] = n;
+    narrow_names[k++] = "AM";
+    narrow_names[k++] = "PM";
+    narrow_names[k++] = "MM/dd/yy";
+    narrow_names[k++] = "dddd, MMMM dd, yyyy";
+    narrow_names[k++] = "HH:mm:ss";
+    for (int i = 0; i < 43; ++i) wide_storage[i] = crt::to_wide(narrow_names[i]);
+    wide_storage[43] = u"en-US";
+  });
+  for (int i = 0; i < 43; ++i) p[i] = reinterpret_cast<uint64_t>(narrow_names[i]);
+  const int32_t caltype = 1, refcount = 0;
+  std::memcpy(p + 43, &caltype, 4);
+  std::memcpy(reinterpret_cast<uint8_t*>(p + 43) + 4, &refcount, 4);
+  for (int i = 0; i < 44; ++i) p[44 + i] = reinterpret_cast<uint64_t>(wide_storage[i].c_str());
+  return p;
+}
+
+void* XBEM_GUEST_ABI hle__Gettnames() { return make_time_names(); }
+void* XBEM_GUEST_ABI hle__W_Gettnames() { return make_time_names(); }
+
+SIZE_T XBEM_GUEST_ABI hle__Strftime(char* buf, SIZE_T size, const char* fmt, const GuestTm* g, void*) {
+  return hle_strftime(buf, size, fmt, g);
+}
+SIZE_T XBEM_GUEST_ABI hle__Wcsftime(char16_t* buf, SIZE_T size, const char16_t* fmt, const GuestTm* g, void*) {
+  return hle_wcsftime(buf, size, fmt, g);
+}
 
 using Compare = int32_t(XBEM_GUEST_ABI*)(const void*, const void*);
 using CompareS = int32_t(XBEM_GUEST_ABI*)(void*, const void*, const void*);
@@ -775,6 +849,8 @@ void add_ucrt_misc_exports(std::vector<ExportDef>& out) {
       XBEM_HLE(clock), XBEM_HLE(strftime), XBEM_HLE(wcsftime), XBEM_HLE(_tzset), XBEM_HLE(_get_timezone),
       XBEM_HLE(_get_daylight), XBEM_HLE(_get_dstbias), XBEM_HLE(_timespec64_get),
       ExportDef{"timespec_get", reinterpret_cast<void*>(&hle__timespec64_get)}, XBEM_HLE(_ftime64_s),
+      XBEM_HLE(_ftime64), XBEM_HLE(_Getdays), XBEM_HLE(_Getmonths), XBEM_HLE(_W_Getdays), XBEM_HLE(_W_Getmonths),
+      XBEM_HLE(_Gettnames), XBEM_HLE(_W_Gettnames), XBEM_HLE(_Strftime), XBEM_HLE(_Wcsftime),
       XBEM_HLE(qsort), XBEM_HLE(qsort_s), XBEM_HLE(bsearch), XBEM_HLE(bsearch_s), XBEM_HLE(srand), XBEM_HLE(rand),
       XBEM_HLE(rand_s), XBEM_HLE(_rotl), XBEM_HLE(_rotr), XBEM_HLE(_rotl64), XBEM_HLE(_rotr64),
       ExportDef{"_lrotl", reinterpret_cast<void*>(&hle__rotl)}, ExportDef{"_lrotr", reinterpret_cast<void*>(&hle__rotr)},

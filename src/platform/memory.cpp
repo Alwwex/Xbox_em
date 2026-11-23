@@ -3,6 +3,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -49,6 +50,11 @@ bool protect(void* address, size_t size, Prot prot) {
 }
 
 bool decommit(void* address, size_t size) { return VirtualFree(address, size, MEM_DECOMMIT) != 0; }
+
+intptr_t create_shared_memory(uint64_t) { return -1; }
+bool map_shared(uint64_t, size_t, Prot, intptr_t, uint64_t) { return false; }
+bool remap_anonymous(uint64_t, size_t, Prot) { return false; }
+bool discard_shared(intptr_t, uint64_t, size_t) { return false; }
 
 bool safe_read(uint64_t address, void* out, size_t size) {
   SIZE_T done = 0;
@@ -117,6 +123,33 @@ bool protect(void* address, size_t size, Prot prot) { return mprotect(address, s
 bool decommit(void* address, size_t size) {
   madvise(address, size, MADV_DONTNEED);
   return mprotect(address, size, PROT_NONE) == 0;
+}
+
+intptr_t create_shared_memory(uint64_t size) {
+  const int fd = memfd_create("xbem-physical", MFD_CLOEXEC);
+  if (fd < 0) return -1;
+  if (ftruncate(fd, static_cast<off_t>(size)) != 0) {  // sparse: costs nothing until touched
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+bool map_shared(uint64_t address, size_t size, Prot prot, intptr_t memory, uint64_t offset) {
+  void* p = mmap(reinterpret_cast<void*>(address), size, to_native(prot), MAP_SHARED | MAP_FIXED,
+                 static_cast<int>(memory), static_cast<off_t>(offset));
+  return p != MAP_FAILED;
+}
+
+bool remap_anonymous(uint64_t address, size_t size, Prot prot) {
+  void* p = mmap(reinterpret_cast<void*>(address), size, to_native(prot),
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  return p != MAP_FAILED;
+}
+
+bool discard_shared(intptr_t memory, uint64_t offset, size_t size) {
+  return fallocate(static_cast<int>(memory), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
+                   static_cast<off_t>(size)) == 0;
 }
 
 bool safe_read(uint64_t address, void* out, size_t size) {

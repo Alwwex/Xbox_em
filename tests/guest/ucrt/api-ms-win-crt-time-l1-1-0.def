@@ -3,3 +3,7 @@ EXPORTS
   _time64
   _gmtime64_s
   strftime
+  _Getdays
+  _Getmonths
+  _Gettnames
+  _Strftime

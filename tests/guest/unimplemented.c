@@ -8,5 +8,7 @@ DWORD guest_main(void* peb) {
   CHECK(XbemDefinitelyMissing() == 0);
   CHECK(GetLastError() == 120); /* ERROR_CALL_NOT_IMPLEMENTED */
   XbemDefinitelyMissing();
+  /* The stub log shows the first four integer arguments and the call site. */
+  CHECK(XbemMissingWithArgs(0x11, 0x22, 0x33, 0x44) == 0);
   return (DWORD)finish("unimplemented");
 }

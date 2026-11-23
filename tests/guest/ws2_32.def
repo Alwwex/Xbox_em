@@ -1,0 +1,9 @@
+LIBRARY ws2_32.dll
+EXPORTS
+  htons @9 NONAME
+  inet_addr @11 NONAME
+  socket @23 NONAME
+  WSAGetLastError @111 NONAME
+  WSAStartup @115 NONAME
+  WSACleanup @116 NONAME
+  getaddrinfo

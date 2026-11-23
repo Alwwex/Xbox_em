@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "hle/hle_util.h"
@@ -613,6 +615,210 @@ DWORD XBEM_GUEST_ABI hle_GetFullPathNameW(LPCWSTR name, DWORD size, LPWSTR buf, 
   return n;
 }
 
+// ------------------------------------------------- handle-based metadata
+
+std::optional<fs::path> path_of_handle(HANDLE h) {
+  auto obj = lookup_handle(h);
+  if (auto f = std::dynamic_pointer_cast<FileObject>(obj)) return f->path;
+  if (auto d = std::dynamic_pointer_cast<DirectoryObject>(obj)) return d->path;
+  return std::nullopt;
+}
+
+uint64_t from_filetime_to_host(uint64_t ft, fs::file_time_type& out) {
+  using namespace std::chrono;
+  const auto ns = nanoseconds(static_cast<int64_t>(ft - 116444736000000000ull) * 100);
+  out = clock_cast<fs::file_time_type::clock>(system_clock::time_point(duration_cast<system_clock::duration>(ns)));
+  return ft;
+}
+
+BOOL XBEM_GUEST_ABI hle_GetFileTime(HANDLE h, uint64_t* creation, uint64_t* access, uint64_t* write) {
+  auto p = path_of_handle(h);
+  if (!p) {
+    set_last_error(ERROR_INVALID_HANDLE);
+    return FALSE;
+  }
+  std::error_code ec;
+  const uint64_t ft = to_filetime(fs::last_write_time(*p, ec));
+  if (creation) *creation = ft;
+  if (access) *access = ft;
+  if (write) *write = ft;
+  return TRUE;
+}
+
+BOOL XBEM_GUEST_ABI hle_SetFileTime(HANDLE h, const uint64_t*, const uint64_t*, const uint64_t* write) {
+  auto p = path_of_handle(h);
+  if (!p) {
+    set_last_error(ERROR_INVALID_HANDLE);
+    return FALSE;
+  }
+  if (write && *write) {
+    fs::file_time_type t;
+    from_filetime_to_host(*write, t);
+    std::error_code ec;
+    fs::last_write_time(*p, t, ec);  // best effort (fails silently on the read-only package)
+  }
+  return TRUE;
+}
+
+// BY_HANDLE_FILE_INFORMATION (52 bytes)
+BOOL XBEM_GUEST_ABI hle_GetFileInformationByHandle(HANDLE h, uint8_t* info) {
+  auto p = path_of_handle(h);
+  if (!p || !info) {
+    set_last_error(ERROR_INVALID_HANDLE);
+    return FALSE;
+  }
+  std::memset(info, 0, 52);
+  const DWORD attrs = attributes_of(*p, false);
+  std::memcpy(info, &attrs, 4);
+  uint8_t times[32];
+  fill_times_and_size(times, *p);
+  std::memcpy(info + 4, times, 24);       // creation, access, write
+  const DWORD serial = 0x58424D45;        // "XBME"
+  std::memcpy(info + 28, &serial, 4);
+  std::memcpy(info + 32, times + 24, 8);  // size high, size low
+  const DWORD links = 1;
+  std::memcpy(info + 40, &links, 4);
+  const uint64_t index = std::hash<std::string>{}(p->string());
+  const DWORD hi = static_cast<DWORD>(index >> 32), lo = static_cast<DWORD>(index);
+  std::memcpy(info + 44, &hi, 4);
+  std::memcpy(info + 48, &lo, 4);
+  return TRUE;
+}
+
+BOOL XBEM_GUEST_ABI hle_SetFileAttributesW(LPCWSTR name, DWORD) {
+  auto r = resolve_writable(narrow(name));
+  if (!r) return FALSE;
+  std::error_code ec;
+  if (!fs::exists(r->host_path, ec)) {
+    set_last_error(ERROR_FILE_NOT_FOUND);
+    return FALSE;
+  }
+  return TRUE;  // attributes beyond read-only/directory are not modelled
+}
+
+BOOL XBEM_GUEST_ABI hle_GetDiskFreeSpaceExW(LPCWSTR dir, uint64_t* avail, uint64_t* total, uint64_t* total_free) {
+  const std::string path = dir ? narrow(dir) : std::string();
+  auto r = proc().vfs().resolve(std::string_view(path.empty() ? std::string("T:\\") : path));
+  uint64_t a = 0, t = 0, f = 0;
+  if (r && !r->read_only) {
+    std::error_code ec;
+    const fs::space_info si = fs::space(r->host_path, ec);
+    if (!ec) {
+      a = si.available;
+      t = si.capacity;
+      f = si.free;
+    }
+  } else if (r) {
+    std::error_code ec;
+    const fs::space_info si = fs::space(r->host_path, ec);
+    t = ec ? 0 : si.capacity;  // the package drive is full and read-only
+  } else {
+    set_last_error(ERROR_PATH_NOT_FOUND);
+    return FALSE;
+  }
+  if (avail) *avail = a;
+  if (total) *total = t;
+  if (total_free) *total_free = f;
+  return TRUE;
+}
+
+constexpr DWORD MOVEFILE_REPLACE_EXISTING = 0x1;
+constexpr DWORD MOVEFILE_COPY_ALLOWED = 0x2;
+
+BOOL XBEM_GUEST_ABI hle_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
+  auto src = resolve_writable(narrow(from));
+  if (!src) return FALSE;
+  if (!to) {  // delete (normally only after reboot)
+    std::error_code ec;
+    fs::remove(src->host_path, ec);
+    return TRUE;
+  }
+  auto dst = resolve_writable(narrow(to));
+  if (!dst) return FALSE;
+  std::error_code ec;
+  if (!fs::exists(src->host_path, ec)) {
+    set_last_error(ERROR_FILE_NOT_FOUND);
+    return FALSE;
+  }
+  if (fs::exists(dst->host_path, ec) && !(flags & MOVEFILE_REPLACE_EXISTING)) {
+    set_last_error(ERROR_ALREADY_EXISTS);
+    return FALSE;
+  }
+  fs::rename(src->host_path, dst->host_path, ec);
+  if (ec && (flags & MOVEFILE_COPY_ALLOWED)) {
+    ec.clear();
+    fs::copy(src->host_path, dst->host_path, fs::copy_options::overwrite_existing | fs::copy_options::recursive, ec);
+    if (!ec) fs::remove_all(src->host_path, ec);
+  }
+  if (ec) {
+    set_last_error(ERROR_ACCESS_DENIED);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+constexpr HRESULT hresult_from_win32(DWORD e) { return e ? static_cast<HRESULT>(0x80070000u | (e & 0xFFFF)) : S_OK; }
+
+// HRESULT CopyFile2(PCWSTR existing, PCWSTR new, COPYFILE2_EXTENDED_PARAMETERS*)
+HRESULT XBEM_GUEST_ABI hle_CopyFile2(LPCWSTR from, LPCWSTR to, const uint8_t* ext) {
+  DWORD copy_flags = 0;
+  if (ext) std::memcpy(&copy_flags, ext + 4, 4);
+  auto src = proc().vfs().resolve(guest_wstr(from));
+  auto dst = resolve_writable(narrow(to));
+  if (!src) return hresult_from_win32(ERROR_PATH_NOT_FOUND);
+  if (!dst) return hresult_from_win32(last_error());
+  std::error_code ec;
+  if (!fs::is_regular_file(src->host_path, ec)) return hresult_from_win32(ERROR_FILE_NOT_FOUND);
+  if ((copy_flags & 0x1 /*COPY_FILE_FAIL_IF_EXISTS*/) && fs::exists(dst->host_path, ec))
+    return hresult_from_win32(ERROR_FILE_EXISTS);
+  fs::copy_file(src->host_path, dst->host_path, fs::copy_options::overwrite_existing, ec);
+  return ec ? hresult_from_win32(ERROR_ACCESS_DENIED) : S_OK;
+}
+
+BOOL XBEM_GUEST_ABI hle_CreateHardLinkW(LPCWSTR link, LPCWSTR existing, void*) {
+  auto l = resolve_writable(narrow(link));
+  auto e = proc().vfs().resolve(guest_wstr(existing));
+  if (!l || !e) {
+    if (!e) set_last_error(ERROR_FILE_NOT_FOUND);
+    return FALSE;
+  }
+  std::error_code ec;
+  fs::create_hard_link(e->host_path, l->host_path, ec);
+  if (ec) fs::copy_file(e->host_path, l->host_path, ec);  // across mounts: fall back to a copy
+  if (ec) {
+    set_last_error(ERROR_ACCESS_DENIED);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+BOOLEAN XBEM_GUEST_ABI hle_CreateSymbolicLinkW(LPCWSTR link, LPCWSTR target, DWORD flags) {
+  auto l = resolve_writable(narrow(link));
+  auto t = proc().vfs().resolve(guest_wstr(target));
+  if (!l || !t) {
+    if (!t) set_last_error(ERROR_PATH_NOT_FOUND);
+    return 0;
+  }
+  std::error_code ec;
+  if (flags & 0x1 /*SYMBOLIC_LINK_FLAG_DIRECTORY*/) fs::create_directory_symlink(t->host_path, l->host_path, ec);
+  else fs::create_symlink(t->host_path, l->host_path, ec);
+  if (ec) {
+    set_last_error(ERROR_ACCESS_DENIED);
+    return 0;
+  }
+  return 1;
+}
+
+// Named pipes do not exist for titles here.
+BOOL XBEM_GUEST_ABI hle_SetNamedPipeHandleState(HANDLE, DWORD*, DWORD*, DWORD*) {
+  set_last_error(ERROR_INVALID_HANDLE);
+  return FALSE;
+}
+BOOL XBEM_GUEST_ABI hle_WaitNamedPipeW(LPCWSTR, DWORD) {
+  set_last_error(ERROR_FILE_NOT_FOUND);
+  return FALSE;
+}
+
 }  // namespace
 
 void add_kernelx_file_exports(std::vector<ExportDef>& out) {
@@ -625,6 +831,10 @@ void add_kernelx_file_exports(std::vector<ExportDef>& out) {
       XBEM_HLE(RemoveDirectoryW), XBEM_HLE(FindFirstFileW), XBEM_HLE(FindFirstFileA), XBEM_HLE(FindFirstFileExW),
       XBEM_HLE(FindNextFileW), XBEM_HLE(FindNextFileA), XBEM_HLE(FindClose), XBEM_HLE(GetCurrentDirectoryW),
       XBEM_HLE(SetCurrentDirectoryW), XBEM_HLE(GetTempPathW), XBEM_HLE(GetFullPathNameW),
+      XBEM_HLE(GetFileTime), XBEM_HLE(SetFileTime), XBEM_HLE(GetFileInformationByHandle),
+      XBEM_HLE(SetFileAttributesW), XBEM_HLE(GetDiskFreeSpaceExW), XBEM_HLE(MoveFileExW), XBEM_HLE(CopyFile2),
+      XBEM_HLE(CreateHardLinkW), XBEM_HLE(CreateSymbolicLinkW), XBEM_HLE_STUB(SetNamedPipeHandleState),
+      XBEM_HLE_STUB(WaitNamedPipeW),
   });
 }
 

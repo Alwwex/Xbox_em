@@ -27,17 +27,20 @@ PC build z nějakého důvodu není možný.
 
 - **PE loader** pro x64 obrazy: mapování sekcí, relokace, importy (i podle ordinálu), exporty a forwardery, ochrany stránek, načítání DLL přibalených ke hře (statické i `LoadLibrary`), `DllMain`.
 - **Prostředí vlákna jako ve Windows**: emulovaný TEB/PEB přes segment `GS` (stejně jako Wine), implicitní TLS (`__declspec(thread)`), TLS callbacky, `TlsAlloc`/`FlsAlloc`, `GetLastError` přímo v TEB.
-- **HLE `kernelx.dll`** (~330 funkcí, slouží i jako `advapi32`/`ole32`): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace, **thread pool** (práce, časovače, čekání, cleanup groups), registr (prázdný jako na konzoli), ETW, základ COM, WinRT řetězce a aktivace, `oleaut32` (BSTR) a `bcrypt` (náhodná čísla). API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
+- **HLE `kernelx.dll`** (~410 funkcí, slouží i jako `advapi32`/`ole32`): vlákna, události, semafory, mutexy, `WaitForMultipleObjects`, kritické sekce, SRW zámky, condition variables, `InitOnce`, `WaitOnAddress`, virtuální paměť, haldy, soubory (včetně overlapped I/O a `FindFirstFile`), moduly, čas, řetězce/kódové stránky, systémové informace, **thread pool** (práce, časovače, čekání, cleanup groups), registr (prázdný jako na konzoli), ETW, základ COM, WinRT řetězce a aktivace, locale/NLS (en‑US), `FormatMessage`, formátování data a času, topologie procesoru, PE prostředky (`FindResource`), `oleaut32` (BSTR) a `bcrypt` (náhodná čísla). API‑set názvy (`api-ms-win-core-*`) se přesměrují sem.
+- **`xmem.dll`** (správa paměti konzole): `XMemAlloc`, `XMemVirtualAlloc` a **fyzické stránky** (`XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`) emulované sdílenou pamětí, takže stejnou stránku lze namapovat na víc adres jako na konzoli.
+- **Offline síť**: `ws2_32` (i importy podle ordinálu), `winhttp`, `crypt32` – vše se chová jako konzole bez připojení, nic neodchází ven.
+- **Zatím neemulované části se hlásí samy**: `acphal`/`chad`/`xapu` (zvukový hardware), `xcrdapi` (DirectStorage), `GameInput`, `XAudio2`, Media Foundation, `xg_xs` – volání se zalogují i s argumenty a místem volání a selžou tak, jak to volající kontroluje.
 - **Výjimky (SEH)**: `RaiseException`, `RtlUnwindEx`, `RtlVirtualUnwind`, `RtlCaptureContext` a spol. nad unwind daty hry (`.pdata`/`.xdata`). Funguje dvoufázové doručení, kolidující unwind, „consolidate“ mechanismus, kterým MSVC spouští `catch` bloky, vektorové handlery i `RtlCaptureStackBackTrace`. Ověřeno skutečnými C++ výjimkami (`throw`/`catch`, rethrow, výjimky ve vláknech). Neošetřená výjimka vypíše typ C++ výjimky a zásobník.
 - **C knihovna (UCRT)** (~660 funkcí za `api-ms-win-crt-*`, tedy to, co hry importují, ale nepřibalují): start/ukončení programu, `atexit`, `errno`, `malloc` a zarovnaná alokace, řetězce a wide řetězce (16bitový `wchar_t`), vlastní `printf`/`scanf` s Windows specifikátory (`%I64d`, `%ls`, …), `FILE` i `_open`/`_read` přes VFS (včetně CRLF v textovém režimu), matematika a `_controlfp`/`fenv`, čas, `qsort`, MSVC `rand()`, `_stat`/`_findfirst`, prostředí, „C“ locale. Pod jménem `msvcrt.dll` slouží i programům z MinGW.
 - **HLE `xgameruntime.dll`**: `XGameRuntimeInitialize`, `XSystemGetDeviceType` (Series X / Series S / devkit), `XPackage*`, kompletní **XTaskQueue** (režimy Manual / Immediate / ThreadPool). `XUser`, `XGameSave`, `XStore` atd. zatím vracejí `E_NOTIMPL`.
 - **Virtuální souborový systém**: balíček hry jako read‑only `G:\`, zapisovatelný `T:\`, další disky přes `--mount`, **case‑insensitive** cesty i na Linuxu, `..` nemůže utéct z kořene.
-- **Diagnostika**: volání neimplementované funkce se zaloguje a na konci běhu vypíše seřazený seznam „implementuj tohle dál“; `--strict` zastaví na první takové funkci; při pádu crash report s registry a pozicí `hra.exe+0x…`.
+- **Diagnostika**: volání neimplementované funkce se zaloguje i s prvními čtyřmi argumenty a místem volání (`hra.exe+0x…`) a na konci běhu vypíše seřazený seznam „implementuj tohle dál“; `--strict` zastaví na první takové funkci; při pádu crash report s registry a pozicí `hra.exe+0x…`. **Když se hra zasekne**: `Ctrl+C` vypíše, kde stojí každé vlákno hry (včetně volané funkce, např. `-> calls kernelx.dll!WaitForSingleObject`) a ukončí běh; `Ctrl+\` vypíše totéž a hra běží dál.
 - **Analýza**: `inspect`, `coverage` (JSON/Markdown report pokrytí importů celé hry), `package` (čte `MicrosoftGame.config`), `xvd` (metadata kontejneru, pozná šifrovaný balíček), `cpu`.
 - **Komunikace PC ↔ konzole**: [`tools/xbdp`](tools/xbdp/xbdp.py) – klient Xbox Device Portalu (informace, balíčky, spuštění/ukončení aplikace, instalace, přenos souborů včetně rekurzivního stažení loose buildu, screenshot). Viz [docs/DEVKIT.md](docs/DEVKIT.md).
 
-Všechno výše je pokryté testy: 36 unit testů, 8 testů devkit klienta proti
-mock serveru a 18 integračních testů, které spouští **skutečné Windows PE
+Všechno výše je pokryté testy: 39 unit testů, 8 testů devkit klienta proti
+mock serveru a 20 integračních testů, které spouští **skutečné Windows PE
 binárky** (sestavené MinGW) importující z `kernelx.dll`, `xgameruntime.dll`
 a `api-ms-win-crt-*`, včetně C++ programu s výjimkami a `libstdc++`.
 
@@ -146,7 +149,7 @@ Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 5. **Služby** – offline `XUser`, `XGameSave` do lokální složky.
 6. **Nativní Windows host** – přesměrování TEB/TLS bez WSL2.
 7. **Hardwarové výjimky jako SEH** – převod `SIGSEGV`/`SIGFPE` v herním kódu na `EXCEPTION_ACCESS_VIOLATION` atd. pro `__try/__except`.
-8. **Threadpool, WinRT/COM, registry, XAudio2, XMem** – další API, která hry importují (podle `xbem coverage`).
+8. **DirectStorage (`xcrdapi`), zvukový hardware (`acphal`/`chad`/`xapu`), XAudio2, GameInput** – podle logů z reálného titulu.
 
 ## Právní rámec
 
