@@ -12,6 +12,7 @@
 #include "common/file.h"
 #include "common/log.h"
 #include "common/strings.h"
+#include "gpu/rdna2.h"
 #include "hle/registry.h"
 #include "loader/pe_image.h"
 #include "package/package_layout.h"
@@ -439,6 +440,48 @@ int cmd_hexdump(const Args& args) {
       std::printf(" %02x", img.bytes()[*off + k]);
     std::printf("\n");
   }
+  return 0;
+}
+
+// Disassembles RDNA2 GPU code from a file (e.g. a shader captured with
+// run --dump-shaders). Without --offset it lists where programs end
+// (s_endpgm) to help locate code inside container formats.
+int cmd_gpu_disasm(const Args& args) {
+  if (args.empty())
+    throw std::runtime_error("usage: xbem gpu-disasm <file> [--offset N] [--size N] [--all]");
+  std::ifstream f(args[0], std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open " + args[0]);
+  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  size_t offset = 0, size = data.size();
+  bool all = false, have_offset = false;
+  for (size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "--offset" && i + 1 < args.size()) {
+      offset = std::stoul(args[++i], nullptr, 0);
+      have_offset = true;
+    } else if (args[i] == "--size" && i + 1 < args.size()) {
+      size = std::stoul(args[++i], nullptr, 0);
+    } else if (args[i] == "--all") {
+      all = true;
+    } else {
+      throw std::runtime_error("unknown option: " + args[i]);
+    }
+  }
+  if (offset >= data.size()) throw std::runtime_error("offset beyond the end of the file");
+  size = std::min(size, data.size() - offset);
+  std::printf("%s: %zu bytes", args[0].c_str(), data.size());
+  if (data.size() >= 4) std::printf(", starts with %02x %02x %02x %02x", data[0], data[1], data[2], data[3]);
+  std::printf("\n");
+  if (!have_offset) {
+    std::vector<size_t> ends;
+    for (size_t p = 0; p + 4 <= data.size(); p += 4)
+      if (data[p] == 0x00 && data[p + 1] == 0x00 && data[p + 2] == 0x81 && data[p + 3] == 0xBF) ends.push_back(p);
+    std::printf("s_endpgm found at %zu offset(s)%s", ends.size(), ends.empty() ? "\n" : ":");
+    for (size_t k = 0; k < ends.size() && k < 16; ++k) std::printf(" 0x%zx", ends[k]);
+    if (!ends.empty()) std::printf("\n");
+  }
+  const gpu::rdna2::Listing l = gpu::rdna2::disassemble_program(data.data() + offset, size, offset, !all);
+  std::fputs(l.text.c_str(), stdout);
+  std::printf("; %zu instructions, %zu not decoded\n", l.instructions, l.unknown);
   return 0;
 }
 

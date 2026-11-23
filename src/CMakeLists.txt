@@ -51,6 +51,7 @@ add_library(xbem_core STATIC
   runtime/seh_asm.cpp
 
   gpu/backend.cpp
+  gpu/rdna2.cpp
 )
 
 target_include_directories(xbem_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

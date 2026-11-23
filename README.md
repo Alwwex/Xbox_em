@@ -143,8 +143,7 @@ Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Roadmapa
 
 1. **Ověření na reálném titulu** – podle `xbem coverage` doplnit chybějící `kernelx`/GDK funkce a potvrdit skutečné názvy DLL a způsob vazby GDK runtime.
-2. **GPU backend nad Vulkanem** – D3D12.X COM rozhraní, fronty, command listy, haldy; prezentace do okna.
-3. **Shadery** – buď DXIL/PC shadery od vývojáře, nebo rekompilátor RDNA2 ISA → SPIR‑V.
+2. **GPU** (viz [docs/GPU.md](docs/GPU.md)) – hotovo: *headless* D3D12.X zařízení (hra projde inicializací grafiky, nic se nekreslí), zachytávání shaderů (`run --dump-shaders DIR`) a dekodér/disassembler instrukcí RDNA2 ověřený proti LLVM (`xbem gpu-disasm`). Dál: rozbor kontejneru shaderů, překlad RDNA2 → SPIR‑V, Vulkan backend.
 4. **Vstup a zvuk** – `GameInput` → SDL/evdev, XAudio2 → host audio.
 5. **Služby** – offline `XUser`, `XGameSave` do lokální složky.
 6. **Nativní Windows host** – přesměrování TEB/TLS bez WSL2.
