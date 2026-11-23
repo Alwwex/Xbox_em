@@ -20,6 +20,14 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Upload xbem (Linux / WSL2)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbem-linux-x64
+          path: |
+            build/bin/xbem
+            tools/xbdp/xbdp.py
+            README.md
 
   windows:
     name: Windows (analysis tools, unit tests)
@@ -32,3 +40,11 @@ jobs:
         run: cmake --build build --config Release
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload xbem.exe (Windows, analysis tools)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbem-windows-x64
+          path: |
+            build/bin/Release/xbem.exe
+            tools/xbdp/xbdp.py
+            README.md

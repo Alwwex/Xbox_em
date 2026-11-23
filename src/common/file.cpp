@@ -30,12 +30,20 @@ std::vector<uint8_t> read_file_prefix(const std::filesystem::path& path, size_t 
 
 std::optional<std::filesystem::path> find_icase(const std::filesystem::path& dir, std::string_view name) {
   std::error_code ec;
+#if !defined(_WIN32) && !defined(__APPLE__)
+  // On a case-sensitive file system an exact hit is already the on-disk name.
   const auto exact = dir / std::filesystem::path(std::string(name));
   if (std::filesystem::exists(exact, ec)) return exact;
+#endif
+  // Otherwise scan the directory so the result carries the real on-disk
+  // spelling (case-insensitive file systems would accept any spelling).
+  std::optional<std::filesystem::path> folded;
   for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-    if (iequals(it->path().filename().string(), name)) return it->path();
+    const std::string entry = it->path().filename().string();
+    if (entry == name) return it->path();
+    if (!folded && iequals(entry, name)) folded = it->path();
   }
-  return std::nullopt;
+  return folded;
 }
 
 }  // namespace xbem
