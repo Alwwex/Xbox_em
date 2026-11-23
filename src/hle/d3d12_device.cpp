@@ -54,6 +54,32 @@ void* fn(F* f) {
   return reinterpret_cast<void*>(f);
 }
 
+// Methods returning a structure larger than 8 bytes. The console's D3D12.X
+// passes the result buffer in RCX and `this` in RDX (a real title calls
+// GetResourceAllocationInfo that way), the PC headers' MSVC form has them the
+// other way round; whichever argument is the probe object is `this`.
+bool is_probe_object(uint64_t p) {
+  uint64_t magic = 0;
+  return p >= 0x10000 && (p & 7) == 0 && platform::safe_read(p + 8, &magic, 8) && magic == kProbeMagic;
+}
+struct StructReturn {
+  ProbeObject* self = nullptr;
+  uint8_t* out = nullptr;
+};
+// The result buffer is scratch memory when the caller passed none, so a bad
+// call is logged by the caller's crash instead of ours.
+uint8_t g_struct_scratch[256];
+StructReturn struct_return(uint64_t a0, uint64_t a1) {
+  StructReturn r;
+  if (is_probe_object(a0) && !is_probe_object(a1)) r = {reinterpret_cast<ProbeObject*>(a0), reinterpret_cast<uint8_t*>(a1)};
+  else r = {reinterpret_cast<ProbeObject*>(a1), reinterpret_cast<uint8_t*>(a0)};
+  if (reinterpret_cast<uint64_t>(r.out) < 0x10000) {
+    XBEM_WARN_ONCE("d3d12", "structure-returning method called without a result buffer ({:#x}, {:#x})", a0, a1);
+    r.out = g_struct_scratch;
+  }
+  return r;
+}
+
 ProbeVtable make_vtable(std::initializer_list<std::pair<int, void*>> overrides) {
   ProbeVtable v = default_probe_vtable();
   for (const auto& [slot, f] : overrides) v[static_cast<size_t>(slot)] = f;
@@ -232,9 +258,10 @@ HRESULT XBEM_GUEST_ABI resource_map(ProbeObject* self, UINT, const void*, void**
   return S_OK;
 }
 void XBEM_GUEST_ABI resource_unmap(ProbeObject*, UINT, const void*) {}
-void* XBEM_GUEST_ABI resource_get_desc(ProbeObject* self, uint8_t* out) {
-  std::memcpy(out, static_cast<ResourceState*>(self->state)->desc, 56);
-  return out;
+void* XBEM_GUEST_ABI resource_get_desc(uint64_t a0, uint64_t a1) {
+  const StructReturn r = struct_return(a0, a1);
+  std::memcpy(r.out, static_cast<ResourceState*>(r.self->state)->desc, 56);
+  return r.out;
 }
 uint64_t XBEM_GUEST_ABI resource_get_gpu_va(ProbeObject* self) { return static_cast<ResourceState*>(self->state)->gpu_va; }
 const ProbeVtable g_resource_vtable = make_vtable({{8, fn(&resource_map)},
@@ -269,9 +296,10 @@ struct HeapState {
 std::mutex g_heaps_mutex;
 std::unordered_map<const void*, HeapState*> g_heaps;
 
-void* XBEM_GUEST_ABI heap_object_get_desc(ProbeObject* self, uint8_t* out) {
-  std::memcpy(out, static_cast<HeapState*>(self->state)->desc, 40);
-  return out;
+void* XBEM_GUEST_ABI heap_object_get_desc(uint64_t a0, uint64_t a1) {
+  const StructReturn r = struct_return(a0, a1);
+  std::memcpy(r.out, static_cast<HeapState*>(r.self->state)->desc, 40);
+  return r.out;
 }
 const ProbeVtable g_heap_object_vtable = make_vtable({{8, fn(&heap_object_get_desc)}});
 
@@ -306,9 +334,10 @@ constexpr uint32_t kDescriptorSize = 32;
 // 10 GetGPUDescriptorHandleForHeapStart. The console's D3D12.X returns the
 // 8-byte handles in RAX - unlike the PC headers' hidden-pointer form (a real
 // title calls slot 9 with garbage in RDX).
-void* XBEM_GUEST_ABI heap_get_desc(ProbeObject* self, uint8_t* out) {
-  std::memcpy(out, static_cast<DescriptorHeapState*>(self->state)->desc, 16);
-  return out;
+void* XBEM_GUEST_ABI heap_get_desc(uint64_t a0, uint64_t a1) {
+  const StructReturn r = struct_return(a0, a1);
+  std::memcpy(r.out, static_cast<DescriptorHeapState*>(r.self->state)->desc, 16);
+  return r.out;
 }
 uint64_t XBEM_GUEST_ABI heap_get_cpu_start(ProbeObject* self) {
   return static_cast<DescriptorHeapState*>(self->state)->cpu;
@@ -578,35 +607,142 @@ bool read_guid(uint64_t address, uint8_t out[16]) {
   return address >= 0x10000 && address < 0x800000000000ull && platform::safe_read(address, out, 16);
 }
 
-// 133 (D3D12.X): a heap over memory the title already mapped (XMemMapPhysicalPages),
-// (address, ..., riid, ppv). The arguments after the address are found by
-// shape: the ID3D12Heap IID followed by the output pointer.
-HRESULT XBEM_GUEST_ABI device_create_heap_at_address(ProbeObject* self, uint64_t address, uint64_t a1, uint64_t a2,
-                                                     uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-  static const uint8_t kHeapIid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
-                                       0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
-  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+// 133 (D3D12.X) CreatePlacedResourceX(va, desc, layout, ..., riid, ppv): a
+// buffer on pages the title mapped itself (XMemMapPhysicalPages) - the
+// resource's memory and GPU address are `va`. `layout` is a
+// D3D12_BARRIER_LAYOUT (0xFFFFFFFF = undefined). The interface ID and output
+// are found by shape (an ID3D12Resource IID followed by the output pointer).
+HRESULT XBEM_GUEST_ABI device_create_placed_resource_x(ProbeObject* self, uint64_t va, const uint8_t* desc,
+                                                       uint64_t layout, uint64_t a3, uint64_t a4, uint64_t a5,
+                                                       uint64_t a6) {
+  static const uint8_t kResourceIid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
+                                           0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
+  const uint64_t args[4] = {a3, a4, a5, a6};
   void** out = nullptr;
-  for (int i = 0; i + 1 < 6 && !out; ++i) {
+  for (int i = 0; i + 1 < 4 && !out; ++i) {
     uint8_t guid[16];
-    if (read_guid(args[i], guid) && std::memcmp(guid, kHeapIid, 16) == 0 && args[i + 1] >= 0x10000)
+    if (read_guid(args[i], guid) && std::memcmp(guid, kResourceIid, 16) == 0 && args[i + 1] >= 0x10000)
       out = reinterpret_cast<void**>(args[i + 1]);
   }
-  uint8_t mbi[48] = {};
-  uint64_t size = 0;
-  if (virtual_query(reinterpret_cast<void*>(address), mbi, sizeof mbi) == 48) {
-    uint64_t region_base, region_size;
-    std::memcpy(&region_base, mbi, 8);
-    std::memcpy(&region_size, mbi + 24, 8);
-    size = region_base + region_size - address;
-  }
+  uint8_t d[56] = {};
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
+  uint64_t width = 0;
+  std::memcpy(&width, d + 16, 8);
   probe_log(self, 133,
-            std::format("CreateHeapAtAddress({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) region {:#x} bytes{}", address,
-                        a1, a2, a3, a4, a5, a6, size, out ? "" : " - no ID3D12Heap output found"),
+            std::format("CreatePlacedResourceX(va {:#x}, dimension {}, width {:#x}, layout {:#x}){}", va, d[0], width,
+                        layout, out ? "" : " - no ID3D12Resource output found"),
             XBEM_RETURN_ADDRESS());
   if (!out) return E_INVALIDARG;
-  return create_into(new_heap(child_name("heap"), address, size, nullptr), out);
+  return create_into(new_resource(child_name("resource"), desc, va), out);
 }
+
+// 25 GetResourceAllocationInfo(visibleMask, numDescs, descs) -> {SizeInBytes, Alignment},
+// returned through the result buffer (see struct_return).
+void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                                         uint64_t a4) {
+  const StructReturn r = struct_return(a0, a1);
+  // (mask, count, descs) or, without a mask, (count, descs).
+  uint64_t count = a3, descs = a4;
+  if (a3 >= 0x10000) {
+    count = a2;
+    descs = a3;
+  }
+  uint64_t size = 0, alignment = 0x10000;
+  bool ok = count > 0 && count < 4096 && descs >= 0x10000;
+  for (uint64_t i = 0; ok && i < count; ++i) {
+    uint8_t d[56];
+    if (!platform::safe_read(descs + i * 56, d, sizeof d)) {
+      ok = false;
+      break;
+    }
+    uint64_t align;
+    std::memcpy(&align, d + 8, 8);
+    alignment = std::max<uint64_t>(alignment, align);
+    size = ((size + alignment - 1) & ~(alignment - 1)) + ((resource_size(d) + 0xFFFF) & ~0xFFFFull);
+  }
+  const uint64_t result[2] = {ok ? size : ~0ull, ok ? alignment : 0};
+  std::memcpy(r.out, result, 16);
+  probe_log(r.self, 25,
+            std::format("GetResourceAllocationInfo({} descs) -> size {:#x}, alignment {:#x}", count, result[0],
+                        result[1]),
+            XBEM_RETURN_ADDRESS());
+  return r.out;
+}
+
+// 26 GetCustomHeapProperties(nodeMask, heapType) -> D3D12_HEAP_PROPERTIES (20 bytes).
+void* XBEM_GUEST_ABI device_get_custom_heap_properties(uint64_t a0, uint64_t a1, uint64_t, uint64_t heap_type) {
+  const StructReturn r = struct_return(a0, a1);
+  // Unified memory: everything is CPU-visible write-back memory in the one pool.
+  const uint32_t props[5] = {4 /*CUSTOM*/, heap_type == 2 /*UPLOAD*/ ? 2u /*WRITE_COMBINE*/ : 3u /*WRITE_BACK*/,
+                             1 /*L0*/, 1, 1};
+  std::memcpy(r.out, props, sizeof props);
+  return r.out;
+}
+
+// 48 CreateCommandQueueX(desc, riid, ppv): the desc starts like D3D12_COMMAND_QUEUE_DESC.
+HRESULT XBEM_GUEST_ABI device_create_command_queue_x(ProbeObject* self, const uint32_t* desc, const void* riid,
+                                                     void** out) {
+  return device_create_command_queue(self, desc, riid, out);
+}
+
+// 62 CreateComputePipelineState(desc, w2, w3, riid, ppv) with a PC compute desc.
+HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint8_t* desc, uint64_t, uint64_t,
+                                                   const void* riid, void** out) {
+  return device_create_compute_pso(self, desc, riid, out);
+}
+
+// 67 DeserializeComputePipelineStateX(desc, riid, ppv): native RDNA2 code at
+// desc+0x28 (pointer) / +0x30 (size), root signature at +0x00.
+HRESULT XBEM_GUEST_ABI device_deserialize_compute_pso_x(ProbeObject* self, const uint8_t* desc, const void*,
+                                                        void** out) {
+  uint64_t code[2] = {};
+  if (desc && platform::safe_read(reinterpret_cast<uint64_t>(desc) + 0x28, code, 16)) capture_shader("cs-native", code[0], code[1]);
+  probe_log(self, 67, std::format("DeserializeComputePipelineStateX(code {:#x}, {} bytes)", code[0], code[1]),
+            XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(child_name("pso")), out);
+}
+
+// 76 texture creation: CreateCommittedResource's arguments; the desc's layout
+// word is the console's (0x101 = tiled).
+HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void*, uint32_t, const uint8_t* desc,
+                                               uint32_t, const void*, const void*, void** out) {
+  probe_log(self, 76, "CreateCommittedResourceX (texture)", XBEM_RETURN_ADDRESS());
+  return create_into(new_resource(child_name("texture"), desc), out);
+}
+
+// 78 SetFrameIntervalX(output, interval_us, latency, flags), 79
+// ScheduleFrameEventX(event, offset_us, pEvent, flags), 80
+// WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). No display is
+// paced yet: waits return at once with a fresh non-zero token.
+std::atomic<uint64_t> g_frame_token{1};
+HRESULT XBEM_GUEST_ABI device_set_frame_interval_x(ProbeObject* self, uint64_t output, uint64_t interval_us,
+                                                   uint64_t latency, uint64_t flags) {
+  probe_log(self, 78,
+            std::format("SetFrameIntervalX(output {:#x}, {} us, latency {}, flags {:#x})", output,
+                        static_cast<uint32_t>(interval_us), static_cast<uint32_t>(latency), flags),
+            XBEM_RETURN_ADDRESS());
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI device_schedule_frame_event_x(ProbeObject* self, uint64_t event, uint64_t offset_us,
+                                                     uint64_t, uint64_t flags) {
+  probe_log(self, 79,
+            std::format("ScheduleFrameEventX(event {}, offset {} us, flags {:#x})", static_cast<uint32_t>(event),
+                        static_cast<uint32_t>(offset_us), flags),
+            XBEM_RETURN_ADDRESS());
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI device_wait_frame_event_x(ProbeObject* self, uint64_t event, uint64_t timeout_ms, uint64_t,
+                                                 uint64_t, uint64_t* token) {
+  probe_log(self, 80,
+            std::format("WaitFrameEventX(event {}, timeout {} ms)", static_cast<uint32_t>(event),
+                        static_cast<uint32_t>(timeout_ms)),
+            XBEM_RETURN_ADDRESS());
+  if (!token || reinterpret_cast<uint64_t>(token) < 0x10000) return E_POINTER;
+  const uint64_t value = g_frame_token.fetch_add(1);
+  platform::safe_write(reinterpret_cast<uint64_t>(token), &value, 8);
+  return S_OK;
+}
+
 // 30 CreateReservedResource(desc, state, clear, riid, ppv)
 HRESULT XBEM_GUEST_ABI device_create_reserved_resource(ProbeObject* self, const uint8_t* desc, uint32_t, const void*,
                                                        const void*, void** out) {
@@ -635,7 +771,16 @@ const ProbeVtable g_device_vtable = make_vtable({
     {30, fn(&device_create_reserved_resource)},
     {36, fn(&device_create_fence)},
     {37, fn(&device_get_removed_reason)},
-    {133, fn(&device_create_heap_at_address)},
+    {25, fn(&device_get_resource_allocation_info)},
+    {26, fn(&device_get_custom_heap_properties)},
+    {48, fn(&device_create_command_queue_x)},
+    {62, fn(&device_create_compute_pso_x)},
+    {67, fn(&device_deserialize_compute_pso_x)},
+    {76, fn(&device_create_texture_x)},
+    {78, fn(&device_set_frame_interval_x)},
+    {79, fn(&device_schedule_frame_event_x)},
+    {80, fn(&device_wait_frame_event_x)},
+    {133, fn(&device_create_placed_resource_x)},
 });
 
 }  // namespace

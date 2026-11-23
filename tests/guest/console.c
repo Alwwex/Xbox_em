@@ -459,7 +459,7 @@ static void test_headless_d3d12(void) {
   /* Methods without a typed implementation are logged probe slots, far past
    * the PC interface (the console device has many more methods). */
   typedef HRESULT (*AnyFn)(void*, uint64_t);
-  CHECK(((AnyFn)VT(device)[26])(device, 0) == 0);
+  CHECK(((AnyFn)VT(device)[200])(device, 0) == 0);
   CHECK(((AnyFn)VT(device)[300])(device, 0) == 0);
 
   void* fence = 0;
@@ -503,24 +503,47 @@ static void test_headless_d3d12(void) {
   CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_x, iid, &heap_x) == 0 && heap_x);
   CHECK(((HeapStartFn)VT(heap_x)[9])(heap_x) == (uint64_t)(uintptr_t)title_mem);
 
-  /* Heaps: CreateHeap (28) and the console's heap over already-mapped memory
-   * (133: address, ..., riid, ppv); placed resources live at heap + offset. */
+  /* Heaps: CreateHeap (28); placed resources live at heap + offset. */
   typedef HRESULT (*CreateMemHeapFn)(void*, const void*, const void*, void**);
-  typedef HRESULT (*HeapAtFn)(void*, void*, uint64_t, uint64_t, uint64_t, const void*, void**);
+  typedef HRESULT (*PlacedXFn)(void*, void*, const void*, uint64_t, uint64_t, const void*, void**);
   typedef HRESULT (*PlacedFn)(void*, void*, uint64_t, const void*, uint32_t, const void*, const void*, void**);
-  static const uint8_t heap_iid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
-                                       0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
+  static const uint8_t heap_iid[16] = {0x02, 0x25, 0x3b, 0x6b, 0x51, 0x6e, 0xb3, 0x45,
+                                       0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3};
+  static const uint8_t resource_iid[16] = {0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
+                                           0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad};
   uint64_t mem_heap_desc[5] = {0x100000, 0, 0, 0, 0};
   void* mem_heap = 0;
   CHECK(((CreateMemHeapFn)VT(device)[28])(device, mem_heap_desc, heap_iid, &mem_heap) == 0 && mem_heap);
-  uint8_t* own = VirtualAlloc(0, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-  void* at_heap = 0;
-  CHECK(((HeapAtFn)VT(device)[133])(device, own, 0, 0xffffffff, 0, heap_iid, &at_heap) == 0 && at_heap);
   void* placed = 0;
-  CHECK(((PlacedFn)VT(device)[29])(device, at_heap, 0x10000, desc, 0, 0, iid, &placed) == 0 && placed);
-  CHECK(((GpuVaFn)VT(placed)[11])(placed) == (uint64_t)(uintptr_t)(own + 0x10000));
   CHECK(((PlacedFn)VT(device)[29])(device, mem_heap, 0x2000, desc, 0, 0, iid, &placed) == 0 && placed);
   *(volatile uint8_t*)(uintptr_t)((GpuVaFn)VT(placed)[11])(placed) = 7;
+
+  /* 133 CreatePlacedResourceX(va, desc, layout, 0, riid, ppv): a buffer on the title's own pages */
+  uint8_t* own = VirtualAlloc(0, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  void* at_va = 0;
+  CHECK(((PlacedXFn)VT(device)[133])(device, own + 0x10000, desc, 0xffffffff, 0, resource_iid, &at_va) == 0 && at_va);
+  CHECK(((GpuVaFn)VT(at_va)[11])(at_va) == (uint64_t)(uintptr_t)(own + 0x10000));
+
+  /* Structure returns: result buffer in RCX and the object in RDX (console
+   * form), or the PC form - both are answered. */
+  typedef uint64_t* (*AllocInfoFn)(uint64_t*, void*, uint32_t, uint32_t, const void*);
+  typedef uint8_t* (*GetDescFn)(void*, void*);
+  uint64_t info[2] = {0, 0};
+  CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, desc) == info);
+  CHECK(info[0] == 0x10000 && info[1] == 0x10000); /* 4 KiB buffer -> one 64 KiB page */
+  uint8_t got[56] = {0};
+  CHECK(((GetDescFn)VT(buffer)[10])(got, buffer) == got && got[0] == 1 && *(uint64_t*)(got + 16) == 4096);
+  uint8_t got_pc[56] = {0};
+  CHECK(((GetDescFn)VT(buffer)[10])(buffer, got_pc) == got_pc && memcmp(got, got_pc, 56) == 0);
+
+  /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
+  typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);
+  typedef HRESULT (*WaitFn)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t*);
+  CHECK(((Frame4Fn)VT(device)[78])(device, 0, 33333, 3, 0) == 0);
+  CHECK(((Frame4Fn)VT(device)[79])(device, 0, 0, 0, 0) == 0);
+  uint64_t token1 = 0, token2 = 0;
+  CHECK(((WaitFn)VT(device)[80])(device, 0, 100, 0, 0, &token1) == 0 && token1 != 0);
+  CHECK(((WaitFn)VT(device)[80])(device, 0, 100, 0, 0, &token2) == 0 && token2 != token1);
 
   /* Compute pipeline: the shader binary is captured (--dump-shaders) */
   static const uint8_t shader[32] = {'X', 'B', 'E', 'M', 's', 'h', 'a', 'd', 'e', 'r'};
