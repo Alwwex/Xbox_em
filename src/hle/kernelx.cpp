@@ -13,7 +13,6 @@
 #include <thread>
 
 #include "hle/hle_util.h"
-#include "loader/pe_format.h"
 #include "platform/cpu.h"
 #include "platform/thread.h"
 
@@ -573,64 +572,6 @@ uint64_t XBEM_GUEST_ABI hle_InterlockedFlushSList(uint64_t* head) {
 
 WORD XBEM_GUEST_ABI hle_QueryDepthSList(uint64_t* head) { return static_cast<WORD>(head[1]); }
 
-// --------------------------------------------------------------- exceptions
-
-uint64_t g_unhandled_filter = 0;
-
-uint64_t XBEM_GUEST_ABI hle_SetUnhandledExceptionFilter(uint64_t filter) {
-  const uint64_t old = g_unhandled_filter;
-  g_unhandled_filter = filter;
-  return old;
-}
-
-LONG XBEM_GUEST_ABI hle_UnhandledExceptionFilter(void*) {
-  XBEM_ERROR("kernelx", "guest reported an unhandled exception (UnhandledExceptionFilter)");
-  return 1;  // EXCEPTION_EXECUTE_HANDLER: the CRT will terminate the process
-}
-
-constexpr DWORD kExceptionCppMsvc = 0xE06D7363;      // C++ throw
-constexpr DWORD kExceptionSetThreadName = 0x406D1388;  // MSVC debugger thread-name convention
-constexpr DWORD kExceptionDbgPrint = 0x40010006;     // DBG_PRINTEXCEPTION_C
-
-void XBEM_GUEST_ABI hle_RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR* args) {
-  if (code == kExceptionSetThreadName && nargs >= 3 && args) {
-    // THREADNAME_INFO { DWORD type; LPCSTR name; DWORD thread_id; DWORD flags; }
-    const auto* name = reinterpret_cast<const char*>(args[1]);
-    if (name) XBEM_DEBUG("kernelx", "thread {} named \"{}\"", static_cast<int32_t>(args[2]), guest_cstr(name));
-    return;  // a debugger-less __except handler would simply continue
-  }
-  if (code == kExceptionDbgPrint && nargs >= 2 && args) {
-    log::guest_output(guest_cstr(reinterpret_cast<const char*>(args[1])));
-    return;
-  }
-  // Structured exception handling (unwinding through .pdata/.xdata) is not
-  // implemented yet. C++ exceptions therefore cannot be delivered.
-  XBEM_ERROR("kernelx", "RaiseException(code {:#x}{}, flags {:#x}): SEH dispatch is not implemented yet", code,
-             code == kExceptionCppMsvc ? " = C++ exception" : "", flags);
-  proc().exit_process(code);
-}
-
-// RUNTIME_FUNCTION lookup in .pdata - needed by any SEH/unwind implementation.
-void* XBEM_GUEST_ABI hle_RtlLookupFunctionEntry(uint64_t pc, uint64_t* image_base, void*) {
-  LoadedModule* m = proc().loader().find_containing(pc);
-  if (!m || !m->image) return nullptr;
-  const auto& dir = m->image->directory(pe::kDirException);
-  if (!dir.VirtualAddress || !dir.Size) return nullptr;
-  const auto* table = reinterpret_cast<const pe::RuntimeFunction*>(m->base + dir.VirtualAddress);
-  const auto rva = static_cast<uint32_t>(pc - m->handle());
-  size_t lo = 0, hi = dir.Size / sizeof(pe::RuntimeFunction);
-  while (lo < hi) {
-    const size_t mid = (lo + hi) / 2;
-    if (rva < table[mid].BeginAddress) hi = mid;
-    else if (rva >= table[mid].EndAddress) lo = mid + 1;
-    else {
-      if (image_base) *image_base = m->handle();
-      return const_cast<pe::RuntimeFunction*>(&table[mid]);
-    }
-  }
-  return nullptr;
-}
-
 }  // namespace
 
 ModuleDef make_kernelx_module() {
@@ -663,9 +604,8 @@ ModuleDef make_kernelx_module() {
       XBEM_HLE(GlobalMemoryStatusEx), XBEM_HLE(IsProcessorFeaturePresent), XBEM_HLE(EncodePointer),
       XBEM_HLE(DecodePointer), XBEM_HLE(InitializeSListHead), XBEM_HLE(InterlockedPushEntrySList),
       XBEM_HLE(InterlockedPopEntrySList), XBEM_HLE(InterlockedFlushSList), XBEM_HLE(QueryDepthSList),
-      XBEM_HLE(SetUnhandledExceptionFilter), XBEM_HLE(UnhandledExceptionFilter), XBEM_HLE(RaiseException),
-      XBEM_HLE(RtlLookupFunctionEntry),
   };
+  add_kernelx_seh_exports(m.exports);
   add_kernelx_memory_exports(m.exports);
   add_kernelx_sync_exports(m.exports);
   add_kernelx_file_exports(m.exports);

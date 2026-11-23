@@ -72,7 +72,7 @@ add_custom_command(
   COMMENT "Guest DLL plugin.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "dlls")
@@ -138,6 +138,9 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                          "PASS unimplemented")
   xbem_guest_test(guest_unimplemented_strict COMMAND run ${GOUT}/unimplemented.exe --strict EXIT 125
                   EXPECT "XbemDefinitelyMissing \\(strict mode\\)")
+  xbem_guest_test(guest_seh COMMAND run ${GOUT}/seh.exe EXPECT "PASS seh")
+  xbem_guest_test(guest_seh_unhandled COMMAND run ${GOUT}/seh_unhandled.exe EXIT 173
+                  EXPECT "unhandled guest exception 0xe0badbad" "frame  1: seh_unhandled.exe\\+0x")
   xbem_guest_test(guest_crash_report COMMAND run ${GOUT}/crash.exe EXIT 139
                   EXPECT "guest crash" "SIGSEGV" "RIP=[0-9a-f]+  crash.exe\\+0x")
 endif()

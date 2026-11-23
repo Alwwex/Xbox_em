@@ -48,3 +48,11 @@ EXPORTS
   FindNextFileA
   FindClose
   XbemDefinitelyMissing
+  RaiseException
+  RtlUnwindEx
+  RtlCaptureContext
+  RtlLookupFunctionEntry
+  RtlVirtualUnwind
+  RtlCaptureStackBackTrace
+  AddVectoredExceptionHandler
+  RemoveVectoredExceptionHandler

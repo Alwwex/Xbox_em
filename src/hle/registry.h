@@ -62,6 +62,7 @@ ModuleDef make_d3d12_module();
 void add_kernelx_memory_exports(std::vector<ExportDef>& out);
 void add_kernelx_sync_exports(std::vector<ExportDef>& out);
 void add_kernelx_file_exports(std::vector<ExportDef>& out);
+void add_kernelx_seh_exports(std::vector<ExportDef>& out);
 
 // Handle value returned by GetProcessHeap() (also stored in the PEB).
 uint64_t default_process_heap();

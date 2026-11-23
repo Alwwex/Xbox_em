@@ -20,6 +20,7 @@ add_library(xbem_core STATIC
   hle/kernelx_memory.cpp
   hle/kernelx_sync.cpp
   hle/kernelx_file.cpp
+  hle/kernelx_seh.cpp
   hle/xgameruntime.cpp
   hle/d3d12.cpp
 
@@ -28,6 +29,8 @@ add_library(xbem_core STATIC
   runtime/trampolines.cpp
   runtime/module_loader.cpp
   runtime/process.cpp
+  runtime/seh.cpp
+  runtime/seh_asm.cpp
 
   gpu/backend.cpp
 )
