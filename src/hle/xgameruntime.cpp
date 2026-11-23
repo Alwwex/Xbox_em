@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "hle/hle_util.h"
+#include "platform/memory.h"
 
 namespace xbem::hle {
 namespace {
@@ -314,6 +315,66 @@ XBEM_NOTIMPL_HR(XGameUiShowMessageDialogAsync)
 XBEM_NOTIMPL_HR(XGameInviteRegisterForEvent)
 XBEM_NOTIMPL_HR(XPackageGetMountPath)
 
+// ------------------------------------------------- runtime binding (discovery)
+//
+// Titles do not import GDK functions by name. The static xgameruntime.lib
+// linked into the game loads xgameruntime.dll, calls InitializeApiImpl* and
+// then QueryApiImpl to obtain the implementation of each API family. That
+// interface is undocumented, so for now these entry points only log what the
+// title passes (pointer arguments are dumped as GUIDs and strings) to map it.
+
+std::string describe_arg(uint64_t v) {
+  std::string out = std::format("{:#x}", v);
+  uint8_t bytes[48];
+  if (v < 0x10000 || !platform::safe_read(v, bytes, 16)) return out;
+  out += " -> {" + guid_to_string(bytes) + "}";
+  if (platform::safe_read(v, bytes, sizeof bytes)) {
+    std::string text;
+    for (uint8_t b : bytes) {
+      if (b == 0) break;
+      if (b < 0x20 || b > 0x7E) {
+        text.clear();
+        break;
+      }
+      text.push_back(static_cast<char>(b));
+    }
+    if (text.size() >= 3) out += " \"" + text + "\"";
+  }
+  return out;
+}
+
+void log_binding_call(const char* name, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  XBEM_WARN("xgameruntime", "{}({}, {}, {}, {})", name, describe_arg(a), describe_arg(b), describe_arg(c),
+            describe_arg(d));
+}
+
+constexpr HRESULT E_NOINTERFACE = static_cast<HRESULT>(0x80004002);
+
+HRESULT XBEM_GUEST_ABI hle_InitializeApiImpl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("InitializeApiImpl", a, b, c, d);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI hle_InitializeApiImplEx(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("InitializeApiImplEx", a, b, c, d);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI hle_InitializeApiImplEx2(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("InitializeApiImplEx2", a, b, c, d);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI hle_QueryApiImpl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("QueryApiImpl", a, b, c, d);
+  return E_NOINTERFACE;
+}
+HRESULT XBEM_GUEST_ABI hle_UninitializeApiImpl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("UninitializeApiImpl", a, b, c, d);
+  return S_OK;
+}
+HRESULT XBEM_GUEST_ABI hle_XErrorReport(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  log_binding_call("XErrorReport", a, b, c, d);
+  return S_OK;
+}
+
 }  // namespace
 
 ModuleDef make_xgameruntime_module() {
@@ -334,6 +395,9 @@ ModuleDef make_xgameruntime_module() {
       XBEM_HLE_STUB(XGameSaveInitializeProviderAsync), XBEM_HLE_STUB(XStoreCreateContext),
       XBEM_HLE_STUB(XNetworkingGetConnectivityHint), XBEM_HLE_STUB(XGameUiShowMessageDialogAsync),
       XBEM_HLE_STUB(XGameInviteRegisterForEvent), XBEM_HLE_STUB(XPackageGetMountPath),
+      // Runtime binding used by xgameruntime.lib (discovery mode, see above).
+      XBEM_HLE_STUB(InitializeApiImpl), XBEM_HLE_STUB(InitializeApiImplEx), XBEM_HLE_STUB(InitializeApiImplEx2),
+      XBEM_HLE_STUB(QueryApiImpl), XBEM_HLE_STUB(UninitializeApiImpl), XBEM_HLE_STUB(XErrorReport),
   };
   return m;
 }

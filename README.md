@@ -36,7 +36,7 @@ PC build z nějakého důvodu není možný.
 - **Analýza**: `inspect`, `coverage` (JSON/Markdown report pokrytí importů celé hry), `package` (čte `MicrosoftGame.config`), `xvd` (metadata kontejneru, pozná šifrovaný balíček), `cpu`.
 - **Komunikace PC ↔ konzole**: [`tools/xbdp`](tools/xbdp/xbdp.py) – klient Xbox Device Portalu (informace, balíčky, spuštění/ukončení aplikace, instalace, přenos souborů včetně rekurzivního stažení loose buildu, screenshot). Viz [docs/DEVKIT.md](docs/DEVKIT.md).
 
-Všechno výše je pokryté testy: 35 unit testů, 8 testů devkit klienta proti
+Všechno výše je pokryté testy: 36 unit testů, 8 testů devkit klienta proti
 mock serveru a 17 integračních testů, které spouští **skutečné Windows PE
 binárky** (sestavené MinGW) importující z `kernelx.dll`, `xgameruntime.dll`
 a `api-ms-win-crt-*`, včetně C++ programu s výjimkami a `libstdc++`.

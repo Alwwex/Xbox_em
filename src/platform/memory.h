@@ -20,6 +20,10 @@ void* map_fixed(uint64_t address, size_t size, Prot prot);
 void* map_anywhere(size_t size, size_t alignment, Prot prot);
 
 bool unmap(void* address, size_t size);
+
+// Copies `size` bytes from `address` without faulting if it is not mapped.
+// Used to log the contents of guest pointers of unknown validity.
+bool safe_read(uint64_t address, void* out, size_t size);
 bool protect(void* address, size_t size, Prot prot);
 
 // Drops the contents of committed pages and makes them inaccessible, keeping

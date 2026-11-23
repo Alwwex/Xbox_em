@@ -4,6 +4,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -48,6 +49,12 @@ bool protect(void* address, size_t size, Prot prot) {
 }
 
 bool decommit(void* address, size_t size) { return VirtualFree(address, size, MEM_DECOMMIT) != 0; }
+
+bool safe_read(uint64_t address, void* out, size_t size) {
+  SIZE_T done = 0;
+  return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), out, size, &done) &&
+         done == size;
+}
 
 #else
 
@@ -110,6 +117,12 @@ bool protect(void* address, size_t size, Prot prot) { return mprotect(address, s
 bool decommit(void* address, size_t size) {
   madvise(address, size, MADV_DONTNEED);
   return mprotect(address, size, PROT_NONE) == 0;
+}
+
+bool safe_read(uint64_t address, void* out, size_t size) {
+  iovec local{out, size};
+  iovec remote{reinterpret_cast<void*>(address), size};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
 }
 
 #endif
