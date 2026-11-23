@@ -408,7 +408,7 @@ typedef HRESULT (*MapFn)(void*, uint32_t, const void*, void**);
 typedef uint64_t (*GpuVaFn)(void*);
 typedef HRESULT (*CreateComputePsoFn)(void*, const void*, const void*, void**);
 typedef HRESULT (*CreateHeapFn)(void*, const void*, const void*, void**);
-typedef uint64_t* (*HeapStartFn)(void*, uint64_t*);
+typedef uint64_t (*HeapStartFn)(void*);
 
 static void test_headless_d3d12(void) {
   static const uint8_t iid[16] = {0x7d, 0x12};
@@ -473,14 +473,14 @@ static void test_headless_d3d12(void) {
   /* unified memory: the GPU address is the CPU address */
   CHECK(((GpuVaFn)VT(buffer)[11])(buffer) == (uint64_t)(uintptr_t)mapped);
 
-  /* D3D12_DESCRIPTOR_HEAP_DESC: 64 descriptors; handle returned through a hidden pointer */
+  /* D3D12_DESCRIPTOR_HEAP_DESC: 64 descriptors; D3D12.X returns handles in RAX */
   static const uint32_t heap_desc[4] = {0, 64, 1, 0};
   void* heap = 0;
   CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc, iid, &heap) == 0 && heap);
-  uint64_t start = 0;
-  CHECK(((HeapStartFn)VT(heap)[9])(heap, &start) == &start && start != 0);
-  uint64_t gpu_start = 0;
-  CHECK(((HeapStartFn)VT(heap)[10])(heap, &gpu_start) == &gpu_start && gpu_start == start);
+  const uint64_t start = ((HeapStartFn)VT(heap)[9])(heap);
+  CHECK(start != 0);
+  const uint64_t gpu_start = ((HeapStartFn)VT(heap)[10])(heap);
+  CHECK(gpu_start == start);
   *(volatile uint64_t*)(uintptr_t)(gpu_start + 63 * 32) = 1; /* descriptors are writable memory */
 
   /* Heaps: CreateHeap (28) and the console's heap over already-mapped memory

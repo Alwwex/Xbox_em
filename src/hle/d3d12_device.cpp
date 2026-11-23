@@ -302,18 +302,19 @@ struct DescriptorHeapState {
 };
 constexpr uint32_t kDescriptorSize = 32;
 
-// ID3D12DescriptorHeap: 8 GetDesc, 9 GetCPUDescriptorHandleForHeapStart, 10 GetGPU... (all hidden returns)
+// ID3D12DescriptorHeap: 8 GetDesc (hidden return), 9 GetCPUDescriptorHandleForHeapStart,
+// 10 GetGPUDescriptorHandleForHeapStart. The console's D3D12.X returns the
+// 8-byte handles in RAX - unlike the PC headers' hidden-pointer form (a real
+// title calls slot 9 with garbage in RDX).
 void* XBEM_GUEST_ABI heap_get_desc(ProbeObject* self, uint8_t* out) {
   std::memcpy(out, static_cast<DescriptorHeapState*>(self->state)->desc, 16);
   return out;
 }
-uint64_t* XBEM_GUEST_ABI heap_get_cpu_start(ProbeObject* self, uint64_t* out) {
-  *out = static_cast<DescriptorHeapState*>(self->state)->cpu;
-  return out;
+uint64_t XBEM_GUEST_ABI heap_get_cpu_start(ProbeObject* self) {
+  return static_cast<DescriptorHeapState*>(self->state)->cpu;
 }
-uint64_t* XBEM_GUEST_ABI heap_get_gpu_start(ProbeObject* self, uint64_t* out) {
-  *out = static_cast<DescriptorHeapState*>(self->state)->gpu;
-  return out;
+uint64_t XBEM_GUEST_ABI heap_get_gpu_start(ProbeObject* self) {
+  return static_cast<DescriptorHeapState*>(self->state)->gpu;
 }
 const ProbeVtable g_heap_vtable = make_vtable({{8, fn(&heap_get_desc)},
                                                {9, fn(&heap_get_cpu_start)},
