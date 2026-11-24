@@ -8,6 +8,7 @@
 // title with `xbem inspect` - the names below follow the public GDK headers.
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <condition_variable>
@@ -370,13 +371,57 @@ HRESULT XBEM_GUEST_ABI xsystem_app_device_id(ProbeObject*, size_t size, char* bu
 constexpr uint8_t kXSystemClsid[16] = {0x1a, 0xbd, 0x49, 0xe3, 0x20, 0xfc, 0x40, 0x4e,
                                        0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f};
 
+// XNetworking {37e56907-2f10-41e8-b72f-36edb185331a} / {bf2346b2-39af-4658-b5ea-44713c7e83b3}:
+// slot 15 GetConnectivityHint(XNetworkingConnectivityHint*) - the title polls
+// it from many places and reads connectivityLevel (+0) and networkInitialized
+// (+0xc). The emulated console is initialized and offline.
+struct ConnectivityHint {
+  uint32_t level;  // XNetworkingConnectivityLevelHint: 1 = None
+  uint32_t cost;   // XNetworkingConnectivityCostHint: 0 = Unknown
+  uint32_t iana_interface_type;
+  bool network_initialized, approaching_data_limit, over_data_limit, roaming;
+};
+static_assert(sizeof(ConnectivityHint) == 16);
+
+HRESULT XBEM_GUEST_ABI xnetworking_connectivity_hint(ProbeObject*, ConnectivityHint* hint) {
+  if (!hint) return E_INVALIDARG;
+  *hint = {1, 0, 0, true, false, false, false};
+  return S_OK;
+}
+
+constexpr uint8_t kXNetworkingClsid[16] = {0x07, 0x69, 0xe5, 0x37, 0x10, 0x2f, 0xe8, 0x41,
+                                           0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a};
+
+// Slots of a GDK family the emulator does not know yet: E_NOTIMPL, as the
+// functions failed before the family was bound (not a probe's S_OK, which
+// would leave outputs unwritten while reporting success).
+HRESULT XBEM_GUEST_ABI gdk_not_implemented(ProbeObject* self) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 32)
+    XBEM_WARN("xgameruntime", "{}: unknown slot called from {} -> E_NOTIMPL", self->name,
+              describe_code_address(XBEM_RETURN_ADDRESS()));
+  return E_NOTIMPL;
+}
+
+ProbeVtable gdk_vtable(std::initializer_list<std::pair<int, void*>> slots) {
+  ProbeVtable v = default_probe_vtable();
+  for (int i = 3; i < 96; ++i) v[i] = reinterpret_cast<void*>(&gdk_not_implemented);
+  for (const auto& [slot, f] : slots) v[slot] = f;
+  return v;
+}
+
 // The object implementing `clsid`, or null.
 void* api_implementation(const uint8_t clsid[16]) {
   if (std::memcmp(clsid, kXSystemClsid, 16) == 0) {
-    static const ProbeVtable vtable = make_probe_vtable({{3, reinterpret_cast<void*>(&xsystem_console_id)},
-                                                         {4, reinterpret_cast<void*>(&xsystem_sandbox_id)},
-                                                         {5, reinterpret_cast<void*>(&xsystem_app_device_id)}});
+    static const ProbeVtable vtable = gdk_vtable({{3, reinterpret_cast<void*>(&xsystem_console_id)},
+                                                  {4, reinterpret_cast<void*>(&xsystem_sandbox_id)},
+                                                  {5, reinterpret_cast<void*>(&xsystem_app_device_id)}});
     static void* object = make_probe_object("xgameruntime.XSystem", &vtable);
+    return object;
+  }
+  if (std::memcmp(clsid, kXNetworkingClsid, 16) == 0) {
+    static const ProbeVtable vtable = gdk_vtable({{15, reinterpret_cast<void*>(&xnetworking_connectivity_hint)}});
+    static void* object = make_probe_object("xgameruntime.XNetworking", &vtable);
     return object;
   }
   return nullptr;

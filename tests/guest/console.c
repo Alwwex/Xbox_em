@@ -567,7 +567,22 @@ static void test_sandbox(void) {
   CHECK(((IdFn)VT(xsystem)[3])(xsystem, sizeof id, id, &used) < 0); /* console IDs need 39 bytes */
   char console_id[39];
   CHECK(((IdFn)VT(xsystem)[3])(xsystem, sizeof console_id, console_id, &used) == 0 && used == 39);
+  typedef HRESULT (*NoArgFn)(void*);
+  CHECK(((NoArgFn)VT(xsystem)[20])(xsystem) == (HRESULT)0x80004001); /* unknown slots: E_NOTIMPL */
   ((ReleaseFn)VT(xsystem)[2])(xsystem);
+
+  /* XNetworking slot 15 GetConnectivityHint: initialized, no connectivity */
+  static const uint8_t xnet_clsid[16] = {0x07, 0x69, 0xe5, 0x37, 0x10, 0x2f, 0xe8, 0x41,
+                                         0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a};
+  static const uint8_t xnet_iid[16] = {0xb2, 0x46, 0x23, 0xbf, 0xaf, 0x39, 0x58, 0x46,
+                                       0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3};
+  typedef HRESULT (*HintFn)(void*, uint8_t*);
+  void* xnet = 0;
+  uint8_t hint[16];
+  for (int i = 0; i < 16; ++i) hint[i] = 0xcc;
+  CHECK(QueryApiImpl(xnet_clsid, xnet_iid, &xnet) == 0 && xnet);
+  CHECK(((HintFn)VT(xnet)[15])(xnet, hint) == 0);
+  CHECK(*(uint32_t*)hint == 1 && hint[12] == 1 && hint[13] == 0 && hint[15] == 0);
 }
 
 /* Core Audio as the title's audio start-up uses it: one render device, its
