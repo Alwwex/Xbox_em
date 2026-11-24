@@ -627,6 +627,8 @@ static void test_headless_d3d12(void) {
   uint64_t info[2] = {0, 0};
   CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, desc) == info);
   CHECK(info[0] == 0x10000 && info[1] == 0x10000); /* 4 KiB buffer -> one 64 KiB page */
+  info[0] = info[1] = 0; /* 108: the console variant, same call shape */
+  CHECK(((AllocInfoFn)VT(device)[108])(info, device, 1, 1, desc) == info && info[0] == 0x10000);
   /* 3840x2160 R8G8B8A8 render target, 1 mip: 15360-byte rows x 2160, in 64 KiB pages */
   uint8_t tex[56] = {0};
   tex[0] = 3; /* TEXTURE2D */

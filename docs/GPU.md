@@ -37,6 +37,7 @@ shows them. No code was taken from it.
 | 14 | CreateDescriptorHeap | the console desc carries the title's memory for the descriptors after the PC fields |
 | 25 | GetResourceAllocationInfo | struct return: result buffer in RCX, `this` in RDX |
 | 26 | GetCustomHeapProperties | struct return as above |
+| 108 | GetResourceAllocationInfo (console variant) | same call shape as 25 |
 | 48 | CreateCommandQueueX(desc, riid, ppv) | |
 | 62 | CreateComputePipelineState(desc, w2, w3, riid, ppv) | |
 | 67 | DeserializeComputePipelineStateX(desc, riid, ppv) | native RDNA2 code at desc+0x28 / size at +0x30 (captured) |

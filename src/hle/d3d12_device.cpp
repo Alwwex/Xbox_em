@@ -729,6 +729,10 @@ HRESULT XBEM_GUEST_ABI device_create_root_signature(ProbeObject* self, uint32_t,
 
 // 25 GetResourceAllocationInfo(visibleMask, numDescs, descs) -> {SizeInBytes, Alignment},
 // returned through the result buffer (see struct_return).
+// Slot 108 is a console variant called the same way (result buffer, device,
+// visible mask 1, ...): GetResourceAllocationInfo1/2/3 share the first
+// arguments, the extra ones (per-resource info, castable formats) are not used.
+template <int Slot>
 void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                                          uint64_t a4) {
   const StructReturn r = struct_return(a0, a1);
@@ -769,9 +773,9 @@ void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a
   }
   const uint64_t result[2] = {ok ? size : ~0ull, ok ? alignment : 0};
   std::memcpy(r.out, result, 16);
-  probe_log(r.self, 25,
-            std::format("GetResourceAllocationInfo({} descs{}) -> size {:#x}, alignment {:#x}", count, what,
-                        result[0], result[1]),
+  probe_log(r.self, Slot,
+            std::format("GetResourceAllocationInfo{}({} descs{}) -> size {:#x}, alignment {:#x}",
+                        Slot == 25 ? "" : "X", count, what, result[0], result[1]),
             XBEM_RETURN_ADDRESS());
   return r.out;
 }
@@ -916,7 +920,8 @@ const ProbeVtable g_device_vtable = make_vtable({
     {36, fn(&device_create_fence)},
     {37, fn(&device_get_removed_reason)},
     {16, fn(&device_create_root_signature)},
-    {25, fn(&device_get_resource_allocation_info)},
+    {25, fn(&device_get_resource_allocation_info<25>)},
+    {108, fn(&device_get_resource_allocation_info<108>)},
     {26, fn(&device_get_custom_heap_properties)},
     {48, fn(&device_create_command_queue_x)},
     {62, fn(&device_create_compute_pso_x)},
