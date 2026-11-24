@@ -24,6 +24,8 @@ bool virtual_free(void* address, uint64_t size, uint32_t type);
 // For crash reports: describes the VirtualAlloc region containing `address`
 // (who allocated it and with which protection). Never blocks.
 bool describe_virtual_memory(uint64_t address, char* out, size_t out_size);
+// The same for blocks from XMemAlloc / XMemAllocDefault.
+bool describe_xmem_allocation(uint64_t address, char* out, size_t out_size);
 size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
 
 // run --watch alloc:CALLER+OFFSET: a data watchpoint armed at `offset` into

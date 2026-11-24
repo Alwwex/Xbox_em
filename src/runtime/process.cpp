@@ -57,6 +57,7 @@ void print_thread_context(void (*write)(const char*)) {
 void describe_memory_for_reports(uint64_t address, char* out, size_t out_size) {
   out[0] = 0;
   if (hle::describe_virtual_memory(address, out, out_size)) return;
+  if (hle::describe_xmem_allocation(address, out, out_size)) return;
   uint64_t magic = 0;
   if ((address & 7) == 0 && platform::safe_read(address + 8, &magic, 8) && magic == hle::kProbeMagic) {
     const auto* o = reinterpret_cast<const hle::ProbeObject*>(address);
@@ -369,10 +370,59 @@ uint64_t resolve_data_spec(ModuleLoader& loader, const std::string& spec, std::s
   return resolve_code_spec(loader, spec, error);
 }
 
-// --watch: "ADDRESS[/len]" (see resolve_data_spec) or "alloc:CALLER+OFFSET[/len]",
-// the allocation made by the function holding the code address CALLER.
+// --watch at:CODE[?cond]:OPERAND[/len]: a watchpoint armed when the code at
+// CODE first runs (and the condition holds), at the address the operand names
+// then (reg+off or [reg+off]+off, as in --trace-at memory ranges).
+void arm_runtime_watchpoint(ModuleLoader& loader, const std::string& spec) {
+  const size_t colon = spec.rfind(':');
+  std::string error, address_text, condition;
+  platform::TracepointOptions options;
+  options.quiet = true;
+  options.arm_at.length = 8;
+  uint64_t address = 0;
+  if (colon == std::string::npos || colon < 4)
+    error = "expected at:CODE[?reg=hex]:OPERAND[/len]";
+  else if (spec.find('@') != std::string::npos)
+    error = "memory ranges (@) are for --trace-at";
+  else if (parse_trace_options(spec.substr(3, colon - 3), address_text, condition, options, error) &&
+           parse_trace_memory(spec.substr(colon + 1), options.arm_at, error))
+    address = resolve_code_spec(loader, address_text, error);
+  LoadedModule* m = address ? loader.find_containing(address) : nullptr;
+  if (address && (!m || !m->image)) error = "not in a game module (emulated code cannot be traced)";
+  if (error.empty() && (options.arm_at.length == 0 || options.arm_at.length > 64))
+    error = "the length must be 1..64 bytes";
+  if (!error.empty()) {
+    XBEM_WARN("watch", "--watch {}: {}", spec, error);
+    return;
+  }
+  char where[200];
+  describe_address(address, where, sizeof where);
+  std::string label = std::format("at {}", address_text.find('!') != std::string::npos
+                                                ? std::format("{} ({})", address_text, where)
+                                                : std::string(where));
+  if (!condition.empty()) label += " if " + condition;
+  label += std::format(": {}", options.arm_at.text);
+  options.arm_watch = platform::reserve_watchpoint(options.arm_at.length, label.c_str());
+  if (options.arm_watch < 0) {
+    XBEM_WARN("watch", "--watch {}: more than 16 watchpoints", spec);
+    return;
+  }
+  if (!platform::add_tracepoint(address, label.c_str(), options)) {
+    XBEM_WARN("watch", "--watch {}: cannot patch the code (a tracepoint is already there, or more than 64)", spec);
+    return;
+  }
+  XBEM_INFO("watch", "{}: armed when that code runs ({} bytes)", label, options.arm_at.length);
+}
+
+// --watch: "ADDRESS[/len]" (see resolve_data_spec), "alloc:CALLER+OFFSET[/len]",
+// the allocation made by the function holding the code address CALLER, or
+// "at:CODE[?cond]:OPERAND[/len]" (arm_runtime_watchpoint).
 void arm_watchpoints(ModuleLoader& loader, const std::vector<std::string>& specs) {
   for (const std::string& spec : specs) {
+    if (spec.rfind("at:", 0) == 0) {
+      arm_runtime_watchpoint(loader, spec);
+      continue;
+    }
     std::string body = spec, error;
     uint32_t length = 8;
     if (const size_t slash = body.find('/'); slash != std::string::npos) {

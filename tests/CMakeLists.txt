@@ -284,6 +284,18 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                          "\\[watch\\] alloc by watch.exe!alloc_block \\+0x2008 \\(0x[0-9a-f]+\\): write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 00 00 00 00 00 00 00 00 -> 88 77 66 55 44 33 22 11"
                          "#0  watch.exe\\+0x[0-9a-f]+  .fn 0x"
                          "the length must be 1..64 bytes" "expected alloc:CALLER\\+OFFSET" "PASS watch")
+  # A watchpoint armed by the code that gets the address: on the second call of
+  # store_at, at rcx+0x3000 (in a VirtualAlloc block); its first instruction
+  # writes there, and a tracepoint after it still works.
+  xbem_guest_test(guest_watchpoint_at
+                  COMMAND run ${GOUT}/watch.exe --watch at:watch.exe!store_at?rdx=2:rcx+0x3000/8,at:watch.exe!nope:rcx
+                          --trace-at watch.exe!after_store
+                  EXPECT "at watch.exe!store_at \\(watch.exe\\+0x[0-9a-f]+\\) if rdx=2: rcx\\+0x3000/8: armed when that code runs \\(8 bytes\\)"
+                         "--watch at:watch.exe!nope:rcx: no export nope in watch.exe"
+                         "\\[watch\\] at watch.exe!store_at .* armed at 0x[0-9a-f]+ \\(hit 2\\) in VirtualAlloc region"
+                         "rdx=2: rcx\\+0x3000/8: write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 01 00 00 00 00 00 00 00 -> 02 00 00 00 00 00 00 00"
+                         "write 2 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 02 00 00 00 00 00 00 00 -> 03 00"
+                         "\\[trace\\] watch.exe!after_store \\(watch.exe\\+0x[0-9a-f]+\\) hit 1" "PASS watch")
   # The run window's display surface: a back buffer made like the title's
   # (no DISPLAY in tests: the window is reported as not opened).
   xbem_guest_test(guest_present COMMAND run ${GOUT}/present.exe

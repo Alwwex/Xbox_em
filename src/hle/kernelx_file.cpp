@@ -922,6 +922,7 @@ bool take_dstorage_log_slot() {
 std::string describe_destination(const void* address) {
   char where[256] = {};
   if (describe_virtual_memory(reinterpret_cast<uint64_t>(address), where, sizeof where)) return where;
+  if (describe_xmem_allocation(reinterpret_cast<uint64_t>(address), where, sizeof where)) return where;
   return {};
 }
 

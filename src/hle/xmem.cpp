@@ -21,8 +21,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <map>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include "hle/discovery.h"
@@ -37,8 +37,13 @@ using namespace win;
 
 // ------------------------------------------------------------- XMemAlloc
 
+struct XMemBlock {
+  uint64_t size = 0;
+  uint64_t attributes = 0;
+  uint64_t caller = 0;
+};
 std::mutex g_alloc_mutex;
-std::unordered_map<uint64_t, uint64_t> g_alloc_sizes;  // pointer -> size (for diagnostics/validation)
+std::map<uint64_t, XMemBlock> g_alloc_blocks;  // pointer -> block (validation, crash reports)
 
 size_t alloc_alignment(SIZE_T size) {
   const uint64_t pow2 = std::bit_ceil(std::max<uint64_t>(size, 1));
@@ -62,14 +67,21 @@ void aligned_host_free(void* p) {
 #endif
 }
 
-void* xmem_alloc(SIZE_T size, uint64_t attributes) {
+void* xmem_alloc(SIZE_T size, uint64_t attributes, uint64_t caller) {
   void* p = aligned_host_alloc(std::max<SIZE_T>(size, 1), alloc_alignment(size));
   if (!p) {
     XBEM_WARN("xmem", "XMemAlloc({:#x}, attributes {:#x}) failed: out of host memory", size, attributes);
     return nullptr;
   }
-  std::lock_guard lock(g_alloc_mutex);
-  g_alloc_sizes[reinterpret_cast<uint64_t>(p)] = size;
+  {
+    std::lock_guard lock(g_alloc_mutex);
+    g_alloc_blocks[reinterpret_cast<uint64_t>(p)] = XMemBlock{size, attributes, caller};
+  }
+  // Large blocks are what titles carve their own heaps and pools from.
+  static std::atomic<int> logged{0};
+  if (size >= 0x100000 && logged.fetch_add(1) < 32)
+    XBEM_INFO("xmem", "XMemAlloc({:#x}, attributes {:#x}) from {} -> {}", size, attributes,
+              describe_code_address(caller), p);
   return p;
 }
 
@@ -77,7 +89,7 @@ void xmem_free(void* p, uint64_t attributes) {
   if (!p) return;
   {
     std::lock_guard lock(g_alloc_mutex);
-    if (g_alloc_sizes.erase(reinterpret_cast<uint64_t>(p)) == 0) {
+    if (g_alloc_blocks.erase(reinterpret_cast<uint64_t>(p)) == 0) {
       XBEM_WARN("xmem", "XMemFree({}, attributes {:#x}): not allocated by XMemAlloc - ignored", p, attributes);
       return;
     }
@@ -87,10 +99,12 @@ void xmem_free(void* p, uint64_t attributes) {
 
 void* XBEM_GUEST_ABI hle_XMemAlloc(SIZE_T size, uint64_t attributes) {
   XBEM_LOG_CALL("xmem", "allocated", size, attributes);
-  return xmem_alloc(size, attributes);
+  return xmem_alloc(size, attributes, XBEM_RETURN_ADDRESS());
 }
 void XBEM_GUEST_ABI hle_XMemFree(void* p, uint64_t attributes) { xmem_free(p, attributes); }
-void* XBEM_GUEST_ABI hle_XMemAllocDefault(SIZE_T size, uint64_t attributes) { return xmem_alloc(size, attributes); }
+void* XBEM_GUEST_ABI hle_XMemAllocDefault(SIZE_T size, uint64_t attributes) {
+  return xmem_alloc(size, attributes, XBEM_RETURN_ADDRESS());
+}
 void XBEM_GUEST_ABI hle_XMemFreeDefault(void* p, uint64_t attributes) { xmem_free(p, attributes); }
 
 BOOL XBEM_GUEST_ABI hle_XMemIsToolsMemAvailable() { return FALSE; }  // retail-like: no extra devkit memory
@@ -355,6 +369,20 @@ int32_t XBEM_GUEST_ABI hle_XMemTransferMemory(uint64_t a0, uint64_t a1, uint64_t
 }
 
 }  // namespace
+
+bool describe_xmem_allocation(uint64_t address, char* out, size_t out_size) {
+  std::unique_lock lock(g_alloc_mutex, std::try_to_lock);  // may run in a signal handler: never block
+  if (!lock.owns_lock()) return false;
+  auto it = g_alloc_blocks.upper_bound(address);
+  if (it == g_alloc_blocks.begin()) return false;
+  --it;
+  if (address >= it->first + std::max<uint64_t>(it->second.size, 1)) return false;
+  std::snprintf(out, out_size, "XMemAlloc block %#llx+%#llx (attributes %#llx, by %#llx)",
+                static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.size),
+                static_cast<unsigned long long>(it->second.attributes),
+                static_cast<unsigned long long>(it->second.caller));
+  return true;
+}
 
 ModuleDef make_xmem_module() {
   ModuleDef m;

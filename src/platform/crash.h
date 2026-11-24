@@ -78,6 +78,13 @@ struct TracepointOptions {
   bool cond_not_equal = false;
   uint64_t cond_value = 0;
   TraceMemory memory[4];
+  // Hits are counted and recorded but never logged (a tracepoint that only
+  // arms a watchpoint).
+  bool quiet = false;
+  // The first hit that meets the condition arms the watchpoint reserved as
+  // `arm_watch` (reserve_watchpoint) at the address of `arm_at`; -1 = none.
+  int arm_watch = -1;
+  TraceMemory arm_at;
 };
 bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions& options = TracepointOptions{});
 void set_tracepoint_log_hits(int hits);
@@ -92,6 +99,10 @@ void set_tracepoint_log_hits(int hits);
 // buffers. `length` is 1..64 bytes; the first `log_writes` writes of each
 // watchpoint are logged.
 bool add_watchpoint(uint64_t address, uint32_t length, const char* label);
+// A watchpoint whose address is only known at run time (run --watch
+// at:CODE:OPERAND): reserved now, armed by a tracepoint hit (see
+// TracepointOptions::arm_watch). Returns its index, -1 when the table is full.
+int reserve_watchpoint(uint32_t length, const char* label);
 void set_watchpoint_log_writes(int writes);
 // True when [address, address + size) touches a page a watchpoint protects:
 // emulated functions that let the kernel write guest memory (read() into a

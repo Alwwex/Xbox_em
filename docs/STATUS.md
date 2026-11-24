@@ -264,6 +264,31 @@ region. The failing shader object sits at `+0x4ce7aa0` in the big
 allocation in every run: watching its `+0x08` (bytecode pointer) and
 `+0x20` (size) shows the code that loads it.
 
+Run on `37255f3`: the shader object is written by fn `0x247f590` (from
+fn `0x2499e50` <- the effect loader fn `0x2499630`), which reads one shader
+of an effect: `[name length][name\0][0x32][u32 size][data]`. For effects in
+the executable the bytecode pointer is the effect plus the stream position;
+for effects read from a file it allocates size+1 bytes (fn `0x14247fc20`)
+and reads the data from the stream (fn `0x1451d2260`). The stream
+(`0x1478d57e0`) is the whole second `SGD5` database of `shaders.rpf` in
+memory (file `0x10287000`, 0x2f1a2b bytes, read in 64 KiB blocks through the
+static buffer) and **matches the file byte for byte**. The failing shader is
+`VS_AIFPassthrough_0b7c474a_Wrapped`, size 0x3f9 at stream position
+`0x2cae`, where the correct container (`e7 dc 0d 00`) starts: the data copied
+into the new allocation (2 MiB aligned, offset 0) is right. The next 0x3f9
+shader (position `0x21ca3`) lands at offset `0x1b4e0` of the same 2 MiB
+block, so fn `0x14247fc20` carves shaders out of a pool. When the fallback
+reads the bytecode later, the block's start holds `2a 18 19 18...`, the
+bytes at file `0x1039d2c8` (stream position `0x1162c8`, 32 bytes into the
+container at `0x1162a8`): **the bytecode is overwritten after it was read**
+- the pool hands out the same memory again (freed, wrapped, or two pools
+overlap). The physical page emulation (`xmem.cpp`) maps distinct pages for
+distinct allocations, not the cause. `run --watch at:CODE[?cond]:OPERAND`
+arms a watchpoint when CODE first runs, at the address OPERAND names then
+(`at:14247f67a?r12=3f9:r13/0x10`: the bytecode just read), and says which
+allocation holds it (VirtualAlloc region or XMemAlloc block); XMemAlloc
+blocks of 1 MiB and more are logged with their caller.
+
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
 the title loads the first chunk of each batch some other way, the pipeline

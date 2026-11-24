@@ -15,6 +15,7 @@ void set_backtrace_printer(BacktracePrinter) {}
 bool add_tracepoint(uint64_t, const char*, const TracepointOptions&) { return false; }
 void set_tracepoint_log_hits(int) {}
 bool add_watchpoint(uint64_t, uint32_t, const char*) { return false; }
+int reserve_watchpoint(uint32_t, const char*) { return -1; }
 void set_watchpoint_log_writes(int) {}
 bool overlaps_watched_page(uint64_t, uint64_t) { return false; }
 void unregister_dump_thread() {}
@@ -403,6 +404,7 @@ struct Tracepoint {
   std::atomic<uint64_t> hits{0};
   std::atomic<uint64_t> matched{0};  // hits that met the condition (all hits without one)
   std::atomic<bool> armed{false};
+  std::atomic<bool> armed_watch{false};  // options.arm_watch has been armed (or tried)
   TraceHit ring[kRing];
 };
 
@@ -439,19 +441,26 @@ void write_hit(const Tracepoint& t, const TraceHit& h, const char* prefix) {
 }
 
 // Memory a tracepoint asks for, as hex and ASCII, 32 bytes per line.
+// The address a memory operand names for a hit's registers; false when its
+// pointer cannot be read.
+bool operand_address(const TraceMemory& m, const uint64_t* gpr, uint64_t& address) {
+  address = gpr[m.reg] + static_cast<uint64_t>(m.outer);
+  if (!m.indirect) return true;
+  uint64_t pointer = 0;
+  if (!safe_read(gpr[m.reg] + static_cast<uint64_t>(m.inner), &pointer, 8)) return false;
+  address = pointer + static_cast<uint64_t>(m.outer);
+  return true;
+}
+
 void write_memory_dumps(const Tracepoint& t, const uint64_t* gpr) {
   char line[400];
   for (const TraceMemory& m : t.options.memory) {
     if (m.reg < 0) continue;
-    uint64_t address = gpr[m.reg] + static_cast<uint64_t>(m.outer);
-    if (m.indirect) {
-      uint64_t pointer = 0;
-      if (!safe_read(gpr[m.reg] + static_cast<uint64_t>(m.inner), &pointer, 8)) {
-        std::snprintf(line, sizeof line, "    mem %s: the pointer is not readable\n", m.text);
-        write_str(line);
-        continue;
-      }
-      address = pointer + static_cast<uint64_t>(m.outer);
+    uint64_t address = 0;
+    if (!operand_address(m, gpr, address)) {
+      std::snprintf(line, sizeof line, "    mem %s: the pointer is not readable\n", m.text);
+      write_str(line);
+      continue;
     }
     std::snprintf(line, sizeof line, "    mem %s = %llx:\n", m.text, static_cast<unsigned long long>(address));
     write_str(line);
@@ -475,6 +484,8 @@ void write_memory_dumps(const Tracepoint& t, const uint64_t* gpr) {
   }
 }
 
+void arm_watch_from_hit(const Tracepoint& t, const TraceHit& h, uint64_t hit);
+
 void record_hit(Tracepoint& t, const greg_t* g) {
   const uint64_t n = t.hits.fetch_add(1) + 1;
   if (n == kTraceDisarmAfter) {
@@ -496,7 +507,8 @@ void record_hit(Tracepoint& t, const greg_t* g) {
   h.ret = 0;
   safe_read(h.gpr[4], &h.ret, 8);
   h.seq = g_trace_seq.fetch_add(1) + 1;
-  if (m <= static_cast<uint64_t>(g_trace_log_hits)) {
+  if (o.arm_watch >= 0 && !t.armed_watch.exchange(true)) arm_watch_from_hit(t, h, n);
+  if (!o.quiet && m <= static_cast<uint64_t>(g_trace_log_hits)) {
     lock_print();
     char head[300];
     std::snprintf(head, sizeof head, "[trace] %s hit %llu%s\n", t.label, static_cast<unsigned long long>(n),
@@ -650,6 +662,45 @@ bool handle_watch_step(ucontext_t* uc) {
   return true;
 }
 
+// Arms a reserved watchpoint (reserve_watchpoint) at `address`. Signal-safe.
+bool arm_reserved_watchpoint(int index, uint64_t address) {
+  if (index < 0 || index >= g_watchpoint_count.load()) return false;
+  Watchpoint& w = g_watchpoints[index];
+  uint8_t probe;
+  if (w.armed.load() || !safe_read(address, &probe, 1) || !safe_read(address + w.length - 1, &probe, 1)) return false;
+  w.address = address;
+  w.armed.store(true);
+  set_page_writable(page_of(address), false);
+  if (page_of(address + w.length - 1) != page_of(address)) set_page_writable(page_of(address + w.length - 1), false);
+  return true;
+}
+
+// A tracepoint's first matching hit arms its watchpoint at the address its
+// operand names, and says where that is (which allocation).
+void arm_watch_from_hit(const Tracepoint& t, const TraceHit& h, uint64_t hit) {
+  const TraceMemory& m = t.options.arm_at;
+  uint64_t address = 0;
+  const bool resolved = m.reg >= 0 && operand_address(m, h.gpr, address);
+  const bool armed = resolved && arm_reserved_watchpoint(t.options.arm_watch, address);
+  char line[900], region[400] = {0};
+  if (armed && g_memory_describer) g_memory_describer(address, region, sizeof region);
+  const char* label = t.options.arm_watch < g_watchpoint_count.load() ? g_watchpoints[t.options.arm_watch].label : "?";
+  lock_print();
+  if (!resolved)
+    std::snprintf(line, sizeof line, "[watch] %s: not armed - the pointer of %s is not readable (hit %llu)\n", label,
+                  m.text, static_cast<unsigned long long>(hit));
+  else
+    std::snprintf(line, sizeof line, "[watch] %s: %s %#llx (hit %llu)%s%s\n", label,
+                  armed ? "armed at" : "not armed - memory not mapped at", static_cast<unsigned long long>(address),
+                  static_cast<unsigned long long>(hit), region[0] ? " in " : "", region);
+  write_str(line);
+  write_hit(t, h, "  ");
+  const DumpSlot* slot = slot_of_tid(current_tid());
+  if (g_backtrace_printer && slot && slot->stack_high)
+    g_backtrace_printer(h.gpr, t.address, slot->stack_low, slot->stack_high, 6, &write_str);
+  unlock_print();
+}
+
 void print_watchpoint_summary() {
   const int count = g_watchpoint_count.load();
   if (!count) return;
@@ -657,7 +708,8 @@ void print_watchpoint_summary() {
   write_str("Watchpoints (last writes, oldest first):\n");
   for (int i = 0; i < count; ++i) {
     const Watchpoint& w = g_watchpoints[i];
-    std::snprintf(line, sizeof line, "  %s: %llu writes\n", w.label, static_cast<unsigned long long>(w.writes.load()));
+    std::snprintf(line, sizeof line, "  %s: %llu writes%s\n", w.label, static_cast<unsigned long long>(w.writes.load()),
+                  w.armed.load() ? "" : " (never armed)");
     write_str(line);
     const uint32_t shown = std::min<uint32_t>(w.length, 16);
     for (uint32_t k = 0; k < Watchpoint::kRing; ++k) {
@@ -677,7 +729,9 @@ void print_watchpoint_summary() {
 
 // SIGTRAP: a tracepoint's int3, or the single step over its instruction.
 bool handle_tracepoint_trap(ucontext_t* uc) {
-  if (handle_watch_step(uc)) return true;
+  // The instruction a tracepoint steps over can itself write a watched page:
+  // that single step then ends both.
+  const bool watch_step = handle_watch_step(uc);
   greg_t* g = uc->uc_mcontext.gregs;
   if (t_trace_step >= 0) {
     Tracepoint& t = g_tracepoints[t_trace_step];
@@ -686,6 +740,7 @@ bool handle_tracepoint_trap(ucontext_t* uc) {
     if (t.armed.load()) put_code_byte(t.address, 0xCC);
     return true;
   }
+  if (watch_step) return true;
   const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
   const int count = g_tracepoint_count.load();
   for (int i = 0; i < count; ++i) {
@@ -922,8 +977,8 @@ void set_backtrace_printer(BacktracePrinter printer) { g_backtrace_printer = pri
 bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions& options) {
   const int i = g_tracepoint_count.load();
   if (i >= kMaxTracepoints) return false;
-  for (int k = 0; k < i; ++k)
-    if (g_tracepoints[k].address == address) return true;  // already armed
+  for (int k = 0; k < i; ++k)  // already armed; one that arms a watchpoint needs its own
+    if (g_tracepoints[k].address == address) return options.arm_watch < 0;
   // The page stays writable: the handler swaps the byte on every hit.
   if (!make_writable(address, 1)) return false;
   Tracepoint& t = g_tracepoints[i];
@@ -932,6 +987,7 @@ bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions
   std::snprintf(t.label, sizeof t.label, "%s", label);
   t.options = options;
   for (TraceMemory& m : t.options.memory) m.length = std::min<uint32_t>(m.length, 1024);
+  t.armed_watch.store(false);
   t.armed.store(true);
   g_tracepoint_count.store(i + 1);  // published before the int3 can be reached
   put_code_byte(address, 0xCC);
@@ -954,6 +1010,17 @@ bool add_watchpoint(uint64_t address, uint32_t length, const char* label) {
   set_page_writable(page_of(address), false);
   if (page_of(address + w.length - 1) != page_of(address)) set_page_writable(page_of(address + w.length - 1), false);
   return true;
+}
+
+int reserve_watchpoint(uint32_t length, const char* label) {
+  const int i = g_watchpoint_count.load();
+  if (i >= kMaxWatchpoints || !length) return -1;
+  Watchpoint& w = g_watchpoints[i];
+  w.address = 0;
+  w.length = std::min<uint32_t>(length, 64);
+  std::snprintf(w.label, sizeof w.label, "%s", label);
+  g_watchpoint_count.store(i + 1);  // not armed: faults ignore it until a tracepoint arms it
+  return i;
 }
 
 void set_watchpoint_log_writes(int writes) { g_watch_log_writes = writes < 0 ? 0 : writes; }
