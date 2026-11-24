@@ -197,26 +197,45 @@ bool is_fence(void* object) {
 
 // ------------------------------------------------------- command queue
 
-// ID3D12CommandQueue: 10 ExecuteCommandLists, 14 Signal, 15 Wait, 16 GetTimestampFrequency
-void XBEM_GUEST_ABI queue_execute(ProbeObject* self, UINT count, void* const* lists) {
-  probe_log(self, 10, std::format("ExecuteCommandLists({} lists) - completed instantly (headless)", count),
-            XBEM_RETURN_ADDRESS());
-  (void)lists;
-}
-HRESULT XBEM_GUEST_ABI queue_signal(ProbeObject* self, void* fence, uint64_t value) {
-  probe_log(self, 14, std::format("Signal(fence, {})", value), XBEM_RETURN_ADDRESS());
-  if (is_fence(fence)) fence_signal(fence_of(fence), value);
+// ID3D12CommandQueue. On the PC: 10 ExecuteCommandLists, 11 SetMarker,
+// 12 BeginEvent, 13 EndEvent, 14 Signal, 15 Wait, 16 GetTimestampFrequency,
+// 17 GetClockCalibration, 18 GetDesc. The console queue is shifted (a real
+// title calls slot 16 with a fence - Signal - and writing a timestamp
+// frequency there destroyed the fence), so slots 10-20 are dispatched by the
+// shape of their arguments: a fence first means Signal/Wait, a count and an
+// array of command lists means ExecuteCommandLists, a zeroed variable on the
+// stack receives the timestamp frequency. Each slot's first calls are logged.
+template <int Slot>
+uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1, uint64_t a2) {
+  const uint64_t ret = XBEM_RETURN_ADDRESS();
+  void* const first = reinterpret_cast<void*>(a0);
+  if (is_fence(first)) {
+    const bool wait = Slot == 15 || Slot == 17;
+    probe_log(self, Slot, std::format("{}(fence, {}) [by shape]", wait ? "Wait" : "Signal", a1), ret);
+    if (!wait) fence_signal(fence_of(first), a1);
+    return S_OK;
+  }
+  if (a0 >= 1 && a0 <= 256 && a1 >= 0x10000 && a1 < 0x800000000000ull && (Slot == 10 || Slot == 12)) {
+    probe_log(self, Slot, std::format("ExecuteCommandLists({} lists) - completed instantly (headless) [by shape]", a0),
+              ret);
+    return 0;
+  }
+  if ((Slot == 16 || Slot == 18) && in_current_guest_stack(a0) && !is_probe_object(a0)) {
+    probe_log(self, Slot, "GetTimestampFrequency [by shape] -> 100 MHz", ret);
+    const uint64_t frequency = 100'000'000;
+    platform::safe_write(a0, &frequency, 8);
+    return S_OK;
+  }
+  probe_log(self, Slot, std::format("method{}({:#x}, {:#x}, {:#x}) - shape not recognised, S_OK", Slot, a0, a1, a2),
+            ret);
   return S_OK;
 }
-HRESULT XBEM_GUEST_ABI queue_wait(ProbeObject*, void*, uint64_t) { return S_OK; }
-HRESULT XBEM_GUEST_ABI queue_get_timestamp_frequency(ProbeObject*, uint64_t* frequency) {
-  if (frequency) *frequency = 100'000'000;  // 100 MHz GPU timestamps
-  return S_OK;
+
+template <int... Slots>
+ProbeVtable make_queue_vtable(std::integer_sequence<int, Slots...>) {
+  return make_vtable({{Slots + 10, fn(&queue_method<Slots + 10>)}...});
 }
-const ProbeVtable g_queue_vtable = make_vtable({{10, fn(&queue_execute)},
-                                                {14, fn(&queue_signal)},
-                                                {15, fn(&queue_wait)},
-                                                {16, fn(&queue_get_timestamp_frequency)}});
+const ProbeVtable g_queue_vtable = make_queue_vtable(std::make_integer_sequence<int, 11>{});
 
 // ------------------------------------------------------------ resource
 

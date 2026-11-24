@@ -570,6 +570,15 @@ static void test_headless_d3d12(void) {
   CHECK(((QueueSignalFn)VT(queue)[14])(queue, fence, 5) == 0); /* GPU work "completes" at once */
   CHECK(((FenceValueFn)VT(fence)[8])(fence) == 5);
   CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+  /* The console queue is shifted: slot 16 with a fence is Signal (and must not
+   * write a timestamp frequency into the fence), a stack variable gets the
+   * frequency. */
+  void* const fence_vtable = *(void**)fence;
+  CHECK(((QueueSignalFn)VT(queue)[16])(queue, fence, 9) == 0);
+  CHECK(*(void**)fence == fence_vtable && ((FenceValueFn)VT(fence)[8])(fence) == 9);
+  typedef HRESULT (*FreqFn)(void*, uint64_t*);
+  uint64_t frequency = 0;
+  CHECK(((FreqFn)VT(queue)[18])(queue, &frequency) == 0 && frequency == 100000000);
 
   /* D3D12_RESOURCE_DESC: buffer of 4096 bytes */
   uint8_t desc[56] = {0};

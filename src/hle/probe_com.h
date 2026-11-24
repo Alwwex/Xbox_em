@@ -51,6 +51,9 @@ void* make_probe_object(const std::string& name, const ProbeVtable* vtable = nul
 // where interface IDs (riid arguments) live.
 bool is_interface_id_pointer(uint64_t address);
 
+// True when `address` is inside the calling guest thread's stack.
+bool in_current_guest_stack(uint64_t address);
+
 // Prints the calling thread's recent probe-object calls (crash reports, dumps).
 void print_probe_history(void (*write)(const char*));
 
