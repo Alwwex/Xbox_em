@@ -41,7 +41,8 @@ shows them. No code was taken from it.
 | 48 | CreateCommandQueueX(desc, riid, ppv) | |
 | 62 | CreateComputePipelineState(desc, w2, w3, riid, ppv) | |
 | 67 | DeserializeComputePipelineStateX(desc, riid, ppv) | native RDNA2 code at desc+0x28 / size at +0x30 (captured) |
-| 73 | CreateCommandListX(desc, allocator, state, riid, ppv) | |
+| 12 | CreateCommandList (PC form) | a typed command list, as for 73 |
+| 73 | CreateCommandListX(desc, allocator, state, riid, ppv) | a typed command list: write cursor at its limit, so every command goes through the vtable (below) |
 | 76 | texture creation | CreateCommittedResource's arguments; layout word 0x101 = tiled |
 | 127 | CreateCommittedResource3 | 10 arguments (heap props, flags, desc, initial layout, clear value, protected session, castable formats count + array, riid, ppv); the back buffers |
 | 78–80 | SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX | frame pacing |
@@ -50,3 +51,20 @@ shows them. No code was taken from it.
 Return conventions differ from the PC headers: 8-byte structures (descriptor
 heap start handles, heap slots 9/10) come back in RAX, larger ones through a
 result buffer passed in RCX with `this` in RDX.
+
+### Command lists
+
+The console command list is wider than its vtable. The title writes PM4
+packets into the list's buffer itself while the write cursor at `+0x18` is
+below a limit (`+0x30` for most commands, `+0x28` for dispatches), and calls
+the vtable only when the buffer is full (the executable at `+0x3258a`; the
+shipped DLLs per Leonida's `d3d12_command_objects.md`). xbem's lists keep the
+cursor at the limit, pointing at a real buffer, so every command is a call.
+Every probe object starts with a zeroed 0x800-byte area for such fields
+(`ProbeHeader` in `probe_com.h`).
+
+Slots 0-26 follow the PC order (measured: 12 DrawInstanced, 20
+IASetPrimitiveTopology, 21 RSSetViewports, 22 RSSetScissorRects, 23
+OMSetBlendFactor, 24 OMSetStencilRef, 25 SetPipelineState). Topology values
+are AMD primitive types where the console adds its own: `0x11` is RECTLIST
+(fullscreen passes draw 3 vertices with it); TRILIST is 4 either way.

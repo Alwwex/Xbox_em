@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstring>
+#include <initializer_list>
 #include <filesystem>
 #include <fstream>
 #include <format>
@@ -462,6 +464,25 @@ HRESULT create_into(void* object, void** out) {
   if (!out) return E_POINTER;
   *out = object;
   return S_OK;
+}
+
+// Command lists. The title records commands partly itself: while a list's
+// write cursor (+0x18) is below its limits (+0x28 for dispatches, +0x30 for
+// other commands) it writes PM4 packets through the cursor instead of calling
+// the list (seen in the executable at +0x3258a, and by Leonida in the shipped
+// DLLs). With the cursor at the limit every command goes through the vtable,
+// where it can be recorded. Cursor and limits point at a real buffer, so an
+// unchecked inline write lands there instead of faulting.
+alignas(4096) uint8_t g_inline_command_sink[0x10000];
+
+constexpr size_t kListCursor = 0x18, kListDispatchLimit = 0x28, kListLimit = 0x30;
+
+void* new_command_list() {
+  auto* list = static_cast<ProbeObject*>(make_probe_object(child_name("command_list")));
+  const uint64_t sink = reinterpret_cast<uint64_t>(g_inline_command_sink);
+  for (const size_t off : {kListCursor, kListDispatchLimit, kListLimit})
+    std::memcpy(reinterpret_cast<uint8_t*>(list) + off, &sink, 8);
+  return list;
 }
 
 UINT XBEM_GUEST_ABI device_get_node_count(ProbeObject*) { return 1; }
@@ -920,6 +941,33 @@ HRESULT XBEM_GUEST_ABI device_wait_frame_event_x(ProbeObject* self, uint64_t eve
   return S_OK;
 }
 
+// The output of a creation call: the argument after the interface ID.
+void** out_after_iid(std::initializer_list<uint64_t> args) {
+  const uint64_t* a = args.begin();
+  for (size_t i = 0; i + 1 < args.size(); ++i)
+    if (is_interface_id_pointer(a[i]) && a[i + 1] >= 0x10000) return reinterpret_cast<void**>(a[i + 1]);
+  return nullptr;
+}
+
+// 12 CreateCommandList(node mask, type, allocator, initial state, riid, ppv)
+HRESULT XBEM_GUEST_ABI device_create_command_list(ProbeObject* self, uint64_t, uint64_t type, uint64_t allocator,
+                                                  uint64_t state, uint64_t riid, uint64_t ppv) {
+  probe_log(self, 12, std::format("CreateCommandList(type {})", static_cast<uint32_t>(type)), XBEM_RETURN_ADDRESS());
+  return create_into(new_command_list(), out_after_iid({allocator, state, riid, ppv}));
+}
+// 73 CreateCommandListX(desc, allocator, initial state, riid, ppv): the console
+// form; the output is found after the interface ID.
+HRESULT XBEM_GUEST_ABI device_create_command_list_x(ProbeObject* self, uint64_t desc, uint64_t allocator,
+                                                    uint64_t state, uint64_t riid, uint64_t ppv, uint64_t extra) {
+  uint32_t head[4] = {};
+  platform::safe_read(desc, head, sizeof head);
+  void** out = out_after_iid({allocator, state, riid, ppv, extra});
+  probe_log(self, 73,
+            std::format("CreateCommandListX(desc {:#x} {:#x} {:#x} {:#x}) -> {}", head[0], head[1], head[2], head[3],
+                        out ? "typed command list (cursor at its limit)" : "no output pointer"),
+            XBEM_RETURN_ADDRESS());
+  return create_into(new_command_list(), out);
+}
 // 30 CreateReservedResource(desc, state, clear, riid, ppv)
 HRESULT XBEM_GUEST_ABI device_create_reserved_resource(ProbeObject* self, const uint8_t* desc, uint32_t, const void*,
                                                        const void*, void** out) {
@@ -939,6 +987,7 @@ const ProbeVtable g_device_vtable = make_vtable({
     {8, fn(&device_create_command_queue)},
     {10, fn(&device_create_graphics_pso)},
     {11, fn(&device_create_compute_pso)},
+    {12, fn(&device_create_command_list)},
     {13, fn(&device_check_feature_support)},
     {14, fn(&device_create_descriptor_heap)},
     {15, fn(&device_get_descriptor_increment)},
@@ -955,6 +1004,7 @@ const ProbeVtable g_device_vtable = make_vtable({
     {48, fn(&device_create_command_queue_x)},
     {62, fn(&device_create_compute_pso_x)},
     {67, fn(&device_deserialize_compute_pso_x)},
+    {73, fn(&device_create_command_list_x)},
     {76, fn(&device_create_texture_x<76>)},
     // 127: CreateCommittedResource3 (the title's back buffers, heap flag ALLOW_DISPLAY).
     {127, fn(&device_create_texture_x<127>)},

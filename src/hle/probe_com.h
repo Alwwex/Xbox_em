@@ -11,6 +11,7 @@
 // they use: the vtable order, argument shapes and structures.
 
 #include <array>
+#include <cstddef>
 #include <atomic>
 #include <cstdint>
 #include <initializer_list>
@@ -23,9 +24,22 @@ constexpr int kProbeSlots = 512;  // D3D12.X devices have far more methods than 
 
 constexpr uint64_t kProbeMagic = 0x45424F5250424558ull;  // "XBEPROBE"
 
-struct ProbeObject {
+// Console runtime objects are wider than their vtables: titles read and write
+// the runtime's fields directly (a command list's write cursor at +0x18 and
+// its limits at +0x28/+0x30, flag bytes at +0x140, pipeline state copied to
+// +0x544 - measured by the Leonida project on the shipped DLLs). Every probe
+// object starts with this zeroed area so those accesses never reach the
+// emulator's own fields.
+constexpr size_t kProbeConsoleArea = 0x800;
+
+struct ProbeHeader {
   void* const* vtable;
   uint64_t magic = kProbeMagic;
+  uint8_t console[kProbeConsoleArea - 16] = {};
+};
+static_assert(sizeof(ProbeHeader) == kProbeConsoleArea);
+
+struct ProbeObject : ProbeHeader {
   std::string name;
   std::atomic<uint32_t> refs{1};
   std::array<std::atomic<int>, kProbeSlots> calls{};

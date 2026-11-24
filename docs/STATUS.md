@@ -83,6 +83,10 @@ D3D12.X (`src/hle/d3d12_device.cpp`, table in `GPU.md`):
   were also called (meaning still open).
 - Fence: slot 12 returns the address of the 64-bit fence value, which the
   title polls itself.
+- Command lists (device 73, PC 12) are typed: the title writes PM4 packets
+  through a cursor at `+0x18` while it is below the limits at `+0x28`/`+0x30`;
+  xbem keeps the cursor at the limit so every command is a vtable call (see
+  `GPU.md`). Topology `0x11` is the AMD RECTLIST.
 - Unified memory: GPU virtual address = CPU address.
 
 Other modules: XG (`src/hle/xg.cpp`) keeps textures in the linear D3D12
@@ -98,6 +102,18 @@ for facts only. xbem is now licensed GPL-3.0-or-later (`LICENSE`), so
 Leonida's code - notably its RDNA2 → SPIR-V translator - may be reused with
 attribution (keep its copyright notices, name the source in the file
 header). Leonida is not in this repository; the owner uploads it when needed.
+
+## Open crash (latest run)
+
+`game_scarlett_master.exe+0xb5a5f8` (fn `0xb5a5d0`, the title's graphics
+pipeline lookup) reads `[rax+0x68]` with RAX = 0. Its caller fn `0x32520`
+(draw state, called from fn `0xbfa70`, the draw) builds a key on its stack
+from the title's render context `ctx` (RDI): key+0 = `ctx+0x12328`,
+key+8 = `ctx+0x12320`; the lookup needs one of the two to be non-null (both
+are, probably the bound shaders), and `ctx+0x12330` (the cached pipeline) is
+null. The previous draw, topology 4, went through; the failing one is a
+RECTLIST fullscreen pass. Next: find who writes `ctx+0x12320/0x12328`
+(objdump of the whole executable, grep for stores to those offsets).
 
 ## Known approximations
 

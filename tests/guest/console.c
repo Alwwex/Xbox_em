@@ -717,6 +717,41 @@ static void test_headless_d3d12(void) {
   CHECK(((WaitFn)VT(device)[80])(device, 0, 100, 0, 0, &token1) == 0 && token1 != 0);
   CHECK(((WaitFn)VT(device)[80])(device, 0, 100, 0, 0, &token2) == 0 && token2 != token1);
 
+  /* Command lists: 73 CreateCommandListX(desc, allocator, state, riid, ppv)
+   * and the PC 12 CreateCommandList. The title writes commands through the
+   * list's cursor (+0x18) while it is below the limits (+0x28 dispatch, +0x30
+   * other commands), as the title does at +0x3258a; at the limit it calls the
+   * list instead, so the emulator sees every command. */
+  typedef HRESULT (*CreateListXFn)(void*, const void*, void*, void*, const void*, void**);
+  typedef HRESULT (*CreateListFn)(void*, uint32_t, uint32_t, void*, void*, const void*, void**);
+  typedef HRESULT (*TopologyFn)(void*, uint32_t);
+  static const uint32_t list_desc[4] = {0, 0, 0, 0}; /* DIRECT */
+  void* list = 0;
+  CHECK(((CreateListXFn)VT(device)[73])(device, list_desc, 0, 0, iid, &list) == 0 && list);
+  uint8_t* lb = (uint8_t*)list;
+  uint64_t* cursor = (uint64_t*)(lb + 0x18);
+  const uint64_t limit = *(uint64_t*)(lb + 0x30);
+  CHECK(*cursor != 0 && *cursor == limit && *(uint64_t*)(lb + 0x28) == limit);
+  int inline_writes = 0;
+  if (*cursor < limit) { /* the title's fast path, never taken */
+    *(uint32_t*)(uintptr_t)*cursor = 0xc000b600;
+    *cursor += 8;
+    ++inline_writes;
+  }
+  CHECK(inline_writes == 0 && *cursor == limit);
+  /* the same cursor bound with a size, as dispatches check it */
+  CHECK(!(*cursor + 16 <= *(uint64_t*)(lb + 0x28)));
+  /* an unchecked write would land in memory, not fault */
+  *(volatile uint32_t*)(uintptr_t)*cursor = 0;
+  /* the console fields the title touches start zeroed and are writable */
+  CHECK(lb[0x140] == 0 && lb[0x143] == 0 && *(uint32_t*)(lb + 0x544) == 0);
+  lb[0x140] = 1;
+  lb[0x141] = 1;
+  CHECK(((TopologyFn)VT(list)[20])(list, 0x11) == 0); /* IASetPrimitiveTopology(RECTLIST) */
+  void* pc_list = 0;
+  CHECK(((CreateListFn)VT(device)[12])(device, 0, 0, 0, 0, iid, &pc_list) == 0 && pc_list && pc_list != list);
+  CHECK(*(uint64_t*)((uint8_t*)pc_list + 0x18) == *(uint64_t*)((uint8_t*)pc_list + 0x30));
+
   /* Compute pipeline: the shader binary is captured (--dump-shaders) */
   static const uint8_t shader[32] = {'X', 'B', 'E', 'M', 's', 'h', 'a', 'd', 'e', 'r'};
   const void* pso_desc[3] = {0, shader, (void*)(uintptr_t)sizeof shader};
