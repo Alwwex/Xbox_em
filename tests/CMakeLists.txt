@@ -194,6 +194,9 @@ function(xbem_guest_test name)
            COMMAND ${CMAKE_COMMAND} -DXBEM=$<TARGET_FILE:xbem> "-DARGS=${cmd}" -DEXPECT_EXIT=${T_EXIT}
                    "-DEXPECT=${expect}" -P ${CMAKE_CURRENT_SOURCE_DIR}/run_xbem.cmake
            WORKING_DIRECTORY ${GOUT})
+  # No run window: an X server (WSLg) may drop connections under a parallel
+  # ctest, and Xlib then ends the process.
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "DISPLAY=")
 endfunction()
 
 # Analysis commands work on every host.
