@@ -52,7 +52,8 @@ set(GUEST_FLAGS -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-l
                 -mno-stack-arg-probe -nostdlib -Wall -Wno-array-bounds)
 set(GUEST_COMMON ${GSRC}/guest_rt.c ${GSRC}/guest.h)
 
-foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs)
+foreach(lib kernelx xgameruntime advapi32 bcrypt oleaut32 xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs
+            acphal xapu)
   add_custom_command(
     OUTPUT ${GOUT}/lib${lib}.a
     COMMAND ${XBEM_MINGW_DLLTOOL} -d ${GSRC}/${lib}.def -l ${GOUT}/lib${lib}.a
@@ -114,7 +115,7 @@ endforeach()
 # Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
 find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
 if(XBEM_MINGW_WINDRES)
-  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs)
+  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs acphal xapu)
   set(CONSOLE_DEPS)
   foreach(lib ${CONSOLE_LIBS})
     list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)
@@ -250,7 +251,7 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
     xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --dump-shaders ${GOUT}/shaders
-                    EXPECT "PASS console" "HEADLESS device" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #2: 3 requests so far"
+                    EXPECT "PASS console" "HEADLESS device" "acphal.hal::Connect\\(0x1000, 0x1000\\)" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #2: 3 requests so far"
                            "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set \\(requests complete\\)"
                            "Submit #3: 19 requests so far"
                            "console.exe: 16 requests cover 0x0-0x8800 of 0x[0-9a-f]+ bytes; 1 gaps \\(0x7800 bytes\\): 0x800-0x8000"

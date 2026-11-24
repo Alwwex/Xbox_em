@@ -75,6 +75,21 @@ IMP HRESULT D3D12CreateRootSignatureDeserializer(const void* data, size_t size, 
 /* xcrdapi.dll */
 IMP HRESULT DStorageGetFactory(const void* iid, void** factory);
 
+/* AcpHal.dll, xapu.dll (audio co-processor) */
+IMP HRESULT ApuCreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes);
+IMP HRESULT ApuAlloc(void** va, uint32_t* apu_address, uint32_t size, uint32_t alignment, uint32_t flags);
+IMP HRESULT ApuFree(void* va);
+IMP uint32_t ApuMapVirtualAddress(void* va);
+IMP void* ApuMapApuAddress(uint32_t apu_address);
+IMP BOOL ApuIsVirtualAddressValid(void* va, uint32_t alignment);
+IMP HRESULT AcpHalAllocateShapeContexts(void* contexts);
+IMP HRESULT AcpHalReleaseShapeContexts(void);
+IMP HRESULT AcpHalCreate(void** hal);
+IMP HRESULT XApuConnect(const void* params, uint64_t* shared, void** handle);
+IMP HRESULT XApuEnqueueCommand(void* handle, const void* command, uint32_t flags);
+IMP uint32_t XApuGetResultCount(void* handle, uint32_t kind);
+IMP HRESULT XApuDisconnect(void* handle);
+
 /* gameinput.dll (ordinal 1) */
 IMP HRESULT GameInputCreate(void** game_input);
 
@@ -466,6 +481,60 @@ typedef HRESULT (*GiCreateDispatcher)(void*, void**);
 typedef _Bool (*GiDispatch)(void*, uint64_t);
 typedef uint32_t (*Release)(void*);
 
+/* The audio start-up of the title: APU heap, XMA shape contexts, the HAL
+ * object (not COM: slot 0 connects) and an XApu queue. */
+static void test_audio(void) {
+  void* va = 0;
+  uint32_t apu = 0;
+  CHECK(ApuAlloc(&va, &apu, 0x100, 0x800, 0) < 0); /* no heap yet */
+  CHECK(ApuCreateHeap(0x100000, 0x20000) == 0);
+  CHECK(ApuCreateHeap(0x100000, 0x20000) < 0); /* only once */
+  CHECK(ApuAlloc(&va, &apu, 0x1e000, 0x800, 2) == 0 && va && apu && apu % 0x800 == 0);
+  CHECK(((uint8_t*)va)[0] == 0 && ((uint8_t*)va)[0x1dfff] == 0);
+  ((uint8_t*)va)[0x1dfff] = 0x5a;
+  CHECK(ApuMapVirtualAddress(va) == apu && ApuMapApuAddress(apu) == va);
+  CHECK(ApuMapVirtualAddress((uint8_t*)va + 0x40) == apu + 0x40);
+  CHECK(ApuIsVirtualAddressValid(va, 0x80) && !ApuIsVirtualAddressValid((uint8_t*)va + 4, 0x40));
+  CHECK(!ApuIsVirtualAddressValid(&apu, 0) && ApuMapVirtualAddress(&apu) == 0xffffffffu);
+  /* the non-cached part is full: falls back to the cached one */
+  void* second = 0;
+  uint32_t second_apu = 0;
+  CHECK(ApuAlloc(&second, &second_apu, 0x10000, 0x800, 2) == 0 && second && second != va);
+  void* big = 0;
+  CHECK(ApuAlloc(&big, 0, 0x200000, 0x800, 0) < 0 && !big); /* larger than the heap */
+  CHECK(ApuFree(va) == 0 && ApuFree(va) < 0 && !ApuIsVirtualAddressValid(va, 0));
+  void* again = 0;
+  CHECK(ApuAlloc(&again, &apu, 0x1e000, 0x800, 2) == 0 && again == va && ((uint8_t*)again)[0x1dfff] == 0);
+  CHECK(ApuFree(again) == 0 && ApuFree(second) == 0);
+
+  /* SHAPE_CONTEXTS: six counts, then six array pointers */
+  struct {
+    uint32_t count[6];
+    void* array[6];
+  } shape = {{0, 0, 0, 0, 350, 0}, {0}};
+  CHECK(AcpHalAllocateShapeContexts(&shape) == 0 && shape.array[4] && !shape.array[0] && !shape.array[5]);
+  CHECK(((uint8_t*)shape.array[4])[349 * 64 + 63] == 0);
+  ((uint8_t*)shape.array[4])[349 * 64 + 63] = 1;
+  CHECK(AcpHalReleaseShapeContexts() == 0);
+
+  typedef HRESULT (*HalConnectFn)(void*, uint32_t, uint32_t);
+  typedef HRESULT (*HalSubmitFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t);
+  void* hal = 0;
+  CHECK(AcpHalCreate(&hal) == 0 && hal);
+  CHECK(((HalConnectFn)VT(hal)[0])(hal, 0x1000, 0x1000) == 0);
+  uint32_t arg = 0xc0;
+  CHECK(((HalSubmitFn)VT(hal)[2])(hal, 2, 0xf0f0f0f0, 0xffffffff, &arg, 0) == 0);
+
+  const uint32_t params[6] = {1, 0x100, 2, 0x104000, 0, 1};
+  uint64_t shared[2] = {0, 0};
+  void* queue = 0;
+  CHECK(XApuConnect(params, shared, &queue) == 0 && queue && shared[0] && shared[1] == 0x104000);
+  ((uint8_t*)(uintptr_t)shared[0])[0x103fff] = 1;
+  const uint32_t command[16] = {1};
+  CHECK(XApuEnqueueCommand(queue, command, 0) == 0 && XApuGetResultCount(queue, 0) == 0);
+  CHECK(XApuDisconnect(queue) == 0);
+}
+
 static void test_gameinput(void) {
   void* gi = 0;
   CHECK(GameInputCreate(&gi) == 0 && gi);
@@ -852,6 +921,7 @@ DWORD guest_main(void* peb) {
   test_headless_d3d12();
   test_dstorage();
   test_gameinput();
+  test_audio();
   test_locale();
   test_time();
   test_topology();
