@@ -685,13 +685,15 @@ bool is_allocated_memory(uint64_t address) {
   return state != MEM_FREE && kind == MEM_PRIVATE;
 }
 
-// 14 CreateDescriptorHeap(desc, riid, ppv). D3D12_DESCRIPTOR_HEAP_DESC is
-// {Type, NumDescriptors, Flags, NodeMask}; the console version also carries the
-// memory the title set aside for the descriptors (a real title checks that the
-// heap starts there), found as a pointer to allocated memory after the PC fields.
+// 14 CreateDescriptorHeap(desc, riid, ppv). The console's descriptor heap
+// desc is the PC {Type, NumDescriptors, Flags, NodeMask} followed by the memory
+// the title set aside for the descriptors and its size (+16, +24; the title
+// checks that the heap starts there). Some call sites fill only the 16 PC
+// bytes and leave stack contents behind them, so the memory is taken only when
+// the size covers the heap.
 HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
   auto* state = new DescriptorHeapState;
-  uint8_t raw[64] = {};
+  uint8_t raw[32] = {};
   if (desc) {
     if (!platform::safe_read(reinterpret_cast<uint64_t>(desc), raw, sizeof raw))
       platform::safe_read(reinterpret_cast<uint64_t>(desc), raw, 16);
@@ -700,22 +702,17 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   uint32_t count = 0;
   std::memcpy(&count, state->desc + 4, 4);
   const uint64_t bytes = std::max<uint64_t>(count, 1) * kDescriptorSize;
-  uint64_t memory = 0;
-  int memory_offset = -1;
-  for (int off = 16; off + 8 <= 64 && !memory; off += 8) {
-    uint64_t v;
-    std::memcpy(&v, raw + off, 8);
-    if (is_allocated_memory(v)) {
-      memory = v;
-      memory_offset = off;
-    }
-  }
+  uint64_t memory = 0, memory_size = 0;
+  std::memcpy(&memory, raw + 16, 8);
+  std::memcpy(&memory_size, raw + 24, 8);
+  const bool title_memory = memory && memory_size >= bytes && memory_size < (1ull << 40) && is_allocated_memory(memory);
+  if (!title_memory) memory = 0;
   if (!memory)
     memory = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
   state->cpu = memory;
   state->gpu = memory;  // unified memory: shader-visible descriptors are read from the same bytes
   std::string dump;
-  for (int i = 0; i < 64; i += 8) {
+  for (int i = 0; i < 32; i += 8) {
     uint64_t v;
     std::memcpy(&v, raw + i, 8);
     dump += std::format(" {:016x}", v);
@@ -723,7 +720,7 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   probe_log(self, 14,
             std::format("CreateDescriptorHeap({} descriptors, type {}, flags {:#x}) at {:#x} ({}) desc:{}", count,
                         raw[0], raw[8], memory,
-                        memory_offset >= 0 ? std::format("title memory from desc+{}", memory_offset) : "own memory",
+                        title_memory ? "title memory from desc+16" : "own memory",
                         dump),
             XBEM_RETURN_ADDRESS());
   return create_into(make_probe_object(child_name("descriptor_heap"), &g_heap_vtable, state), out);

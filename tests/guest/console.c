@@ -761,12 +761,24 @@ static void test_headless_d3d12(void) {
   const uint64_t gpu_start = ((HeapStartFn)VT(heap)[10])(heap);
   CHECK(gpu_start == start);
   *(volatile uint64_t*)(uintptr_t)(gpu_start + 63 * 32) = 1; /* descriptors are writable memory */
-  /* Console desc: memory the title set aside for the descriptors follows the PC fields */
+  /* Console desc: the memory the title set aside for the descriptors and its
+   * size follow the PC fields */
   uint8_t* title_mem = VirtualAlloc(0, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-  uint64_t heap_desc_x[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)title_mem, 0};
+  uint64_t heap_desc_x[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)title_mem, 64 * 32};
   void* heap_x = 0;
   CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_x, iid, &heap_x) == 0 && heap_x);
   CHECK(((HeapStartFn)VT(heap_x)[9])(heap_x) == (uint64_t)(uintptr_t)title_mem);
+  /* Only the 16 PC bytes set, the rest stack contents (fn 0x1c744f0 of the
+   * title): a pointer to allocated memory there is not the heap's memory */
+  uint64_t heap_desc_pc[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)title_mem, (uint64_t)(uintptr_t)title_mem};
+  void* heap_pc = 0;
+  CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_pc, iid, &heap_pc) == 0 && heap_pc);
+  const uint64_t pc_start = ((HeapStartFn)VT(heap_pc)[9])(heap_pc);
+  CHECK(pc_start && pc_start != (uint64_t)(uintptr_t)title_mem);
+  uint64_t heap_desc_small[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)title_mem, 32};
+  void* heap_small = 0;
+  CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_small, iid, &heap_small) == 0 && heap_small);
+  CHECK(((HeapStartFn)VT(heap_small)[9])(heap_small) != (uint64_t)(uintptr_t)title_mem);
 
   /* Heaps: CreateHeap (28); placed resources live at heap + offset. */
   typedef HRESULT (*CreateMemHeapFn)(void*, const void*, const void*, void**);
