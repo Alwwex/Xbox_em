@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <new>
 #include <thread>
 
@@ -123,14 +124,13 @@ bool primary_function_of(uint64_t pc, uint64_t* begin_rva, uint64_t* end_rva, ui
 // Crash reports: the faulting thread's frames, found with the title's unwind
 // data, each with the start of its function (for objdump --start-address).
 void print_unwind_backtrace(const uint64_t gpr[16], uint64_t rip, uint64_t stack_low, uint64_t stack_high,
-                            void (*write)(const char*)) {
+                            int max_frames, void (*write)(const char*)) {
   alignas(16) seh::Context c{};
   std::memcpy(c.Gpr, gpr, sizeof c.Gpr);
   c.Rip = rip;
   seh::DispatcherContext dc{};
   char line[640], where[256], call[256];
-  write("Backtrace (from the title's unwind data; fn = start of the function):\n");
-  for (int frame = 0; frame < 48 && c.Rip; ++frame) {
+  for (int frame = 0; frame < max_frames && c.Rip; ++frame) {
     where[0] = 0;
     describe_address(c.Rip, where, sizeof where);
     if (!where[0]) {
@@ -168,6 +168,77 @@ void print_unwind_backtrace(const uint64_t gpr[16], uint64_t rip, uint64_t stack
       write("  (unwind did not move up the stack - walk ends)\n");
       return;
     }
+  }
+}
+
+// A code address from a --trace-at spec: "module!export[+hex]", "module+hex",
+// or a hex number in the main executable (an RVA, or an address inside it).
+uint64_t resolve_code_spec(ModuleLoader& loader, const std::string& spec, std::string& error) {
+  const auto hex = [&](const std::string& text, uint64_t& out) {
+    try {
+      size_t used = 0;
+      out = std::stoull(text, &used, 16);
+      return used == text.size();
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
+  const size_t bang = spec.find('!');
+  const size_t plus = spec.find('+', bang == std::string::npos ? 0 : bang);
+  LoadedModule* m = loader.main_module();
+  uint64_t offset = 0;
+  if (bang != std::string::npos || plus != std::string::npos) {
+    const std::string module = spec.substr(0, bang != std::string::npos ? bang : plus);
+    m = loader.find_loaded(module);
+    if (!m) {
+      error = "module " + module + " is not loaded";
+      return 0;
+    }
+    if (plus != std::string::npos && !hex(spec.substr(plus + 1), offset)) {
+      error = "bad offset (hex expected)";
+      return 0;
+    }
+    if (bang != std::string::npos) {
+      const std::string name = spec.substr(bang + 1, plus == std::string::npos ? std::string::npos : plus - bang - 1);
+      const auto it = m->exports_by_name.find(name);
+      if (it == m->exports_by_name.end() || !it->second.forwarder.empty() || !it->second.address) {
+        error = "no export " + name + " in " + m->name;
+        return 0;
+      }
+      return it->second.address + offset;
+    }
+  } else if (!m || !hex(spec, offset)) {
+    error = "expected module!export, module+offset or a hex offset in the executable";
+    return 0;
+  } else if (m->contains(offset)) {
+    return offset;  // already an address inside the executable
+  }
+  if (offset >= m->size) {
+    error = "offset is outside " + m->name;
+    return 0;
+  }
+  return m->handle() + offset;
+}
+
+void arm_tracepoints(ModuleLoader& loader, const std::vector<std::string>& specs) {
+  for (const std::string& spec : specs) {
+    std::string error;
+    const uint64_t address = resolve_code_spec(loader, spec, error);
+    LoadedModule* m = address ? loader.find_containing(address) : nullptr;
+    if (address && (!m || !m->image)) error = "not in a game module (emulated code cannot be traced)";
+    if (!error.empty()) {
+      XBEM_WARN("trace", "--trace-at {}: {}", spec, error);
+      continue;
+    }
+    char where[200];
+    describe_address(address, where, sizeof where);
+    const std::string label = spec.find('!') != std::string::npos ? std::format("{} ({})", spec, where) : where;
+    const uint8_t first = *reinterpret_cast<const uint8_t*>(address);
+    if (!platform::add_tracepoint(address, label.c_str())) {
+      XBEM_WARN("trace", "--trace-at {}: cannot patch the code (or more than 64 tracepoints)", spec);
+      continue;
+    }
+    XBEM_INFO("trace", "tracepoint at {} (first byte {:02x})", label, first);
   }
 }
 
@@ -283,6 +354,8 @@ int Process::run() {
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&print_thread_context);
   platform::set_backtrace_printer(&print_unwind_backtrace);
+  platform::set_tracepoint_log_hits(options_.trace_log_hits);
+  arm_tracepoints(*loader_, options_.trace_at);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

@@ -36,7 +36,9 @@ struct ProcessOptions {
   bool strict = false;           // terminate on the first call to an unimplemented import
   bool trace_hle = false;
   bool continue_after_breakpoint = false;
-  std::filesystem::path dump_shaders_dir;  // save shader binaries the title creates  // log int3 / __debugbreak() and keep running        // trace calls to emulated functions (log + per-thread history)
+  std::filesystem::path dump_shaders_dir;  // save shader binaries the title creates
+  std::vector<std::string> trace_at;  // code tracepoints: module!export[+off], module+off, or an offset in the exe
+  int trace_log_hits = 8;             // hits of each tracepoint logged as they happen
   DeviceType device = DeviceType::XboxScarlettAnaconda;
   std::filesystem::path scratch_dir;  // host directory for T:\ (created if missing)
   std::vector<std::pair<char, std::filesystem::path>> extra_mounts;

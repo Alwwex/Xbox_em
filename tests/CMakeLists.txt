@@ -244,6 +244,20 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   endif()
   xbem_guest_test(guest_seh_unhandled COMMAND run ${GOUT}/seh_unhandled.exe EXIT 173
                   EXPECT "unhandled guest exception 0xe0badbad" "frame  1: seh_unhandled.exe\\+0x")
+  # Tracepoints: hits logged with registers, the int3 put back after each step
+  # (three calls -> three hits), the title still runs to the end; bad specs warn.
+  xbem_guest_test(guest_tracepoints
+                  COMMAND run ${GOUT}/dlls.exe --trace-at
+                          gamelib.dll!gamelib_add,gamelib.dll+0x7fffffff,nosuch.dll!f,gamelib.dll!gamelib_tick
+                  EXPECT "tracepoint at gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\)"
+                         "\\[trace\\] gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\) hit 3"
+                         "    rax=[0-9a-f]+ rcx=[0-9a-f]+ rdx=2 "
+                         "offset is outside gamelib.dll" "module nosuch.dll is not loaded"
+                         "no export gamelib_tick in gamelib.dll" "PASS dlls")
+  xbem_guest_test(guest_tracepoint_crash COMMAND run ${GOUT}/crash.exe --trace-at crash.exe!call_fault EXIT 139
+                  EXPECT "\\[trace\\] crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\) hit 1"
+                         "Tracepoints:" "crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\): 1 hits"
+                         "Last tracepoint hits" "#0  crash.exe\\+0x[0-9a-f]+  .fn 0x")
   xbem_guest_test(guest_crash_report COMMAND run ${GOUT}/crash.exe EXIT 139
                   EXPECT "guest crash" "SIGSEGV" "RIP=[0-9a-f]+  crash.exe\\+0x"
                          "#0  crash.exe\\+0x[0-9a-f]+  .(fn 0x)?"

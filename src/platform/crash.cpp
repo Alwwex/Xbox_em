@@ -12,6 +12,8 @@ void set_continue_after_breakpoint(bool) {}
 const char* patch_cache_hint_instruction(uint8_t*) { return nullptr; }
 void set_thread_context_printer(ThreadContextPrinter) {}
 void set_backtrace_printer(BacktracePrinter) {}
+bool add_tracepoint(uint64_t, const char*) { return false; }
+void set_tracepoint_log_hits(int) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
 
@@ -347,9 +349,155 @@ bool handle_unsupported_instruction(ucontext_t* uc) {
 }
 #endif
 
+// ------------------------------------------------------------ tracepoints
+
+// greg_t indices in unwind-code register order (RAX RCX RDX RBX RSP RBP RSI RDI R8..R15).
+const int kUnwindOrder[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                              REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+const char* const kRegNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                   "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+
+struct TraceHit {
+  uint64_t seq = 0;  // global order of hits, 0 = unused
+  uint32_t guest_thread = 0;
+  uint64_t gpr[16] = {};
+  uint64_t ret = 0;  // [rsp]: the return address at a function's first instruction
+};
+
+struct Tracepoint {
+  static constexpr uint32_t kRing = 4;
+  uint64_t address = 0;
+  uint8_t original = 0;
+  char label[160] = {};
+  std::atomic<uint64_t> hits{0};
+  std::atomic<bool> armed{false};
+  TraceHit ring[kRing];
+};
+
+constexpr int kMaxTracepoints = 64;
+constexpr uint64_t kTraceDisarmAfter = 1000000;  // a hot loop would make the title crawl
+constexpr greg_t kTrapFlag = 0x100;
+Tracepoint g_tracepoints[kMaxTracepoints];
+std::atomic<int> g_tracepoint_count{0};
+std::atomic<uint64_t> g_trace_seq{0};
+int g_trace_log_hits = 8;
+thread_local int t_trace_step = -1;  // tracepoint this thread is single-stepping over
+
+void put_code_byte(uint64_t address, uint8_t value) { *reinterpret_cast<volatile uint8_t*>(address) = value; }
+
+// "rax=... rcx=..." for registers [from, to) of a hit.
+void format_regs(char* out, size_t size, const uint64_t* gpr, int from, int to) {
+  size_t n = 0;
+  for (int k = from; k < to && n < size; ++k)
+    n += static_cast<size_t>(std::snprintf(out + n, size - n, "%s%s=%llx", k == from ? "" : " ", kRegNames[k],
+                                           static_cast<unsigned long long>(gpr[k])));
+}
+
+void write_hit(const Tracepoint& t, const TraceHit& h, const char* prefix) {
+  char line[700], regs[400], where[256] = {0};
+  if (g_describer && h.ret) g_describer(h.ret, where, sizeof where);
+  format_regs(regs, sizeof regs, h.gpr, 0, 8);
+  std::snprintf(line, sizeof line, "%s#%llu %s (guest thread %u)\n%s    %s\n", prefix,
+                static_cast<unsigned long long>(h.seq), t.label, h.guest_thread, prefix, regs);
+  write_str(line);
+  format_regs(regs, sizeof regs, h.gpr, 8, 16);
+  std::snprintf(line, sizeof line, "%s    %s  [rsp]=%llx%s%s\n", prefix, regs, static_cast<unsigned long long>(h.ret),
+                where[0] ? " " : "", where);
+  write_str(line);
+}
+
+void record_hit(Tracepoint& t, const greg_t* g) {
+  const uint64_t n = t.hits.fetch_add(1) + 1;
+  TraceHit& h = t.ring[(n - 1) % Tracepoint::kRing];
+  h.seq = 0;
+  const DumpSlot* slot = slot_of_tid(current_tid());
+  h.guest_thread = slot ? slot->guest_id : 0;
+  for (int k = 0; k < 16; ++k) h.gpr[k] = static_cast<uint64_t>(g[kUnwindOrder[k]]);
+  h.ret = 0;
+  safe_read(h.gpr[4], &h.ret, 8);
+  h.seq = g_trace_seq.fetch_add(1) + 1;
+  if (n <= static_cast<uint64_t>(g_trace_log_hits)) {
+    lock_print();
+    char head[300];
+    std::snprintf(head, sizeof head, "[trace] %s hit %llu%s\n", t.label, static_cast<unsigned long long>(n),
+                  n == static_cast<uint64_t>(g_trace_log_hits) ? " (later hits are counted, not logged)" : "");
+    write_str(head);
+    write_hit(t, h, "  ");
+    if (g_backtrace_printer && slot && slot->stack_high)
+      g_backtrace_printer(h.gpr, t.address, slot->stack_low, slot->stack_high, 6, &write_str);
+    unlock_print();
+  }
+  if (n == kTraceDisarmAfter) {
+    t.armed.store(false);
+    char line[300];
+    std::snprintf(line, sizeof line, "[warn ][trace] %s disarmed after %llu hits\n", t.label,
+                  static_cast<unsigned long long>(n));
+    write_str(line);
+  }
+}
+
+// SIGTRAP: a tracepoint's int3, or the single step over its instruction.
+bool handle_tracepoint_trap(ucontext_t* uc) {
+  greg_t* g = uc->uc_mcontext.gregs;
+  if (t_trace_step >= 0) {
+    Tracepoint& t = g_tracepoints[t_trace_step];
+    t_trace_step = -1;
+    g[REG_EFL] &= ~kTrapFlag;
+    if (t.armed.load()) put_code_byte(t.address, 0xCC);
+    return true;
+  }
+  const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
+  const int count = g_tracepoint_count.load();
+  for (int i = 0; i < count; ++i) {
+    Tracepoint& t = g_tracepoints[i];
+    if (t.address != rip - 1) continue;
+    record_hit(t, g);
+    // Execute the original instruction, then put the int3 back (single step).
+    put_code_byte(t.address, t.original);
+    g[REG_RIP] = static_cast<greg_t>(t.address);
+    if (t.armed.load()) {
+      g[REG_EFL] |= kTrapFlag;
+      t_trace_step = i;
+    }
+    return true;
+  }
+  if (g[REG_EFL] & kTrapFlag) {  // a stray single step (TF restored by popf after a step)
+    g[REG_EFL] &= ~kTrapFlag;
+    return true;
+  }
+  return false;
+}
+
+// Crash reports: hit counts and the last recorded hits of all tracepoints.
+void print_tracepoint_summary() {
+  const int count = g_tracepoint_count.load();
+  if (!count) return;
+  char line[300];
+  write_str("Tracepoints:\n");
+  struct Ref {
+    uint64_t seq;
+    int tp, slot;
+  } refs[kMaxTracepoints * Tracepoint::kRing];
+  int n = 0;
+  for (int i = 0; i < count; ++i) {
+    const Tracepoint& t = g_tracepoints[i];
+    std::snprintf(line, sizeof line, "  %s: %llu hits%s\n", t.label, static_cast<unsigned long long>(t.hits.load()),
+                  t.armed.load() ? "" : " (disarmed)");
+    write_str(line);
+    for (int k = 0; k < static_cast<int>(Tracepoint::kRing); ++k)
+      if (t.ring[k].seq) refs[n++] = {t.ring[k].seq, i, k};
+  }
+  if (!n) return;
+  std::sort(refs, refs + n, [](const Ref& a, const Ref& b) { return a.seq < b.seq; });
+  write_str("Last tracepoint hits (oldest first; up to 4 per tracepoint):\n");
+  for (int k = n > 40 ? n - 40 : 0; k < n; ++k)
+    write_hit(g_tracepoints[refs[k].tp], g_tracepoints[refs[k].tp].ring[refs[k].slot], "  ");
+}
+
 void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
 #if defined(__x86_64__)
   if (sig == SIGILL && handle_unsupported_instruction(static_cast<ucontext_t*>(ctx_raw))) return;
+  if (sig == SIGTRAP && handle_tracepoint_trap(static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGTRAP && g_continue_after_breakpoint.load()) {
     // int3 leaves RIP after the instruction: returning continues the title.
     char line[320], where[256] = {0};
@@ -486,14 +634,14 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   if (!shown) write_str("  (none found)\n");
   print_outermost_frames(slot, line, sizeof line, where, sizeof where);
   if (g_context_printer) g_context_printer(&write_str);
+  print_tracepoint_summary();
   // Last: the walk follows the title's unwind data through its stack; should
   // it fault anyway, everything above is already written.
   if (g_backtrace_printer && slot && slot->stack_high) {
-    const int order[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
-                           REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
     uint64_t gpr[16];
-    for (int i = 0; i < 16; ++i) gpr[i] = static_cast<uint64_t>(g[order[i]]);
-    g_backtrace_printer(gpr, rip, slot->stack_low, slot->stack_high, &write_str);
+    for (int i = 0; i < 16; ++i) gpr[i] = static_cast<uint64_t>(g[kUnwindOrder[i]]);
+    write_str("Backtrace (from the title's unwind data; fn = start of the function):\n");
+    g_backtrace_printer(gpr, rip, slot->stack_low, slot->stack_high, 48, &write_str);
   }
 #else
   (void)ctx_raw;
@@ -524,6 +672,25 @@ void set_memory_describer(AddressDescriber describer) { g_memory_describer = des
 void set_continue_after_breakpoint(bool enabled) { g_continue_after_breakpoint.store(enabled); }
 void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
 void set_backtrace_printer(BacktracePrinter printer) { g_backtrace_printer = printer; }
+
+bool add_tracepoint(uint64_t address, const char* label) {
+  const int i = g_tracepoint_count.load();
+  if (i >= kMaxTracepoints) return false;
+  for (int k = 0; k < i; ++k)
+    if (g_tracepoints[k].address == address) return true;  // already armed
+  // The page stays writable: the handler swaps the byte on every hit.
+  if (!make_writable(address, 1)) return false;
+  Tracepoint& t = g_tracepoints[i];
+  t.address = address;
+  t.original = *reinterpret_cast<const uint8_t*>(address);
+  std::snprintf(t.label, sizeof t.label, "%s", label);
+  t.armed.store(true);
+  g_tracepoint_count.store(i + 1);  // published before the int3 can be reached
+  put_code_byte(address, 0xCC);
+  return true;
+}
+
+void set_tracepoint_log_hits(int hits) { g_trace_log_hits = hits < 0 ? 0 : hits; }
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();

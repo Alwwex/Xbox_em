@@ -10,7 +10,8 @@ typedef int (*PLUGIN_FN)(void);
 DWORD guest_main(void* peb) {
   (void)peb;
   CHECK(gamelib_attach_count() == 1);   /* DllMain ran exactly once, before the entry point */
-  CHECK(gamelib_add(1, 2) == 23);       /* relocated pointer inside the DLL works */
+  for (int i = 0; i < 3; ++i)
+    CHECK(gamelib_add(1, 2) == 23);     /* relocated pointer inside the DLL works (3 calls: tracepoint test) */
   CHECK(gamelib_tick() > 0);            /* forwarder gamelib -> kernelx (HLE) */
 
   HANDLE lib = GetModuleHandleA("gamelib.dll");

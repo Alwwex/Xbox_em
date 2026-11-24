@@ -46,13 +46,23 @@ const char* patch_cache_hint_instruction(uint8_t* code);
 using ThreadContextPrinter = void (*)(void (*write)(const char*));
 void set_thread_context_printer(ThreadContextPrinter printer);
 
-// Prints a backtrace from the faulting register state using the guest's unwind
-// data (.pdata), with each frame's function start. `gpr` is in unwind-code
-// order (RAX RCX RDX RBX RSP RBP RSI RDI R8..R15); the stack bounds limit
-// every frame the walk may read.
+// Prints up to `max_frames` frames of a backtrace from a register state using
+// the guest's unwind data (.pdata), with each frame's function start. `gpr` is
+// in unwind-code order (RAX RCX RDX RBX RSP RBP RSI RDI R8..R15); the stack
+// bounds limit every frame the walk may read.
 using BacktracePrinter = void (*)(const uint64_t gpr[16], uint64_t rip, uint64_t stack_low, uint64_t stack_high,
-                                  void (*write)(const char*));
+                                  int max_frames, void (*write)(const char*));
 void set_backtrace_printer(BacktracePrinter printer);
+
+// Code tracepoints (run --trace-at). An int3 replaces the first byte of a
+// guest instruction; a hit records the registers and [rsp] (crash reports list
+// the last hits of all tracepoints in order), the first hits of each are
+// logged with a short backtrace, then the instruction is single-stepped and
+// the int3 put back. A thread reaching a tracepoint while another one steps
+// over it is not counted. `label` names it in logs. Returns false when the
+// code cannot be patched (or the table is full).
+bool add_tracepoint(uint64_t address, const char* label);
+void set_tracepoint_log_hits(int hits);
 void unregister_dump_thread();
 
 }  // namespace xbem::platform

@@ -559,6 +559,15 @@ int cmd_run(const Args& args) {
       opt.dump_shaders_dir = value();
     } else if (a == "--continue-after-breakpoint") {
       opt.continue_after_breakpoint = true;
+    } else if (a == "--trace-at") {
+      std::string list = value();
+      for (size_t start = 0; start <= list.size();) {
+        const size_t comma = std::min(list.find(',', start), list.size());
+        if (comma > start) opt.trace_at.push_back(list.substr(start, comma - start));
+        start = comma + 1;
+      }
+    } else if (a == "--trace-log") {
+      opt.trace_log_hits = std::stoi(value());
     } else if (a == "--device") {
       const std::string& d = value();
       if (d == "series-x") opt.device = rt::DeviceType::XboxScarlettAnaconda;

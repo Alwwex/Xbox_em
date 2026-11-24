@@ -4,7 +4,8 @@
 
 __attribute__((noinline)) static void fault_here(volatile int* p) { *p = 1; }
 
-__attribute__((noinline)) static void call_fault(volatile int* p) {
+/* Exported, so tests can name it: run --trace-at crash.exe!call_fault */
+__attribute__((noinline, dllexport)) void call_fault(volatile int* p) {
   fault_here(p);
   __asm__ volatile("" ::: "memory"); /* keeps the call from becoming a tail jump */
 }

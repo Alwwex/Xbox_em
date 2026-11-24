@@ -50,7 +50,17 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    RIP-16..RIP+32, registers and what they point at (stacks, allocations,
    emulator probe objects); `xbem hexdump` still dumps raw bytes.
 
-4. `--continue-after-breakpoint` skips one known title assertion
+4. Tracepoints answer "who sets this, with what" at run time instead of
+   reading more code: `--trace-at ADDR[,ADDR...]` (absolute addresses as
+   objdump prints them, RVAs, `module+hex` or `module!export`) puts an int3
+   on each instruction; the first hits (`--trace-log N`, default 8) are
+   logged with all registers, `[rsp]` and a 6-frame backtrace, and the crash
+   report lists hit counts and the last hits of all tracepoints in order
+   (`sed -n '/^Tracepoints:/,/^Backtrace/p' run.log`). A good set: every
+   instruction that stores the field a crash reads (found with
+   `objdump ... | grep -E "PTR \[[a-z0-9]+\+0xOFFSET\],"`), plus the
+   functions in the crash backtrace.
+5. `--continue-after-breakpoint` skips one known title assertion
    (+0x247af2d, a render-target budget check that expects the console's tiled
    texture sizes); everything after it runs normally.
 
