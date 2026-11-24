@@ -103,6 +103,15 @@ bool add_watchpoint(uint64_t address, uint32_t length, const char* label);
 // at:CODE:OPERAND): reserved now, armed by a tracepoint hit (see
 // TracepointOptions::arm_watch). Returns its index, -1 when the table is full.
 int reserve_watchpoint(uint32_t length, const char* label);
+// Memory mapped at several addresses (emulated physical pages): a watchpoint
+// also guards the other views of its bytes. The finder lists every address
+// the byte at `address` is mapped at, itself included (at most `max`; 0 when
+// it is not such memory, -1 when it cannot tell without blocking and
+// `may_block` is false). The emulator calls refresh_watchpoint_views after it
+// maps or unmaps such memory (never from a signal handler).
+using ViewFinder = int (*)(uint64_t address, uint64_t* out, int max, bool may_block);
+void set_view_finder(ViewFinder finder);
+void refresh_watchpoint_views();
 void set_watchpoint_log_writes(int writes);
 // True when [address, address + size) touches a page a watchpoint protects:
 // emulated functions that let the kernel write guest memory (read() into a

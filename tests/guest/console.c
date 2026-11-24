@@ -95,6 +95,13 @@ static int starts_with(const char* s, const char* prefix) {
   return 1;
 }
 
+/* Exported: run --watch at:console.exe!watch_here:rcx+OFFSET arms a watchpoint
+   on memory the test maps (the address is only known at run time). */
+__attribute__((noinline, dllexport)) void watch_here(volatile uint8_t* p) {
+  (void)p;
+  __asm__ volatile("" ::: "memory");
+}
+
 /* ------------------------------------------------------------------ xmem */
 
 static void test_xmem(void) {
@@ -124,9 +131,41 @@ static void test_xmem(void) {
   CHECK(v[0x10000 + 0x123] == 0x5A);
   v[0x10000 + 0xFFFF] = 0x77;
   CHECK(v[0xFFFF] == 0x77);
+  /* run --watch at:console.exe!watch_here:rcx+0x120 watches the other view too */
+  watch_here(va);
+  v[0x10000 + 0x120] = 0x66;
+  CHECK(v[0x120] == 0x66);
   CHECK(XMemMapPhysicalPages(va, 1, 0) == va); /* unmap */
   CHECK(XMemFreePhysicalPages(1, pages) >= 0);
   CHECK(VirtualFree(va, 0, MEM_RELEASE));
+
+  /* The title's layout, (flags, &count, pages), frees exactly those pages; a
+     call naming pages that are not allocated frees nothing - freeing pages in
+     use would hand them to another allocation, which overwrites them. */
+  {
+    typedef int32_t (*free3_fn)(uint64_t, uint64_t*, const uint64_t*);
+    free3_fn free3 = (free3_fn)(void*)XMemFreePhysicalPages;
+    uint8_t* w = XMemVirtualAlloc(0, 0x30000, MEM_RESERVE | 0x20000000 /*MEM_LARGE_PAGES*/, 0x3, PAGE_READWRITE);
+    CHECK(w != 0);
+    uint64_t n2 = 2, keep[2] = {0}, n1 = 1, other[1] = {0}, again[1] = {0};
+    CHECK(XMemAllocatePhysicalPages(0x380, &n2, keep) >= 0);
+    CHECK(XMemAllocatePhysicalPages(0x380, &n1, other) >= 0);
+    CHECK(XMemMapPhysicalPages(w, 2, keep) == w);
+    volatile uint8_t* vw = w;
+    vw[0x10] = 0x11;
+    vw[0x10010] = 0x22;
+    CHECK(free3(0x380, &n1, other) >= 0); /* frees `other` only */
+    uint64_t junk[2] = {keep[0] + 0x1000000, 5}, two = 2;
+    CHECK(free3(0x280, &two, junk) >= 0); /* nothing allocated named: nothing freed */
+    CHECK(XMemAllocatePhysicalPages(0x380, &n1, again) >= 0);
+    CHECK(again[0] != keep[0] && again[0] != keep[1]); /* never a page in use */
+    CHECK(XMemMapPhysicalPages(w + 0x20000, 1, again) == w + 0x20000);
+    vw[0x20010] = 0x33;
+    CHECK(vw[0x10] == 0x11 && vw[0x10010] == 0x22 && vw[0x20010] == 0x33);
+    CHECK(XMemMapPhysicalPages(w, 3, 0) == w);
+    CHECK(free3(0x380, &n2, keep) >= 0 && free3(0x380, &n1, again) >= 0);
+    CHECK(VirtualFree(w, 0, MEM_RELEASE));
+  }
 
   /* Placeholders: reserve, split, replace with an allocation, turn back into a
    * placeholder, coalesce, release (the pattern GTA-engine descriptor heaps use). */

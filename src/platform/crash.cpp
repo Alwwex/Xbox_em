@@ -16,6 +16,8 @@ bool add_tracepoint(uint64_t, const char*, const TracepointOptions&) { return fa
 void set_tracepoint_log_hits(int) {}
 bool add_watchpoint(uint64_t, uint32_t, const char*) { return false; }
 int reserve_watchpoint(uint32_t, const char*) { return -1; }
+void set_view_finder(ViewFinder) {}
+void refresh_watchpoint_views() {}
 void set_watchpoint_log_writes(int) {}
 bool overlaps_watched_page(uint64_t, uint64_t) { return false; }
 void unregister_dump_thread() {}
@@ -528,17 +530,22 @@ struct WatchWrite {
   uint64_t seq = 0;
   uint32_t guest_thread = 0;
   uint64_t rip = 0;
+  uint64_t via = 0;  // the other view written through, 0 = the watched address
   uint8_t before[16] = {}, after[16] = {};
 };
 
 struct Watchpoint {
   static constexpr uint32_t kRing = 4;
+  static constexpr int kMaxViews = 8;
   uint64_t address = 0;
   uint32_t length = 8;
   char label[160] = {};
   std::atomic<bool> armed{false};
   std::atomic<uint64_t> writes{0};
   WatchWrite ring[kRing];
+  // Other addresses of the same bytes (physical memory mapped more than once).
+  uint64_t view[kMaxViews] = {};
+  std::atomic<int> views{0};
 };
 
 constexpr int kMaxWatchpoints = 16;
@@ -552,6 +559,7 @@ struct WatchStep {
   uint64_t page = 0;
   int watch = -1;      // the watchpoint written, -1 for another address on its page
   bool maybe = false;  // the store starts before the range: a hit only if the range changes
+  uint64_t via = 0;    // the view written through (0 = the watched address)
   uint64_t rip = 0;
   uint64_t gpr[16] = {};
   uint8_t before[16] = {};
@@ -581,16 +589,18 @@ void log_watch_write(Watchpoint& w, const WatchStep& s, const DumpSlot* slot) {
   r.seq = g_trace_seq.fetch_add(1) + 1;
   r.guest_thread = slot ? slot->guest_id : 0;
   r.rip = s.rip;
+  r.via = s.via;
   std::memcpy(r.before, s.before, shown);
   safe_read(w.address, r.after, shown);
   if (n > static_cast<uint64_t>(g_watch_log_writes)) return;
-  char line[700], where[256] = {0}, before[64], after[64], regs[400];
+  char line[700], where[256] = {0}, before[64], after[64], regs[400], via[48] = {0};
   if (g_describer) g_describer(s.rip, where, sizeof where);
   write_bytes(before, sizeof before, r.before, shown);
   write_bytes(after, sizeof after, r.after, shown);
+  if (s.via) std::snprintf(via, sizeof via, " via %#llx", static_cast<unsigned long long>(s.via));
   lock_print();
-  std::snprintf(line, sizeof line, "[watch] %s: write %llu by %s (guest thread %u): %s -> %s%s\n", w.label,
-                static_cast<unsigned long long>(n), where[0] ? where : "?", r.guest_thread, before, after,
+  std::snprintf(line, sizeof line, "[watch] %s: write %llu%s by %s (guest thread %u): %s -> %s%s\n", w.label,
+                static_cast<unsigned long long>(n), via, where[0] ? where : "?", r.guest_thread, before, after,
                 n == static_cast<uint64_t>(g_watch_log_writes) ? " (later writes are counted, not logged)" : "");
   write_str(line);
   format_regs(regs, sizeof regs, s.gpr, 0, 8);
@@ -613,18 +623,26 @@ bool handle_watch_fault(siginfo_t* info, ucontext_t* uc) {
   int hit = -1;
   bool maybe = false;
   bool on_page = false;
-  for (int i = 0; i < count; ++i) {
+  uint64_t via = 0;
+  for (int i = 0; i < count && (hit < 0 || maybe); ++i) {
     const Watchpoint& w = g_watchpoints[i];
-    if (!w.armed.load() || (page_of(w.address) != page && page_of(w.address + w.length - 1) != page)) continue;
-    on_page = true;
-    if (fault >= w.address && fault < w.address + w.length) {  // the store starts inside the range
-      hit = i;
-      maybe = false;
-      break;
-    }
-    if (hit < 0 && fault < w.address && fault + 32 > w.address) {  // a wider store may reach into it
-      hit = i;
-      maybe = true;
+    if (!w.armed.load()) continue;
+    const int views = std::min(w.views.load(), Watchpoint::kMaxViews);
+    for (int v = -1; v < views; ++v) {
+      const uint64_t base = v < 0 ? w.address : w.view[v];
+      if (page_of(base) != page && page_of(base + w.length - 1) != page) continue;
+      on_page = true;
+      if (fault >= base && fault < base + w.length) {  // the store starts inside the range
+        hit = i;
+        maybe = false;
+        via = v < 0 ? 0 : base;
+        break;
+      }
+      if (hit < 0 && fault < base && fault + 32 > base) {  // a wider store may reach into it
+        hit = i;
+        maybe = true;
+        via = v < 0 ? 0 : base;
+      }
     }
   }
   if (!on_page) return false;
@@ -634,6 +652,7 @@ bool handle_watch_fault(siginfo_t* info, ucontext_t* uc) {
   s.page = page;
   s.watch = hit;
   s.maybe = maybe;
+  s.via = via;
   s.rip = static_cast<uint64_t>(g[REG_RIP]);
   if (hit >= 0) {
     for (int k = 0; k < 16; ++k) s.gpr[k] = static_cast<uint64_t>(g[kUnwindOrder[k]]);
@@ -662,6 +681,56 @@ bool handle_watch_step(ucontext_t* uc) {
   return true;
 }
 
+ViewFinder g_view_finder = nullptr;
+
+void protect_range(uint64_t address, uint32_t length) {
+  set_page_writable(page_of(address), false);
+  if (page_of(address + length - 1) != page_of(address)) set_page_writable(page_of(address + length - 1), false);
+}
+
+// Finds the other views of a watchpoint's bytes and protects them (and the
+// watched address again, when it is such memory: a new mapping there replaced
+// the protection).
+void update_views(Watchpoint& w, bool may_block) {
+  if (!g_view_finder || !w.armed.load()) return;
+  uint64_t found[Watchpoint::kMaxViews + 1];
+  const int n = g_view_finder(w.address, found, Watchpoint::kMaxViews + 1, may_block);
+  if (n < 0) return;  // busy: keep the views it had
+  uint64_t old[Watchpoint::kMaxViews];
+  const int old_count = std::min(w.views.load(), Watchpoint::kMaxViews);
+  std::memcpy(old, w.view, sizeof(uint64_t) * static_cast<size_t>(old_count));
+  uint64_t next[Watchpoint::kMaxViews];
+  int k = 0;
+  bool mapped_here = false;
+  for (int j = 0; j < n; ++j) {
+    if (found[j] == w.address) {
+      mapped_here = true;
+    } else if (k < Watchpoint::kMaxViews) {
+      next[k++] = found[j];
+    }
+  }
+  // Published before its pages are protected (a fault there must find it); a
+  // fault meanwhile sees old and new views, all of them still protected.
+  if (k > old_count) {
+    std::memcpy(w.view, next, sizeof(uint64_t) * static_cast<size_t>(k));
+    w.views.store(k);
+  } else {
+    w.views.store(k);
+    std::memcpy(w.view, next, sizeof(uint64_t) * static_cast<size_t>(k));
+  }
+  for (int j = 0; j < k; ++j) protect_range(w.view[j], w.length);
+  if (mapped_here) protect_range(w.address, w.length);
+  // A view that is gone but still maps memory (its page now shows other
+  // bytes) is no longer watched: give its page write access back.
+  for (int j = 0; j < old_count; ++j) {
+    bool kept = false;
+    for (int m = 0; m < k; ++m) kept |= page_of(next[m]) == page_of(old[j]);
+    uint64_t probe[1];
+    if (!kept && page_of(old[j]) != page_of(w.address) && g_view_finder(old[j], probe, 1, may_block) > 0)
+      set_page_writable(page_of(old[j]), true);
+  }
+}
+
 // Arms a reserved watchpoint (reserve_watchpoint) at `address`. Signal-safe.
 bool arm_reserved_watchpoint(int index, uint64_t address) {
   if (index < 0 || index >= g_watchpoint_count.load()) return false;
@@ -670,8 +739,8 @@ bool arm_reserved_watchpoint(int index, uint64_t address) {
   if (w.armed.load() || !safe_read(address, &probe, 1) || !safe_read(address + w.length - 1, &probe, 1)) return false;
   w.address = address;
   w.armed.store(true);
-  set_page_writable(page_of(address), false);
-  if (page_of(address + w.length - 1) != page_of(address)) set_page_writable(page_of(address + w.length - 1), false);
+  protect_range(address, w.length);
+  update_views(w, false);
   return true;
 }
 
@@ -715,9 +784,9 @@ void print_watchpoint_summary() {
     char now_text[64] = "not readable";
     if (w.armed.load() && safe_read(w.address, now, shown)) write_bytes(now_text, sizeof now_text, now, shown);
     if (w.armed.load())
-      std::snprintf(line, sizeof line, "  %s at %#llx: %llu writes, now %s\n", w.label,
+      std::snprintf(line, sizeof line, "  %s at %#llx: %llu writes, now %s%s\n", w.label,
                     static_cast<unsigned long long>(w.address), static_cast<unsigned long long>(w.writes.load()),
-                    now_text);
+                    now_text, w.views.load() ? " (also watched at its other mappings)" : "");
     else
       std::snprintf(line, sizeof line, "  %s: never armed\n", w.label);
     write_str(line);
@@ -729,8 +798,10 @@ void print_watchpoint_summary() {
       if (g_describer) g_describer(r.rip, where, sizeof where);
       write_bytes(before, sizeof before, r.before, shown);
       write_bytes(after, sizeof after, r.after, shown);
-      std::snprintf(line, sizeof line, "    #%llu by %s (guest thread %u): %s -> %s\n",
-                    static_cast<unsigned long long>(r.seq), where[0] ? where : "?", r.guest_thread, before, after);
+      char via[48] = {0};
+      if (r.via) std::snprintf(via, sizeof via, " via %#llx", static_cast<unsigned long long>(r.via));
+      std::snprintf(line, sizeof line, "    #%llu%s by %s (guest thread %u): %s -> %s\n",
+                    static_cast<unsigned long long>(r.seq), via, where[0] ? where : "?", r.guest_thread, before, after);
       write_str(line);
     }
   }
@@ -1016,9 +1087,16 @@ bool add_watchpoint(uint64_t address, uint32_t length, const char* label) {
   if (!safe_read(address, &probe, 1) || !safe_read(address + w.length - 1, &probe, 1)) return false;
   w.armed.store(true);
   g_watchpoint_count.store(i + 1);  // published before the first fault can happen
-  set_page_writable(page_of(address), false);
-  if (page_of(address + w.length - 1) != page_of(address)) set_page_writable(page_of(address + w.length - 1), false);
+  protect_range(address, w.length);
+  update_views(w, true);
   return true;
+}
+
+void set_view_finder(ViewFinder finder) { g_view_finder = finder; }
+
+void refresh_watchpoint_views() {
+  const int count = g_watchpoint_count.load();
+  for (int i = 0; i < count; ++i) update_views(g_watchpoints[i], true);
 }
 
 int reserve_watchpoint(uint32_t length, const char* label) {
@@ -1041,8 +1119,12 @@ bool overlaps_watched_page(uint64_t address, uint64_t size) {
   for (int i = 0; i < count; ++i) {
     const Watchpoint& w = g_watchpoints[i];
     if (!w.armed.load()) continue;
-    const uint64_t a = page_of(w.address), b = page_of(w.address + w.length - 1);
-    if (a <= last && b >= first) return true;
+    const int views = std::min(w.views.load(), Watchpoint::kMaxViews);
+    for (int v = -1; v < views; ++v) {
+      const uint64_t base = v < 0 ? w.address : w.view[v];
+      const uint64_t a = page_of(base), b = page_of(base + w.length - 1);
+      if (a <= last && b >= first) return true;
+    }
   }
   return false;
 }

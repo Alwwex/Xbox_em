@@ -246,7 +246,14 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                            "Submit #3: 19 requests so far"
                            "console.exe: 16 requests cover 0x0-0x8800 of 0x[0-9a-f]+ bytes; 1 gaps \\(0x7800 bytes\\): 0x800-0x8000"
                            "gap ending at 0x8000: memory 0x[0-9a-f]+-0x[0-9a-f]+ \\(0x7800 bytes\\) is all zero"
-                           "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this")
+                           "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this"
+                           "XMemFreePhysicalPages\\(0x380, .*\\(flags, &count, pages\\) 1 pages freed"
+                           "XMemFreePhysicalPages\\(0x280, .*no layout names allocated pages - nothing freed")
+    # A watchpoint on physical memory mapped twice also guards the other view.
+    xbem_guest_test(guest_console_watch_views COMMAND run ${GOUT}/console.exe --watch at:console.exe!watch_here:rcx+0x120/8
+                    EXPECT "armed at 0x[0-9a-f]+ \\(hit 1\\) in VirtualAlloc region .*; physical page 0x[0-9a-f]+, mapped at 2 address"
+                           "write 1 via 0x[0-9a-f]+ by console.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 00 00 00 5a 00 00 00 00 -> 66 00 00 5a"
+                           "PASS console")
   endif()
   if(Python3_Interpreter_FOUND)
     add_test(NAME guest_thread_dump

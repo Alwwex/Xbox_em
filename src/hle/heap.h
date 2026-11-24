@@ -26,6 +26,11 @@ bool virtual_free(void* address, uint64_t size, uint32_t type);
 bool describe_virtual_memory(uint64_t address, char* out, size_t out_size);
 // The same for blocks from XMemAlloc / XMemAllocDefault.
 bool describe_xmem_allocation(uint64_t address, char* out, size_t out_size);
+// Emulated physical memory: which physical page `address` maps and where else
+// that page is mapped (never blocks); and every address the byte at `address`
+// is mapped at (a platform::ViewFinder for watchpoints).
+bool describe_physical_page(uint64_t address, char* out, size_t out_size);
+int physical_views(uint64_t address, uint64_t* out, int max, bool may_block);
 size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
 
 // run --watch alloc:CALLER+OFFSET: a data watchpoint armed at `offset` into

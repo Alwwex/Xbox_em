@@ -289,6 +289,25 @@ arms a watchpoint when CODE first runs, at the address OPERAND names then
 allocation holds it (VirtualAlloc region or XMemAlloc block); XMemAlloc
 blocks of 1 MiB and more are logged with their caller.
 
+Run on `c852f61` with that watchpoint: armed at `0x7e48ebe00000`, in the
+title's 24 GiB reservation for physical pages (VirtualAlloc by
+`0x141e1d00f`, type `MEM_RESERVE | MEM_PHYSICAL | MEM_LARGE_PAGES`, the
+pool at +16 GiB); **no write through that address, yet at the crash it held
+the other shader's bytes** - the bytes changed through another mapping of
+the same physical page, or the address was mapped anew. Suspect: our
+`XMemFreePhysicalPages` decoding took `(count, pages)` first, so a call laid
+out like the allocation, `(flags 0x280/0x380, &count, pages)`, freed 0x280
+"pages" read from the count's stack slot: pages in use went back to the free
+list and the next allocation got them. Now the free tries
+`(flags, &count, pages)` first and only frees when every page named is
+allocated (otherwise it logs and frees nothing). The emulator tracks each
+physical page (allocated, the addresses it is mapped at) and logs mappings
+over another page without an unmap, second mappings of a page, frees of
+pages still mapped and maps of pages not allocated (first 16, then powers
+of two). A watchpoint on physical memory also guards the page's other
+mappings (`write N via ADDRESS`), and crash reports name the physical page
+of an address and where else it is mapped.
+
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
 the title loads the first chunk of each batch some other way, the pipeline

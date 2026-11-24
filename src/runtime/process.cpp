@@ -56,7 +56,15 @@ void print_thread_context(void (*write)(const char*)) {
 // reading through one shows up in crash reports).
 void describe_memory_for_reports(uint64_t address, char* out, size_t out_size) {
   out[0] = 0;
-  if (hle::describe_virtual_memory(address, out, out_size)) return;
+  if (hle::describe_virtual_memory(address, out, out_size)) {
+    const size_t used = std::strlen(out);
+    if (used + 2 < out_size) {
+      out[used] = ';';
+      out[used + 1] = ' ';
+      if (!hle::describe_physical_page(address, out + used + 2, out_size - used - 2)) out[used] = 0;
+    }
+    return;
+  }
   if (hle::describe_xmem_allocation(address, out, out_size)) return;
   uint64_t magic = 0;
   if ((address & 7) == 0 && platform::safe_read(address + 8, &magic, 8) && magic == hle::kProbeMagic) {
@@ -613,6 +621,7 @@ int Process::run() {
   platform::install_crash_handler(&describe_address);
   platform::install_thread_dump(&describe_address, &describe_call_site);
   platform::set_memory_describer(&describe_memory_for_reports);
+  platform::set_view_finder(&hle::physical_views);
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&print_thread_context);
   platform::set_backtrace_printer(&print_unwind_backtrace);
