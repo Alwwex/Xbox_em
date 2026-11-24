@@ -271,6 +271,34 @@ bool find_count_ptr_and_array(const uint64_t* a, int n, int& index, uint64_t& co
   return false;
 }
 
+// For the log: how a page array (or address array) is laid out - its first
+// entries, how many distinct values, the longest run of one value, and the
+// step between neighbours when it is constant.
+std::string summarize_array(const uint64_t* a, uint64_t count) {
+  if (!a || !count) return "-";
+  std::string out = "[";
+  for (uint64_t k = 0; k < count && k < 6; ++k) out += std::format("{}{:#x}", k ? " " : "", a[k]);
+  if (count > 6) out += " ...";
+  out += "]";
+  std::unordered_map<uint64_t, uint32_t> seen;
+  uint64_t longest = 1, run = 1, min = a[0], max = a[0];
+  bool constant_step = count > 1;
+  const uint64_t step = count > 1 ? a[1] - a[0] : 0;
+  for (uint64_t k = 0; k < count; ++k) {
+    ++seen[a[k]];
+    min = std::min(min, a[k]);
+    max = std::max(max, a[k]);
+    if (k) {
+      run = a[k] == a[k - 1] ? run + 1 : 1;
+      longest = std::max(longest, run);
+      constant_step &= a[k] - a[k - 1] == step;
+    }
+  }
+  out += std::format(" {} distinct, longest run {}, {:#x}..{:#x}", seen.size(), longest, min, max);
+  if (constant_step) out += std::format(", step {:#x}", step);
+  return out;
+}
+
 int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                                      uint64_t a4) {
   const uint64_t args[5] = {a0, a1, a2, a3, a4};
@@ -284,7 +312,7 @@ int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, u
     return success_value_for_caller(caller) == 0 ? E_INVALIDARG : FALSE;
   }
   auto* pages = reinterpret_cast<uint64_t*>(args[i + 1]);
-  uint64_t first = 0, reused = 0, total = 0;
+  uint64_t reused = 0, total = 0;
   {
     std::lock_guard lock(g_phys.mutex);
     if (!g_phys.init()) return success_value_for_caller(caller) == 0 ? E_OUTOFMEMORY : FALSE;
@@ -300,7 +328,6 @@ int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, u
       }
       g_phys.pages[page].allocated = true;
       pages[k] = kPfnBase + page;
-      if (k == 0) first = pages[k];
       ++g_phys.in_use;
     }
     total = g_phys.in_use;
@@ -310,9 +337,9 @@ int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, u
   if (log_event(calls.fetch_add(1) + 1))
     XBEM_WARN("xmem",
               "XMemAllocatePhysicalPages({:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {}: {} x 64K pages (count arg {}), "
-              "first {:#x}, {} reused; {} in use -> {}",
-              a0, a1, a2, a3, a4, describe_code_address(caller), count, i, first, reused, total,
-              ok == 0 ? "S_OK" : "TRUE");
+              "pages {}, {} reused; {} in use -> {}",
+              a0, a1, a2, a3, a4, describe_code_address(caller), count, i, summarize_array(pages, count), reused,
+              total, ok == 0 ? "S_OK" : "TRUE");
   return ok;
 }
 
@@ -434,21 +461,20 @@ void* XBEM_GUEST_ABI hle_XMemMapPhysicalPages(uint64_t va, uint64_t count, uint6
   // unmaps. Later registers hold unrelated values.
   const uint64_t* pages = plausible_pointer(a2) ? reinterpret_cast<const uint64_t*>(a2) : nullptr;
   bool ok = va != 0 && plausible_count(count) && (va % kPhysPageSize) == 0;
-  uint64_t first = 0;
   if (ok) {
     std::lock_guard lock(g_phys.mutex);
     for (uint64_t k = 0; k < count && ok; ++k) {
       const uint64_t page_va = va + k * kPhysPageSize;
       ok = pages ? map_page(page_va, pages[k], caller) : unmap_page(page_va);
     }
-    if (pages && count) first = pages[0];
   }
   platform::refresh_watchpoint_views();  // a new mapping replaced the protection of watched pages
   static std::atomic<uint64_t> calls{0};
-  if (log_event(calls.fetch_add(1) + 1) || !ok)
-    XBEM_WARN("xmem", "XMemMapPhysicalPages({:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {} -> {}{}", va, count, a2, a3, a4,
-              describe_code_address(caller), ok ? (pages ? "mapped" : "unmapped") : "FAILED",
-              pages ? std::format(" (first page {:#x})", first) : std::string());
+  const uint64_t n = calls.fetch_add(1) + 1;
+  if (log_event(n) || !ok)
+    XBEM_WARN("xmem", "XMemMapPhysicalPages({:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {} -> {} (call {}){}", va, count, a2,
+              a3, a4, describe_code_address(caller), ok ? (pages ? "mapped" : "unmapped") : "FAILED", n,
+              pages && plausible_count(count) ? "; pages " + summarize_array(pages, count) : std::string());
   if (!ok) {
     set_last_error(ERROR_INVALID_PARAMETER);
     return nullptr;
@@ -471,9 +497,14 @@ int32_t XBEM_GUEST_ABI hle_XMemMapPhysicalPagesScatter(uint64_t a0, uint64_t a1,
   }
   platform::refresh_watchpoint_views();
   static std::atomic<uint64_t> calls{0};
-  if (log_event(calls.fetch_add(1) + 1) || !ok)
-    XBEM_WARN("xmem", "XMemMapPhysicalPagesScatter({:#x}, {:#x}, {:#x}, {:#x}) from {} -> {}", a0, a1, a2, a3,
-              describe_code_address(caller), ok ? "mapped" : "FAILED");
+  const uint64_t n = calls.fetch_add(1) + 1;
+  const bool arrays = a0 >= 0x10000 && plausible_count(a1);
+  if (log_event(n) || !ok)
+    XBEM_WARN("xmem", "XMemMapPhysicalPagesScatter({:#x}, {:#x}, {:#x}, {:#x}) from {} -> {} (call {}){}{}", a0, a1, a2,
+              a3, describe_code_address(caller), ok ? "mapped" : "FAILED", n,
+              arrays ? "; addresses " + summarize_array(reinterpret_cast<const uint64_t*>(a0), a1) : std::string(),
+              arrays && a2 >= 0x10000 ? "; pages " + summarize_array(reinterpret_cast<const uint64_t*>(a2), a1)
+                                      : std::string());
   return ok ? success_value_for_caller(caller) : (success_value_for_caller(caller) == 0 ? E_INVALIDARG : FALSE);
 }
 
