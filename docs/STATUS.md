@@ -232,7 +232,26 @@ and created with device slot 16. All 1,215 failures return
 found in it). Leonida found 10 DXBC containers with `PRIV` embedded in the
 executable (1 VS, 9 PS); the shaders of `shaders.rpf` must get their root
 signatures from the cache, which is probably empty or missing when the
-effects load. Next: is `[0x1475ddb90]` set, and by whom.
+effects load.
+
+The cache (`[0x1475ddb90]`, set once at start by fn `0x938790`) is a
+`std::unordered_map<shader hash, root signature>` behind a reader/writer
+lock (`obj+0x270..+0x2b8`, lookup fn `0x140f9fe30`); only the fallback path
+fills it, so it starts empty - expected. The fallback's fn `0x14086f8e0`
+takes the shader's bytecode (`[shader+8]`, size `[shader+0x20]`, or reads
+it through the shader's stream) and, when it starts with `e7 dc`, inflates
+it: the shader container format is `u32 0x000DDCE7, u32 compressed size,
+u32 uncompressed size, raw deflate` -> DXBC with `PRIV` (checked: the
+`shaders.rpf` entry at `0x1039d2a8` inflates from `+0xc` to a 1736-byte
+DXBC). Shaders embedded in the executable work this way. For the failing
+shaders from `shaders.rpf` the bytecode in memory starts **32 bytes after
+the container header** (at `0x1039d2c8`, the header is at `0x1039d2a8`)
+and its size does not match the entry: the archive read that put it into
+GPU memory used the wrong file position. Found on the way: ReadFile and
+WriteFile with an OVERLAPPED on a synchronous handle did not move the file
+pointer (Windows does) - fixed. `run --log-reads shaders.rpf` logs every
+CreateFile/SetFilePointer(Ex)/ReadFile/DirectStorage request on the file
+(offset, size, destination, caller). Next: which read fetched `0x1039d2c8`.
 
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):

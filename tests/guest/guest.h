@@ -73,6 +73,7 @@ IMP DWORD GetModuleFileNameA(HANDLE, char*, DWORD);
 IMP int MultiByteToWideChar(unsigned, DWORD, const char*, int, WCHAR*, int);
 IMP HANDLE CreateFileA(const char*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
 IMP BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
+IMP BOOL SetFilePointerEx(HANDLE, int64_t, int64_t*, DWORD);
 IMP BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
 IMP BOOL GetFileSizeEx(HANDLE, int64_t*);
 IMP DWORD GetFileAttributesA(const char*);

@@ -48,6 +48,8 @@ void print_usage() {
       "                                  module+hex, a hex RVA or address, or alloc:CALLER+OFFSET -\n"
       "                                  OFFSET into the memory the function at CALLER allocates\n"
       "      --watch-log N               writes of each watchpoint logged as they happen (default 16)\n"
+      "      --log-reads TEXT            log CreateFile/SetFilePointer/ReadFile/DirectStorage on files\n"
+      "                                  whose path contains TEXT (offsets, sizes, destinations, callers)\n"
       "      --no-window                 no run window (by default one opens when DISPLAY is set:\n"
       "                                  status and the title's back buffer, WSLg on Windows 11)\n"
       "      --dump-shaders DIR          save the GPU shader binaries the title creates\n"

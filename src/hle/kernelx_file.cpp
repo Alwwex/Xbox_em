@@ -2,6 +2,7 @@
 // (see runtime/vfs.h for how guest paths map to host paths).
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -11,6 +12,8 @@
 #include <optional>
 #include <vector>
 
+#include "hle/discovery.h"
+#include "hle/file_log.h"
 #include "hle/hle_util.h"
 #include "platform/crash.h"
 
@@ -51,7 +54,10 @@ class FileObject final : public rt::KernelObject {
   std::mutex mutex;
   std::FILE* file = nullptr;
   fs::path path;
+  std::string guest_path;
   bool writable = false;
+  bool overlapped = false;  // FILE_FLAG_OVERLAPPED: the handle keeps no file pointer
+  bool log_reads = false;   // --log-reads matched its name
   uint64_t position = 0;
 };
 
@@ -101,6 +107,12 @@ uint64_t to_filetime(fs::file_time_type t) {
 }
 
 // ------------------------------------------------------------- open/close
+
+// --log-reads: file operations on files whose guest path contains the
+// pattern (case-insensitive) are logged, the first 600 of them.
+std::string g_read_log_pattern;
+std::atomic<int> g_read_log_count{0};
+constexpr int kReadLogLimit = 600;
 
 // Files the title opens and does not find (the first 64), with the host path
 // they map to: a missing or misnamed file shows up here.
@@ -193,7 +205,13 @@ HANDLE create_file(const std::string& guest_path, DWORD access, DWORD dispositio
   auto obj = std::make_shared<FileObject>();
   obj->file = f;
   obj->path = r->host_path;
+  obj->guest_path = guest_path;
   obj->writable = mode[0] == 'w' || mode[1] == '+';
+  obj->overlapped = (flags & 0x40000000u) != 0;  // FILE_FLAG_OVERLAPPED
+  obj->log_reads = file_reads_logged(guest_path);
+  if (obj->log_reads)
+    XBEM_INFO("read", "CreateFile({}, access {:#x}, disposition {}, flags {:#x}) from {}", guest_path, access,
+              disposition, flags, describe_code_address(XBEM_RETURN_ADDRESS()));
   set_last_error(success_error);
   return proc().handles().insert(obj);
 }
@@ -256,7 +274,12 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
     }
   }
   if (ov) complete_overlapped(ov, got);
-  else f->position += got;
+  // A synchronous handle keeps its file pointer after the bytes read, also
+  // when the read gave an offset in an OVERLAPPED (Windows semantics).
+  if (!f->overlapped) f->position = offset + got;
+  if (f->log_reads && take_read_log_slot())
+    XBEM_INFO("read", "{} ReadFile at {:#x} size {:#x}{} -> {:#x} bytes into {} from {}", f->guest_path, offset,
+              count, ov ? " (OVERLAPPED)" : "", got, buffer, describe_code_address(XBEM_RETURN_ADDRESS()));
   if (read) *read = static_cast<DWORD>(got);
   return TRUE;  // reading at EOF succeeds with 0 bytes
 }
@@ -283,7 +306,7 @@ BOOL XBEM_GUEST_ABI hle_WriteFile(HANDLE h, const void* buffer, DWORD count, DWO
   size_t put = 0;
   if (seek_host(f->file, offset)) put = std::fwrite(buffer, 1, count, f->file);
   if (ov) complete_overlapped(ov, put);
-  else f->position += put;
+  if (!f->overlapped) f->position = offset + put;
   if (written) *written = static_cast<DWORD>(put);
   return put == count ? TRUE : FALSE;
 }
@@ -357,6 +380,9 @@ BOOL XBEM_GUEST_ABI hle_SetFilePointerEx(HANDLE h, LONGLONG distance, LONGLONG* 
     set_last_error(ERROR_INVALID_PARAMETER);
     return FALSE;
   }
+  if (f->log_reads && take_read_log_slot())
+    XBEM_INFO("read", "{} SetFilePointerEx({:#x}, method {}) -> {:#x} from {}", f->guest_path, distance, method, pos,
+              describe_code_address(XBEM_RETURN_ADDRESS()));
   if (new_pos) *new_pos = static_cast<LONGLONG>(pos);
   return TRUE;
 }
@@ -371,6 +397,9 @@ DWORD XBEM_GUEST_ABI hle_SetFilePointer(HANDLE h, LONG distance, LONG* high, DWO
     set_last_error(ERROR_INVALID_PARAMETER);
     return 0xFFFFFFFF;
   }
+  if (f->log_reads && take_read_log_slot())
+    XBEM_INFO("read", "{} SetFilePointer({:#x}, method {}) -> {:#x} from {}", f->guest_path, d, method, pos,
+              describe_code_address(XBEM_RETURN_ADDRESS()));
   if (high) *high = static_cast<LONG>(pos >> 32);
   set_last_error(ERROR_SUCCESS);
   return static_cast<DWORD>(pos);
@@ -861,6 +890,22 @@ void add_kernelx_file_exports(std::vector<ExportDef>& out) {
       XBEM_HLE(CreateHardLinkW), XBEM_HLE(CreateSymbolicLinkW), XBEM_HLE_STUB(SetNamedPipeHandleState),
       XBEM_HLE_STUB(WaitNamedPipeW),
   });
+}
+
+void set_file_read_log(const std::string& pattern) { g_read_log_pattern = pattern; }
+
+bool file_reads_logged(const std::string& guest_path) {
+  if (g_read_log_pattern.empty()) return false;
+  std::string a = guest_path, b = g_read_log_pattern;
+  for (char& c : a) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  for (char& c : b) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return a.find(b) != std::string::npos;
+}
+
+bool take_read_log_slot() {
+  const int n = g_read_log_count.fetch_add(1);
+  if (n == kReadLogLimit) XBEM_INFO("read", "(further file operations are not logged)");
+  return n < kReadLogLimit;
 }
 
 }  // namespace xbem::hle

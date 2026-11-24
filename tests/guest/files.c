@@ -27,6 +27,16 @@ DWORD guest_main(void* peb) {
   CHECK(GetFileSizeEx(f, &size) && size == 18);
   CloseHandle(f);
 
+  /* A synchronous handle keeps a file pointer: after a read at an OVERLAPPED
+   * offset it points behind the bytes read (Windows semantics). */
+  f = CreateFileA("G:\\Content\\Data.TXT", GENERIC_READ, 1, 0, OPEN_EXISTING, 0, 0);
+  struct { uint64_t internal, internal_high; DWORD offset, offset_high; HANDLE event; } ov = {0, 0, 6, 0, 0};
+  CHECK(ReadFile(f, buf, 4, &got, &ov) && got == 4 && buf[0] == 'f' && buf[3] == 'm'); /* "from" */
+  CHECK(ReadFile(f, buf, 3, &got, 0) && got == 3 && buf[0] == '-' && buf[1] == 'p');    /* continues: "-pa" */
+  int64_t pos = 0;
+  CHECK(SetFilePointerEx(f, 0, &pos, 1) && pos == 13);
+  CloseHandle(f);
+
   CHECK(GetFileAttributesA("G:\\Content") == 0x10);
   CHECK(GetFileAttributesA("G:\\nope.bin") == 0xFFFFFFFFu);
   CHECK(GetLastError() == 2);

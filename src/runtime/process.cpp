@@ -14,6 +14,7 @@
 #include "common/strings.h"
 #include "hle/guest_types.h"
 #include "hle/d3d12_device.h"
+#include "hle/file_log.h"
 #include "hle/heap.h"
 #include "hle/probe_com.h"
 #include "hle/registry.h"
@@ -569,6 +570,7 @@ int Process::run() {
   arm_tracepoints(*loader_, options_.trace_at);
   platform::set_watchpoint_log_writes(options_.watch_log_writes);
   arm_watchpoints(*loader_, options_.watch);
+  hle::set_file_read_log(options_.log_reads);
   g_run_start = std::chrono::steady_clock::now();
   if (options_.window) {
     std::string reason;

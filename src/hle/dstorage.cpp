@@ -32,6 +32,7 @@
 #include "common/strings.h"
 #include "hle/d3d12_device.h"
 #include "hle/discovery.h"
+#include "hle/file_log.h"
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
 #include "hle/registry.h"
@@ -219,6 +220,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     std::lock_guard lock(file->coverage_mutex);
     file->dest_by_offset[offset] = {reinterpret_cast<uint64_t>(dest), dest_size};
   }
+  if (file_reads_logged(file->guest_path) && take_read_log_slot())
+    XBEM_INFO("read", "{} DirectStorage at {:#x} size {:#x} (uncompressed {:#x}, compression {}) into {} size {:#x} from {}",
+              file->guest_path, offset, source_size, uncompressed_size, compression, static_cast<void*>(dest),
+              dest_size, describe_code_address(caller));
   if (log)
     XBEM_INFO("dstorage",
               "  -> {} offset {:#x} size {:#x} (uncompressed {:#x}), compression {}, dest {} size {:#x}",

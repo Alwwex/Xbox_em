@@ -217,6 +217,11 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_tls COMMAND run ${GOUT}/tls.exe EXPECT "PASS tls")
   xbem_guest_test(guest_dlls COMMAND run ${GOUT}/dlls.exe EXPECT "gamelib.dll: relocated" "PASS dlls")
   xbem_guest_test(guest_files_package COMMAND run ${PKG} EXPECT "title: Files Test" "PASS files")
+  xbem_guest_test(guest_files_read_log COMMAND run ${PKG} --log-reads data.txt
+                  EXPECT "read. CreateFile\\(G:.Content.Data.TXT, access 0x80000000, disposition 3, flags 0x0\\)"
+                         "Data.TXT ReadFile at 0x6 size 0x4 \\(OVERLAPPED\\) -> 0x4 bytes into 0x[0-9a-f]+ from files.exe\\+0x"
+                         "Data.TXT ReadFile at 0xa size 0x3 -> 0x3 bytes"
+                         "Data.TXT SetFilePointerEx\\(0x0, method 1\\) -> 0xd" "PASS files")
   xbem_guest_test(guest_xgameruntime COMMAND run ${GOUT}/xgr.exe EXPECT "device type=7" "PASS xgr")
   xbem_guest_test(guest_xgameruntime_series_s COMMAND run ${GOUT}/xgr.exe --device series-s
                   EXPECT "device type=6" "PASS xgr")

@@ -39,6 +39,7 @@ EXPORTS
   LoadLibraryA
   GetModuleFileNameA
   GetCommandLineA
+  SetFilePointerEx
   MultiByteToWideChar
   CreateFileA
   ReadFile
