@@ -221,6 +221,13 @@ program is destroyed and null returned. The failing calls never reach
 emulated code (R11 keeps the title's value), so `0x142476e20` rejects them
 on its own. Next: its code.
 
+The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
+data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
+the title loads the first chunk of each batch some other way, the pipeline
+library is complete in memory - not the cause. fn `0x142476d40` only fills
+`program+0x30`: the four stage pointers, the slot index of each non-null
+one at `+0x50..+0x53` (0xff = none) and counts; it cannot fail.
+
 ## Known approximations
 
 - Textures are linear, not tiled: sizes differ from the console's, which is
