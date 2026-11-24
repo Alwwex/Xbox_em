@@ -219,7 +219,20 @@ objects, `+0x30` the stages via `0x142476d40`, `+0x60` cfg, `+0x68` hash,
 count) and calls **`0x142476e20(program)`**: when that returns false the
 program is destroyed and null returned. The failing calls never reach
 emulated code (R11 keeps the title's value), so `0x142476e20` rejects them
-on its own. Next: its code.
+on its own.
+
+fn `0x142476e20` looks the program's root signature up in a global cache
+(`[0x1475ddb90]`, `0x140f9fe30` with the first shader's `+0x18` hash);
+on a miss it takes the shader's bytecode (`0x14086f8e0`) and fn
+`0x140fa09f0` extracts the root signature from it: a `DXBC` container
+with a `PRIV` part starting `0xDC 0xE2` (a 32-bit key, then compressed
+data unpacked by `0x1455ac630`), cached in a `std::map` (`0x1475e7760`)
+and created with device slot 16. All 1,215 failures return
+`E_NOINTERFACE`: the bytecode is not DXBC (1017 bytes, no deflate stream
+found in it). Leonida found 10 DXBC containers with `PRIV` embedded in the
+executable (1 VS, 9 PS); the shaders of `shaders.rpf` must get their root
+signatures from the cache, which is probably empty or missing when the
+effects load. Next: is `[0x1475ddb90]` set, and by whom.
 
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
@@ -227,6 +240,17 @@ the title loads the first chunk of each batch some other way, the pipeline
 library is complete in memory - not the cause. fn `0x142476d40` only fills
 `program+0x30`: the four stage pointers, the slot index of each non-null
 one at `+0x50..+0x53` (0xff = none) and counts; it cannot fail.
+
+## Run window
+
+`xbem run` opens a window when `DISPLAY` is set (WSLg on Windows 11
+provides an X server; libX11 is loaded at run time, `--no-window` skips
+it): status lines (uptime, guest threads, frame events, command lists,
+draws and dispatches recorded) and the title's first display surface - the
+first 2D texture created with `D3D12_HEAP_FLAG_ALLOW_DISPLAY` - scaled to
+960x540 (`src/platform/window.*`). There is no renderer yet, so the
+title's back buffer stays black; the guest test `present.exe` (`-- wait`)
+fills one with a test pattern to see the path work.
 
 ## Known approximations
 

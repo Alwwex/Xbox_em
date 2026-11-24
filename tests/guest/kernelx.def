@@ -38,6 +38,7 @@ EXPORTS
   GetProcAddress
   LoadLibraryA
   GetModuleFileNameA
+  GetCommandLineA
   MultiByteToWideChar
   CreateFileA
   ReadFile

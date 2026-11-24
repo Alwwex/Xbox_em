@@ -24,4 +24,11 @@ void* make_root_signature_deserializer(const gpu::RootSignature& rs);
 // `iid`: the interface ID the title asked for (QueryInterface with it returns the device).
 void* create_headless_d3d12_device(const void* iid);
 
+// What the title has asked of the GPU so far (the run window shows it):
+// frame events waited on, command lists created, draws and dispatches recorded.
+struct D3d12Counters {
+  uint64_t frames, command_lists, draws, dispatches;
+};
+D3d12Counters d3d12_counters();
+
 }  // namespace xbem::hle

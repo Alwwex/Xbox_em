@@ -13,11 +13,13 @@
 #include "common/log.h"
 #include "common/strings.h"
 #include "hle/guest_types.h"
+#include "hle/d3d12_device.h"
 #include "hle/heap.h"
 #include "hle/probe_com.h"
 #include "hle/registry.h"
 #include "platform/crash.h"
 #include "platform/memory.h"
+#include "platform/window.h"
 #include "runtime/seh.h"
 
 namespace xbem::rt {
@@ -433,6 +435,24 @@ void arm_watchpoints(ModuleLoader& loader, const std::vector<std::string>& specs
   }
 }
 
+// The run window's status lines.
+std::chrono::steady_clock::time_point g_run_start;
+std::vector<std::string> window_status_lines() {
+  std::vector<std::string> lines;
+  Process* p = Process::current_or_null();
+  const auto seconds =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_run_start).count();
+  LoadedModule* main = p ? p->loader().main_module() : nullptr;
+  lines.push_back(std::format("{} - running for {} s, {} guest threads", main ? main->name : std::string("?"),
+                              seconds, p ? p->guest_thread_count() : 0));
+  const hle::D3d12Counters c = hle::d3d12_counters();
+  lines.push_back(std::format("frame events {}, command lists {}, draws {}, dispatches {} (recorded, not executed)",
+                              c.frames, c.command_lists, c.draws, c.dispatches));
+  lines.push_back("GPU: headless D3D12.X - there is no renderer yet, so nothing is drawn");
+  lines.push_back("log: the terminal or the file the output goes to; crash reports end the run");
+  return lines;
+}
+
 std::string quote_arg(const std::string& a) {
   if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
   std::string out = "\"";
@@ -549,6 +569,14 @@ int Process::run() {
   arm_tracepoints(*loader_, options_.trace_at);
   platform::set_watchpoint_log_writes(options_.watch_log_writes);
   arm_watchpoints(*loader_, options_.watch);
+  g_run_start = std::chrono::steady_clock::now();
+  if (options_.window) {
+    std::string reason;
+    if (platform::window_open(std::format("xbem - {}", main->name), &window_status_lines, reason))
+      XBEM_INFO("window", "run window opened (--no-window runs without it)");
+    else
+      XBEM_INFO("window", "no run window: {}", reason);
+  }
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

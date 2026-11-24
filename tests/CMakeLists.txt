@@ -83,7 +83,7 @@ add_custom_command(
   COMMENT "Guest DLL tlsdll.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll ${GOUT}/tlsdll.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang breakpoint watch)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang breakpoint watch present)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "system")
@@ -93,6 +93,10 @@ foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhand
   if(prog STREQUAL "tls")
     set(extra_libs -ltlsdll -lkernelx)
     list(APPEND extra_deps ${GOUT}/libtlsdll.a)
+  endif()
+  if(prog STREQUAL "present")
+    set(extra_libs -ld3d12_xs -lkernelx)
+    list(APPEND extra_deps ${GOUT}/libd3d12_xs.a)
   endif()
   if(prog STREQUAL "dlls")
     set(extra_libs -lgamelib -lkernelx)
@@ -275,6 +279,10 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                          "\\[watch\\] alloc by watch.exe!alloc_block \\+0x2008 \\(0x[0-9a-f]+\\): write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 00 00 00 00 00 00 00 00 -> 88 77 66 55 44 33 22 11"
                          "#0  watch.exe\\+0x[0-9a-f]+  .fn 0x"
                          "the length must be 1..64 bytes" "expected alloc:CALLER\\+OFFSET" "PASS watch")
+  # The run window's display surface: a back buffer made like the title's
+  # (no DISPLAY in tests: the window is reported as not opened).
+  xbem_guest_test(guest_present COMMAND run ${GOUT}/present.exe
+                  EXPECT "CreateCommittedResource3\\(dim 3 3840x2160 format 28, heap flags 0x8" "run window" "PASS present")
   # A condition that never holds: hits are counted, none logged or recorded.
   xbem_guest_test(guest_tracepoint_condition COMMAND run ${GOUT}/crash.exe --trace-at crash.exe!call_fault?rcx!=10
                   EXIT 139 EXPECT "crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\) if rcx!=10: 1 hits, 0 matched")

@@ -36,6 +36,7 @@
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
 #include "platform/memory.h"
+#include "platform/window.h"
 
 namespace xbem::hle {
 namespace {
@@ -477,8 +478,35 @@ alignas(4096) uint8_t g_inline_command_sink[0x10000];
 
 constexpr size_t kListCursor = 0x18, kListDispatchLimit = 0x28, kListLimit = 0x30;
 
+// Counted for the run window and logs: no renderer executes them yet.
+std::atomic<uint64_t> g_command_lists{0}, g_draws{0}, g_dispatches{0};
+
+// 12 DrawInstanced(vertices, instances, start vertex, start instance),
+// 13 DrawIndexedInstanced(indices, instances, start index, base vertex, start
+// instance), 14 Dispatch(x, y, z): the PC order, confirmed by the title's
+// calls (a fullscreen pass draws 3 vertices, 1 instance).
+void XBEM_GUEST_ABI list_draw_instanced(ProbeObject* self, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+  g_draws.fetch_add(1);
+  probe_log(self, 12, std::format("DrawInstanced({} vertices, {} instances)", vertices, instances),
+            XBEM_RETURN_ADDRESS());
+}
+void XBEM_GUEST_ABI list_draw_indexed_instanced(ProbeObject* self, uint32_t indices, uint32_t instances, uint32_t,
+                                                int32_t, uint32_t) {
+  g_draws.fetch_add(1);
+  probe_log(self, 13, std::format("DrawIndexedInstanced({} indices, {} instances)", indices, instances),
+            XBEM_RETURN_ADDRESS());
+}
+void XBEM_GUEST_ABI list_dispatch(ProbeObject* self, uint32_t x, uint32_t y, uint32_t z) {
+  g_dispatches.fetch_add(1);
+  probe_log(self, 14, std::format("Dispatch({}, {}, {})", x, y, z), XBEM_RETURN_ADDRESS());
+}
+const ProbeVtable g_command_list_vtable = make_vtable({{12, fn(&list_draw_instanced)},
+                                                       {13, fn(&list_draw_indexed_instanced)},
+                                                       {14, fn(&list_dispatch)}});
+
 void* new_command_list() {
-  auto* list = static_cast<ProbeObject*>(make_probe_object(child_name("command_list")));
+  g_command_lists.fetch_add(1);
+  auto* list = static_cast<ProbeObject*>(make_probe_object(child_name("command_list"), &g_command_list_vtable));
   const uint64_t sink = reinterpret_cast<uint64_t>(g_inline_command_sink);
   for (const size_t off : {kListCursor, kListDispatchLimit, kListLimit})
     std::memcpy(reinterpret_cast<uint8_t*>(list) + off, &sink, 8);
@@ -898,6 +926,15 @@ HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* he
   const uint64_t args[6] = {a4, a5, a6, a7, a8, a9};
   void** out = find_output_after_iid(args, kTrailing, 0);
   void* resource = out ? new_resource(child_name("texture"), desc) : nullptr;
+  // The first 2D texture with D3D12_HEAP_FLAG_ALLOW_DISPLAY (0x8) is a back
+  // buffer: the run window shows it.
+  static std::atomic<bool> have_display_surface{false};
+  if (resource && (heap_flags & 0x8) && d[0] == 3 && !have_display_surface.exchange(true)) {
+    const auto* r = static_cast<ResourceState*>(static_cast<ProbeObject*>(resource)->state);
+    const FormatInfo fi = format_info(f);
+    const uint64_t pitch = (w * fi.bytes + 255) & ~255ull;
+    if (r->cpu && !fi.block) platform::window_set_surface(r->cpu, static_cast<uint32_t>(w), h, pitch, f);
+  }
   probe_log(self, Slot,
             std::format("CreateCommittedResource{}(dim {} {}x{} format {}, heap flags {:#x}, state/layout {:#x}, "
                         "clear value {:#x}) -> {}{}",
@@ -1015,6 +1052,10 @@ const ProbeVtable g_device_vtable = make_vtable({
 });
 
 }  // namespace
+
+D3d12Counters d3d12_counters() {
+  return {g_frame_token.load() - 1, g_command_lists.load(), g_draws.load(), g_dispatches.load()};
+}
 
 void* create_headless_d3d12_device(const void* iid) {
   if (iid) {

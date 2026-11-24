@@ -39,6 +39,7 @@ struct ProcessOptions {
   std::filesystem::path dump_shaders_dir;  // save shader binaries the title creates
   std::vector<std::string> trace_at;  // code tracepoints: module!export[+off], module+off, or an offset in the exe
   int trace_log_hits = 8;             // hits of each tracepoint logged as they happen
+  bool window = true;                 // open the run window when a display is available
   std::vector<std::string> watch;    // data watchpoints: ADDRESS[/len] or alloc:CALLER+OFFSET[/len]
   int watch_log_writes = 16;          // writes of each watchpoint logged as they happen
   DeviceType device = DeviceType::XboxScarlettAnaconda;
@@ -127,6 +128,10 @@ class Process {
   Vfs& vfs() { return vfs_; }
   TrampolinePool& trampolines() { return trampolines_; }
   const ProcessOptions& options() const { return options_; }
+  size_t guest_thread_count() {
+    std::lock_guard lock(threads_mutex_);
+    return threads_.size();
+  }
   const package::PackageLayout& layout() const { return layout_; }
 
   uint8_t* peb() const { return peb_; }

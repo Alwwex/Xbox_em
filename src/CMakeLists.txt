@@ -9,6 +9,7 @@ add_library(xbem_core STATIC
   platform/cpu.cpp
   platform/thread.cpp
   platform/crash.cpp
+  platform/window.cpp
 
   loader/pe_image.cpp
 
@@ -59,7 +60,7 @@ add_library(xbem_core STATIC
 )
 
 target_include_directories(xbem_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(xbem_core PUBLIC Threads::Threads)
+target_link_libraries(xbem_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 if(MSVC)
   target_compile_options(xbem_core PUBLIC /W4 /utf-8 /permissive- /Zc:__cplusplus)

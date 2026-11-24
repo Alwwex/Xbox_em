@@ -12,6 +12,7 @@ layers, built in this order:
 | **Root signatures** (`src/gpu/root_signature.*`) – D3D12 descriptions 1.0/1.1/1.2 parsed from guest memory, serialized as DXBC/RTS0 (`D3D12Serialize[Versioned]RootSignature`), read back by `CreateRootSignature` and the deserializer; the console's `0x03000000` flag bits are kept | done |
 | Shader container parsing – locate the RDNA2 program, resource bindings and input/output layout inside the console shader blobs | next (needs captured shaders) |
 | RDNA2 → SPIR-V translation – scalar/vector ALU, memory (buffer, image, LDS), control flow (exec mask, branches), exports | planned |
+| Run window (`src/platform/window.*`) – X11 window (WSLg) with status and the title's display surface (first `ALLOW_DISPLAY` texture), scaled | done (shows the surface memory; nothing renders into it yet) |
 | Vulkan backend – D3D12 objects mapped to Vulkan: queues, command buffers, descriptors, pipelines; presentation to a window | planned |
 | Console specifics – ESRAM-less unified memory, GPU virtual addresses chosen by the title, tiling/swizzle (XG), frame pacing (PresentX) | planned |
 

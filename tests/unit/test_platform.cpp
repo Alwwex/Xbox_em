@@ -2,6 +2,7 @@
 #include <cstring>
 
 #include "platform/memory.h"
+#include "platform/window.h"
 #include "test.h"
 
 using namespace xbem;
@@ -43,3 +44,20 @@ TEST(patch_cache_hint_instructions) {
   platform::unmap(page, platform::page_size());
 }
 #endif
+
+// The run window converts the title's back buffer rows to 0x00RRGGBB.
+TEST(window_surface_row_conversion) {
+  const uint8_t rgba[8] = {0x10, 0x20, 0x30, 0xff, 0xa0, 0xb0, 0xc0, 0xff};
+  uint32_t out[2] = {};
+  CHECK(xbem::platform::convert_surface_row(rgba, 28, 2, 1, out));  // R8G8B8A8_UNORM
+  CHECK(out[0] == 0x102030u && out[1] == 0xa0b0c0u);
+  CHECK(xbem::platform::convert_surface_row(rgba, 87, 1, 2, out));  // B8G8R8A8, every 2nd pixel
+  CHECK(out[0] == 0x302010u);
+  const uint32_t r10[1] = {0x3ffu | (0x200u << 10) | (0u << 20)};  // R10G10B10A2: red full, green half
+  CHECK(xbem::platform::convert_surface_row(reinterpret_cast<const uint8_t*>(r10), 24, 1, 1, out));
+  CHECK(out[0] == 0xff8000u);
+  const uint16_t half[4] = {0x3c00, 0x3800, 0x0000, 0x3c00};  // 1.0, 0.5, 0.0 (R16G16B16A16_FLOAT)
+  CHECK(xbem::platform::convert_surface_row(reinterpret_cast<const uint8_t*>(half), 10, 1, 1, out));
+  CHECK(out[0] == 0xff8000u);
+  CHECK(!xbem::platform::convert_surface_row(rgba, 71, 1, 1, out));  // BC1: not shown
+}

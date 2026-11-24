@@ -624,6 +624,8 @@ int cmd_run(const Args& args) {
         if (comma > start) opt.watch.push_back(list.substr(start, comma - start));
         start = comma + 1;
       }
+    } else if (a == "--no-window") {
+      opt.window = false;
     } else if (a == "--watch-log") {
       opt.watch_log_writes = std::stoi(value());
     } else if (a == "--device") {
