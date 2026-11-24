@@ -872,6 +872,68 @@ void print_tracepoint_summary() {
     write_hit(g_tracepoints[refs[k].tp], g_tracepoints[refs[k].tp].ring[refs[k].slot], "  ");
 }
 
+// int3 in a title is usually an assertion: the first ones logged get the
+// registers, a short backtrace and the text the assertion was about - strings
+// registers point at, and strings the code just before loaded with
+// lea reg, [rip+disp32].
+constexpr int kBreakpointDetails = 32;
+
+// A printable ASCII or UTF-16LE string at `address` (at least 4 characters).
+bool read_text(uint64_t address, char* out, size_t out_size) {
+  uint8_t raw[192];
+  if (address < 0x10000 || !safe_read(address, raw, sizeof raw)) {
+    if (address < 0x10000 || !safe_read(address, raw, 64)) return false;
+    std::memset(raw + 64, 0, sizeof raw - 64);
+  }
+  const auto printable = [](uint8_t c) { return c >= 0x20 && c < 0x7f; };
+  size_t n = 0;
+  const bool wide = printable(raw[0]) && raw[1] == 0 && printable(raw[2]) && raw[3] == 0;
+  const size_t step = wide ? 2 : 1;
+  for (size_t k = 0; k + step <= sizeof raw && n + 1 < out_size && n < 96; k += step) {
+    if (!printable(raw[k]) || (wide && raw[k + 1] != 0)) break;
+    out[n++] = static_cast<char>(raw[k]);
+  }
+  out[n] = 0;
+  return n >= 4;
+}
+
+void write_breakpoint_details(ucontext_t* uc, uint64_t at) {
+  const greg_t* g = uc->uc_mcontext.gregs;
+  uint64_t gpr[16];
+  for (int k = 0; k < 16; ++k) gpr[k] = static_cast<uint64_t>(g[kUnwindOrder[k]]);
+  char line[600], regs[400], text[100];
+  format_regs(regs, sizeof regs, gpr, 0, 8);
+  std::snprintf(line, sizeof line, "      %s\n", regs);
+  write_str(line);
+  format_regs(regs, sizeof regs, gpr, 8, 16);
+  std::snprintf(line, sizeof line, "      %s\n", regs);
+  write_str(line);
+  for (int k = 0; k < 16; ++k)
+    if (k != 4 && read_text(gpr[k], text, sizeof text)) {
+      std::snprintf(line, sizeof line, "      %s -> \"%s\"\n", kRegNames[k], text);
+      write_str(line);
+    }
+  // lea r64, [rip+disp32] in the 96 bytes before the int3: REX.W(+R) 8D, ModRM 00 reg 101.
+  uint8_t code[96];
+  if (at >= sizeof code && safe_read(at - sizeof code, code, sizeof code)) {
+    for (size_t p = 0; p + 7 <= sizeof code; ++p) {
+      if ((code[p] != 0x48 && code[p] != 0x4C) || code[p + 1] != 0x8D || (code[p + 2] & 0xC7) != 0x05) continue;
+      int32_t disp;
+      std::memcpy(&disp, code + p + 3, 4);
+      const uint64_t insn = at - sizeof code + p;
+      const uint64_t target = insn + 7 + static_cast<int64_t>(disp);
+      if (!read_text(target, text, sizeof text)) continue;
+      char where[256] = {0};
+      if (g_describer) g_describer(insn, where, sizeof where);
+      std::snprintf(line, sizeof line, "      lea at %s -> \"%s\"\n", where[0] ? where : "?", text);
+      write_str(line);
+    }
+  }
+  const DumpSlot* slot = slot_of_tid(current_tid());
+  if (g_backtrace_printer && slot && slot->stack_high)
+    g_backtrace_printer(gpr, at, slot->stack_low, slot->stack_high, 6, &write_str);
+}
+
 void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
 #if defined(__x86_64__)
   if (sig == SIGSEGV && handle_watch_fault(info, static_cast<ucontext_t*>(ctx_raw))) return;
@@ -882,9 +944,16 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
     char line[320], where[256] = {0};
     const uint64_t rip = static_cast<uint64_t>(static_cast<ucontext_t*>(ctx_raw)->uc_mcontext.gregs[REG_RIP]);
     if (g_describer) g_describer(rip - 1, where, sizeof where);
+    static std::atomic<int> detailed{0};
+    const bool details = detailed.fetch_add(1) < kBreakpointDetails;
+    if (details) lock_print();
     std::snprintf(line, sizeof line, "[warn ][crash] int3 breakpoint at %s ignored (--continue-after-breakpoint)\n",
                   where[0] ? where : "?");
     write_str(line);
+    if (details) {
+      write_breakpoint_details(static_cast<ucontext_t*>(ctx_raw), rip - 1);
+      unlock_print();
+    }
     return;
   }
 #endif

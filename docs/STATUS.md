@@ -157,6 +157,15 @@ address (as in MapUserPhysicalPagesScatter) - fixed for both map calls.
 `xrefs` now also lists direct calls/jumps to an address and 8-byte pointers
 to it in data sections (vtables), to find who calls the setter.
 
+Run on `778d93b`: the scatter unmap no longer fails. The setter (fn
+`0x5a6f390`: allocate 0x1008 bytes, construct, store) has one caller, fn
+`0x2425c90` +0x2d1, and the tracepoint on it never hit - the same function
+hits an **assertion (int3) at +0x164** (`game+0x2425df4`) first. Other
+int3s in that run: `+0x247af2d`, `+0x43ad94e`, `+0x43a657e`, `+0x25a4ca0`.
+The first 32 ignored int3s are now logged with registers, a backtrace and
+the strings registers point at and the code before loaded with
+`lea reg, [rip+disp32]` (assertion messages).
+
 Earlier crash (fixed by the PFN change):
 
 `game_scarlett_master.exe+0xb5a5f8` (fn `0xb5a5d0`, the title's graphics

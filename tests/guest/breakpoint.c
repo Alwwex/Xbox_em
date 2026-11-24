@@ -5,7 +5,8 @@
 DWORD guest_main(void* peb) {
   (void)peb;
   say("before breakpoint");
-  __asm__ volatile("int3");
+  /* Like a title's assertion: the message in a register, loaded just before. */
+  __asm__ volatile("int3" ::"c"("assertion: budget exceeded"));
   say("after breakpoint");
   return (DWORD)finish("breakpoint");
 }

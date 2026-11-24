@@ -244,7 +244,8 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_breakpoint_crash COMMAND run ${GOUT}/breakpoint.exe EXIT 133
                   EXPECT "SIGTRAP \\(int3 breakpoint" "RIP=.*breakpoint.exe\\+0x")
   xbem_guest_test(guest_breakpoint_continue COMMAND run ${GOUT}/breakpoint.exe --continue-after-breakpoint
-                  EXPECT "int3 breakpoint at breakpoint.exe\\+0x[0-9a-f]+ ignored" "PASS breakpoint")
+                  EXPECT "int3 breakpoint at breakpoint.exe\\+0x[0-9a-f]+ ignored" "rcx -> \"assertion: budget exceeded\""
+                         "lea at breakpoint.exe\\+0x[0-9a-f]+ -> \"assertion: budget exceeded\"" "PASS breakpoint")
   xbem_guest_test(guest_trace_hle COMMAND run ${GOUT}/seh.exe --trace-hle
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
