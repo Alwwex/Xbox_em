@@ -136,6 +136,18 @@ header). Leonida is not in this repository; the owner uploads it when needed.
 
 ## Open crash (latest run)
 
+Run on `78b7391` (PFNs in 4 KiB units): **all 1,234 program lookups
+succeed** (a counting tracepoint on `0x247c833?rax=0`: 0 matched) and the
+pipeline-lookup crash below is gone. The title now runs ~30 s and crashes at
+`game+0x57f9a81` (fn `0x57f9a20`, guest thread 284, called from fn
+`0x24269b0` <- `0x21b8f30` <- `0x63cd0` <- `0x4eaa040` <- `0x221c1f0` <-
+the thread entry `0x2215ea0`): `mov rax, [0x14ab5cdf8]` then
+`mov [rax+0xfc4], ecx` with the global null. `xbem xrefs <exe> 14ab5cdf8`
+lists the code that reads and writes it; `run --watch 14ab5cdf8` shows
+whether anything stores it.
+
+Earlier crash (fixed by the PFN change):
+
 `game_scarlett_master.exe+0xb5a5f8` (fn `0xb5a5d0`, the title's graphics
 pipeline lookup) reads `[rax+0x68]` with RAX = 0. Its caller fn `0x32520`
 (draw state, called from fn `0xbfa70`, the draw) builds a key on its stack

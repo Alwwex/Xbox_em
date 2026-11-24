@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -542,6 +543,136 @@ int cmd_func(const Args& args) {
   };
   objdump("the function", primary);
   if (primary.BeginAddress != fn.BeginAddress) objdump("the part holding the RVA", fn);
+  return 0;
+}
+
+// Finds the instructions in an image's code that address [address, address +
+// length) RIP-relatively (globals): a ModRM byte with mod 00 and r/m 101, then
+// a 32-bit displacement that, from the end of the instruction, reaches the
+// range. The immediate size comes from the opcode; prefixes are found by a
+// short look back, so the instruction start is a good guess, not a decode.
+int cmd_xrefs(const Args& args) {
+  if (args.size() < 2)
+    throw std::runtime_error("usage: xbem xrefs <file.exe|dll> <address|rva|export>[/length]...");
+  const pe::PeImage img = pe::PeImage::load(args[0]);
+  const uint64_t base = img.image_base();
+  const auto& dir = img.directory(pe::kDirException);
+  const uint32_t fn_count = img.exception_function_count();
+  const auto function_of = [&](uint32_t rva) -> std::optional<uint32_t> {
+    if (!dir.VirtualAddress) return std::nullopt;
+    uint32_t lo = 0, hi = fn_count;
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      pe::RuntimeFunction f = img.read_rva<pe::RuntimeFunction>(dir.VirtualAddress + mid * 12);
+      if (rva < f.BeginAddress) hi = mid;
+      else if (rva >= f.EndAddress) lo = mid + 1;
+      else {
+        if (f.UnwindData & 1) f = img.read_rva<pe::RuntimeFunction>(f.UnwindData & ~1u);
+        for (int depth = 0; depth < 32; ++depth) {  // chained unwind info: the primary entry
+          const uint32_t head = img.read_rva<uint32_t>(f.UnwindData);
+          if (!(((head & 0xFF) >> 3) & 4)) break;
+          const uint8_t codes = static_cast<uint8_t>(head >> 16);
+          f = img.read_rva<pe::RuntimeFunction>(f.UnwindData + 4 + ((codes + 1u) & ~1u) * 2);
+        }
+        return f.BeginAddress;
+      }
+    }
+    return std::nullopt;
+  };
+  const std::vector<uint8_t>& file = img.bytes();
+  for (size_t a = 1; a < args.size(); ++a) {
+    std::string spec = args[a];
+    uint32_t length = 8;
+    if (const size_t slash = spec.find('/'); slash != std::string::npos) {
+      length = static_cast<uint32_t>(std::stoul(spec.substr(slash + 1), nullptr, 0));
+      spec.resize(slash);
+    }
+    uint32_t target = 0;
+    bool named = false;
+    for (const pe::ExportEntry& e : img.exports())
+      if (e.name == spec && e.rva) {
+        target = e.rva;
+        named = true;
+      }
+    if (!named) {
+      try {
+        const uint64_t v = std::stoull(spec, nullptr, 16);
+        target = static_cast<uint32_t>(v >= base && v - base < img.size_of_image() ? v - base : v);
+      } catch (const std::exception&) {
+        std::printf("%s: not a hex address, RVA or export\n", spec.c_str());
+        continue;
+      }
+    }
+    std::printf("references to %llx (rva %08x, %u bytes):\n", static_cast<unsigned long long>(base + target), target,
+                length);
+    int found = 0;
+    for (const pe::Section& sec : img.sections()) {
+      if (!sec.executable()) continue;
+      const size_t begin = sec.raw_offset, end = std::min<size_t>(file.size(), size_t{sec.raw_offset} + sec.raw_size);
+      for (size_t p = begin + 2; p + 4 <= end; ++p) {
+        const uint8_t modrm = file[p - 1];
+        if ((modrm & 0xC7) != 0x05) continue;
+        const uint8_t op = file[p - 2];
+        if ((op & 0xF0) == 0x40 || op == 0x0F) continue;  // a REX prefix or an escape is not an opcode
+        const bool escaped = file[p - 3] == 0x0F;
+        const uint8_t reg = (modrm >> 3) & 7;
+        size_t start = p - 2;
+        if (escaped) --start;
+        else if (start >= 1 && (file[start - 1] == 0x38 || file[start - 1] == 0x3A) && start >= 2 && file[start - 2] == 0x0F)
+          start -= 2;
+        if (start >= 2 && file[start - 2] == 0xC5) start -= 2;  // VEX
+        else if (start >= 3 && file[start - 3] == 0xC4) start -= 3;
+        bool opsize16 = false;
+        if (start > begin && (file[start - 1] & 0xF0) == 0x40) --start;  // REX
+        for (int k = 0; k < 2 && start > begin; ++k) {
+          const uint8_t b = file[start - 1];
+          if (b != 0x66 && b != 0xF2 && b != 0xF3 && b != 0xF0) break;
+          opsize16 |= b == 0x66;
+          --start;
+        }
+        uint32_t imm = 0;
+        if (!escaped) {
+          if (op == 0xC7 || op == 0x81 || op == 0x69) imm = opsize16 ? 2 : 4;
+          else if (op == 0xC6 || op == 0x80 || op == 0x83 || op == 0xC0 || op == 0xC1 || op == 0x6B) imm = 1;
+          else if (op == 0xF6 && reg == 0) imm = 1;
+          else if (op == 0xF7 && reg == 0) imm = opsize16 ? 2 : 4;
+        } else if (op == 0xBA || op == 0x70 || op == 0xC6 || op == 0xC2 || file[p - 4] == 0x3A) {
+          imm = 1;
+        }
+        int32_t disp;
+        std::memcpy(&disp, file.data() + p, 4);
+        const uint32_t disp_rva = sec.virtual_address + static_cast<uint32_t>(p - begin);
+        const uint64_t ref = static_cast<uint64_t>(disp_rva) + 4 + imm + static_cast<int64_t>(disp);
+        if (ref < target || ref >= static_cast<uint64_t>(target) + length) continue;
+        const char* kind = "read";
+        if (!escaped) {
+          if (op == 0x88 || op == 0x89 || op == 0xC6 || op == 0xC7) kind = "store";
+          else if (op == 0x8A || op == 0x8B) kind = "load";
+          else if (op == 0x8D) kind = "lea";
+          else if (op == 0x87 || ((op & 0xC7) == 0x01 && op < 0x40) || ((op == 0x80 || op == 0x81 || op == 0x83) && reg != 7) ||
+                   ((op == 0xFE || op == 0xFF) && reg < 2))
+            kind = "modify";
+          else if (op == 0xFF && (reg == 2 || reg == 4)) kind = "call/jmp";
+        } else {
+          if (op == 0x11 || op == 0x29 || op == 0x7F || op == 0xD6 || op == 0x13 || op == 0x17 || op == 0x2B) kind = "store";
+          else if (op == 0x10 || op == 0x28 || op == 0x6F || op == 0x7E || op == 0x12 || op == 0x16) kind = "load";
+          else if (op == 0xB1 || op == 0xC1) kind = "modify";
+        }
+        const uint32_t insn_rva = sec.virtual_address + static_cast<uint32_t>(start - begin);
+        char bytes[64] = {0};
+        size_t used = 0;
+        for (size_t k = start; k < p + 4 + imm && k < end && used + 4 < sizeof bytes; ++k)
+          used += static_cast<size_t>(std::snprintf(bytes + used, sizeof bytes - used, "%s%02x", k == start ? "" : " ", file[k]));
+        const auto fn = function_of(insn_rva);
+        char where[48] = "no .pdata entry";
+        if (fn) std::snprintf(where, sizeof where, "fn %08x +0x%x", *fn, insn_rva - *fn);
+        std::printf("  %llx  %-20s %-8s %s%s\n", static_cast<unsigned long long>(base + insn_rva), where, kind, bytes,
+                    ref != target ? std::format("  (+{:#x})", ref - target).c_str() : "");
+        ++found;
+      }
+    }
+    std::printf("%d reference%s\n", found, found == 1 ? "" : "s");
+  }
   return 0;
 }
 

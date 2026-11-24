@@ -16,6 +16,7 @@ int cmd_hle(const Args& args);
 int cmd_run(const Args& args);
 int cmd_hexdump(const Args& args);
 int cmd_func(const Args& args);
+int cmd_xrefs(const Args& args);
 int cmd_gpu_disasm(const Args& args);
 
 }  // namespace xbem::app

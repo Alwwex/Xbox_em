@@ -202,6 +202,11 @@ xbem_guest_test(version COMMAND --version EXPECT "xbem [0-9]+\\.[0-9]+\\.[0-9]+ 
 xbem_guest_test(hexdump COMMAND hexdump ${GOUT}/hello.exe 1000 32 EXPECT "00001000:( [0-9a-f][0-9a-f])+" "00001010:")
 xbem_guest_test(func_lookup_many COMMAND func ${GOUT}/hello.exe 1010 140001020 ffffff
                 EXPECT "00001010  fn 00001000 \\+0x10" "00001020  fn 00001000 \\+0x20" "00ffffff  -")
+# The instructions that address a global: two stores of an immediate and a load.
+xbem_guest_test(xrefs_global COMMAND xrefs ${GOUT}/watch.exe watched_global
+                EXPECT "references to 14000[0-9a-f]+ \\(rva [0-9a-f]+, 8 bytes\\)"
+                       "  14000[0-9a-f]+  fn [0-9a-f]+ \\+0x[0-9a-f]+ +store +48 c7 05 [0-9a-f ]+ 02 00 00 00"
+                       "  14000[0-9a-f]+  fn [0-9a-f]+ \\+0x[0-9a-f]+ +load +48 8b 05" "3 references")
 xbem_guest_test(func_lookup COMMAND func ${GOUT}/hello.exe 1010
                 EXPECT "00001010: in .pdata range 00001000-" "function starts at 00001000"
                        "disassemble the function: objdump -d -M intel --start-address=0x140001000 --stop-address=0x14")

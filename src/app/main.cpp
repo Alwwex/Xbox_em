@@ -27,6 +27,8 @@ void print_usage() {
       "  hexdump <file> <rva> [len]      bytes of a PE file at an RVA (hex), e.g. code to disassemble\n"
       "  func <file> <rva>... | -        the function an RVA is in (.pdata) and an objdump command for it;\n"
       "                                  several RVAs or objdump lines on stdin (-): one line each\n"
+      "  xrefs <file> <addr>[/len]...    instructions that address a global RIP-relatively (load,\n"
+      "                                  store, lea...), with their functions; addr is hex or an export\n"
       "  gpu-disasm <file> [--offset N] [--size N] [--all]\n"
       "                                  disassemble RDNA2 (Xbox Series GPU) shader code\n"
       "\n"
@@ -106,6 +108,7 @@ int main(int argc, char** argv) {
     }
     if (command == "hexdump") return xbem::app::cmd_hexdump(rest);
     if (command == "func") return xbem::app::cmd_func(rest);
+    if (command == "xrefs") return xbem::app::cmd_xrefs(rest);
     if (command == "gpu-disasm") return xbem::app::cmd_gpu_disasm(rest);
     if (command == "help" || command == "-h") {
       print_usage();
