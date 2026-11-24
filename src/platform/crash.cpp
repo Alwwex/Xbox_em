@@ -84,15 +84,43 @@ BacktracePrinter g_backtrace_printer = nullptr;
 std::atomic<int> g_dump_active{0};
 std::atomic<int> g_dump_done{0};
 std::atomic<bool> g_dump_compact{false};  // crash reports: where each thread is, without call histories
-std::atomic<bool> g_print_lock{false};
 
 int dump_signal() { return SIGRTMIN + 4; }
 int current_tid() { return static_cast<int>(syscall(SYS_gettid)); }
 
+// Serializes crash/breakpoint/dump output. Re-entrant: a signal handler that
+// interrupted the thread while it printed (a Ctrl+C during a logged int3)
+// nests instead of spinning forever; a holder that never releases it (a
+// thread stopped inside a print) is waited for at most about two seconds.
+std::atomic<int> g_print_owner{0};
+thread_local int t_print_depth = 0;
+thread_local bool t_print_owned = false;
+
 void lock_print() {
-  while (g_print_lock.exchange(true, std::memory_order_acquire)) sched_yield();
+  const int self = current_tid();
+  if (t_print_depth > 0) {
+    ++t_print_depth;
+    return;
+  }
+  int expected = 0;
+  bool owned = true;
+  for (int spins = 0; !g_print_owner.compare_exchange_weak(expected, self, std::memory_order_acquire);
+       expected = 0) {
+    if (++spins > 20000) {
+      owned = false;
+      break;
+    }
+    timespec ts{0, 100 * 1000};
+    nanosleep(&ts, nullptr);
+  }
+  t_print_owned = owned;
+  t_print_depth = 1;
 }
-void unlock_print() { g_print_lock.store(false, std::memory_order_release); }
+void unlock_print() {
+  if (t_print_depth <= 0 || --t_print_depth > 0) return;
+  if (t_print_owned) g_print_owner.store(0, std::memory_order_release);
+  t_print_owned = false;
+}
 
 // True if the bytes before `ret` end with a call instruction.
 bool preceded_by_call(uint64_t ret) {
@@ -132,7 +160,10 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
   const bool compact = g_dump_compact.load();
   int shown = 0;
   for (uint64_t p = rsp & ~7ull; p + 8 <= high && shown < (compact ? 6 : 24) && p - rsp < (4u << 20); p += 8) {
-    const uint64_t v = *reinterpret_cast<const uint64_t*>(p);
+    // A thread blocked in host code runs on another stack than the guest
+    // stack's bounds: the range can cross unmapped memory.
+    uint64_t v;
+    if (!safe_read(p, &v, 8)) break;
     if (v < 0x10000) continue;
     where[0] = 0;
     if (g_describer) g_describer(v, where, sizeof where);
@@ -165,6 +196,9 @@ void dump_signal_handler(int, siginfo_t*, void* ctx) {
   g_dump_done.fetch_add(1);
 }
 
+void print_tracepoint_summary();
+void print_watchpoint_summary();
+
 void interrupt_handler(int sig, siginfo_t*, void* ctx) {
   if (g_dump_active.exchange(1)) {
     if (sig == SIGINT) _exit(130);  // second Ctrl+C while dumping: leave immediately
@@ -191,6 +225,10 @@ void interrupt_handler(int sig, siginfo_t*, void* ctx) {
   }
   if (g_dump_done.load() < requested)
     write_str("(some threads did not respond - they may be stuck with signals blocked)\n");
+  // What the run's tracepoints and watchpoints saw, as in crash reports (a
+  // title that hangs is interrupted, not crashed).
+  print_tracepoint_summary();
+  print_watchpoint_summary();
   write_str("================================================================================\n");
   if (sig == SIGINT) _exit(130);
   g_dump_active.store(0);
