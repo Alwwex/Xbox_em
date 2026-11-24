@@ -45,6 +45,14 @@ const char* patch_cache_hint_instruction(uint8_t* code);
 // into crash reports and thread dumps, using the given writer.
 using ThreadContextPrinter = void (*)(void (*write)(const char*));
 void set_thread_context_printer(ThreadContextPrinter printer);
+
+// Prints a backtrace from the faulting register state using the guest's unwind
+// data (.pdata), with each frame's function start. `gpr` is in unwind-code
+// order (RAX RCX RDX RBX RSP RBP RSI RDI R8..R15); the stack bounds limit
+// every frame the walk may read.
+using BacktracePrinter = void (*)(const uint64_t gpr[16], uint64_t rip, uint64_t stack_low, uint64_t stack_high,
+                                  void (*write)(const char*));
+void set_backtrace_printer(BacktracePrinter printer);
 void unregister_dump_thread();
 
 }  // namespace xbem::platform

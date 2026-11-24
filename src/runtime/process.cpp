@@ -17,6 +17,7 @@
 #include "hle/registry.h"
 #include "platform/crash.h"
 #include "platform/memory.h"
+#include "runtime/seh.h"
 
 namespace xbem::rt {
 
@@ -92,6 +93,81 @@ void describe_call_site(uint64_t ret, char* out, size_t out_size) {
   } else {
     char where[200];
     if (p->loader().describe(target, where, sizeof where)) std::snprintf(out, out_size, "-> calls %s", where);
+  }
+}
+
+// The function a code address belongs to, following chained unwind info to
+// the primary entry (the function's real start). Returns its start RVA.
+bool primary_function_of(uint64_t pc, uint64_t* begin_rva, uint64_t* end_rva, uint8_t* frame_register) {
+  uint64_t base = 0;
+  const seh::RuntimeFunction* fn = seh::lookup_function_entry(pc, &base);
+  if (!fn) return false;
+  *end_rva = fn->EndAddress;
+  *frame_register = 0;
+  for (int depth = 0; depth < 32; ++depth) {
+    uint8_t head[4];
+    if (!platform::safe_read(base + fn->UnwindData, head, 4)) break;
+    if (depth == 0) *frame_register = head[3] & 0x0F;
+    if (!((head[0] >> 3) & seh::kUnwFlagChainInfo)) break;
+    const uint64_t chained = base + fn->UnwindData + 4 + ((head[2] + 1u) & ~1u) * 2;
+    uint32_t words[3];
+    if (!platform::safe_read(chained, words, sizeof words)) break;
+    static thread_local seh::RuntimeFunction primary;
+    primary = {words[0], words[1], words[2]};
+    fn = &primary;
+  }
+  *begin_rva = fn->BeginAddress;
+  return true;
+}
+
+// Crash reports: the faulting thread's frames, found with the title's unwind
+// data, each with the start of its function (for objdump --start-address).
+void print_unwind_backtrace(const uint64_t gpr[16], uint64_t rip, uint64_t stack_low, uint64_t stack_high,
+                            void (*write)(const char*)) {
+  alignas(16) seh::Context c{};
+  std::memcpy(c.Gpr, gpr, sizeof c.Gpr);
+  c.Rip = rip;
+  seh::DispatcherContext dc{};
+  char line[640], where[256], call[256];
+  write("Backtrace (from the title's unwind data; fn = start of the function):\n");
+  for (int frame = 0; frame < 48 && c.Rip; ++frame) {
+    where[0] = 0;
+    describe_address(c.Rip, where, sizeof where);
+    if (!where[0]) {
+      std::snprintf(line, sizeof line, "  #%-2d %016llx  (not in a loaded module - walk ends)\n", frame,
+                    static_cast<unsigned long long>(c.Rip));
+      write(line);
+      return;
+    }
+    // A return address can sit just past its function (a call as the last
+    // instruction): attribute it to the byte before.
+    const uint64_t lookup_pc = frame ? c.Rip - 1 : c.Rip;
+    uint64_t begin = 0, end = 0;
+    uint8_t frame_reg = 0;
+    char fn_text[96] = "no unwind data (leaf function)";
+    if (primary_function_of(lookup_pc, &begin, &end, &frame_reg)) {
+      Process* p = Process::current_or_null();
+      const rt::LoadedModule* m = p ? p->loader().find_containing(c.Rip) : nullptr;
+      const uint64_t rva = m ? c.Rip - m->handle() : 0;
+      std::snprintf(fn_text, sizeof fn_text, "fn 0x%llx +0x%llx", static_cast<unsigned long long>(begin),
+                    static_cast<unsigned long long>(rva - begin));
+    }
+    call[0] = 0;
+    if (frame) describe_call_site(c.Rip, call, sizeof call);
+    std::snprintf(line, sizeof line, "  #%-2d %s  [%s]%s%s\n", frame, where, fn_text, call[0] ? "  " : "", call);
+    write(line);
+    if (!seh::is_guest_code(c.Rip)) return;  // host or HLE code: its frames have no Windows unwind data
+    const uint64_t rsp = c.Gpr[seh::kRsp];
+    const auto on_stack = [&](uint64_t v) { return v >= stack_low && v < stack_high; };
+    if (!on_stack(rsp) || (frame_reg && !on_stack(c.Gpr[frame_reg]))) {
+      write("  (stack or frame pointer outside the thread's stack - walk ends)\n");
+      return;
+    }
+    if (!seh::unwind_one_frame(seh::kUnwFlagNHandler, dc, c)) return;
+    if (c.Gpr[seh::kRsp] <= rsp || c.Gpr[seh::kRsp] > stack_high) {
+      write("  (unwind did not move up the stack - walk ends)\n");
+      return;
+    }
   }
 }
 
@@ -206,6 +282,7 @@ int Process::run() {
   platform::set_memory_describer(&describe_memory_for_reports);
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&print_thread_context);
+  platform::set_backtrace_printer(&print_unwind_backtrace);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

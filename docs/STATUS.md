@@ -35,14 +35,21 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
 
    ```bash
    sed -n '/guest crash/,/Stack (likely/p' run.log | cut -c1-200
+   sed -n '/^Backtrace/,/^=====/p' run.log | cut -c1-200
    grep -E "probe\]" run.log | tail -12 | cut -c1-240
    sed -n '/Last emulated-function calls/,/Last probe-object/p' run.log | tail -15 | cut -c1-200
-   ./build/bin/xbem hexdump "/mnt/d/GTAVI/GTAVI/game_scarlett_master.exe" <rva-hex> <len> > code.txt; cat code.txt
+   ./build/bin/xbem func "/mnt/d/GTAVI/GTAVI/game_scarlett_master.exe" <rva-hex>
+   objdump -d -M intel --start-address=0x<start> --stop-address=0x<stop> "/mnt/d/GTAVI/GTAVI/game_scarlett_master.exe" | cut -c1-120 > code.txt
    ```
 
-   Code around a crash is disassembled by hand from `hexdump` output; the
-   crash report already shows RIP-16..RIP+32, registers and what they point
-   at (stacks, allocations, emulator probe objects).
+   The crash report ends with a backtrace walked with the title's own unwind
+   data (`.pdata`); every frame names the start of its function
+   (`[fn 0x... +0x...]`). `xbem func` prints a function's range and the
+   matching `objdump` command (GNU objdump reads PE files: `pei-x86-64`;
+   `sudo apt install binutils` if missing). The crash report also shows
+   RIP-16..RIP+32, registers and what they point at (stacks, allocations,
+   emulator probe objects); `xbem hexdump` still dumps raw bytes.
+
 4. `--continue-after-breakpoint` skips one known title assertion
    (+0x247af2d, a render-target budget check that expects the console's tiled
    texture sizes); everything after it runs normally.

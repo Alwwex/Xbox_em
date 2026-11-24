@@ -195,6 +195,9 @@ endfunction()
 xbem_guest_test(inspect_imports COMMAND inspect ${GOUT}/unimplemented.exe
                 EXPECT "kernelx.dll  \\[HLE\\]  3/5 resolved" "- XbemDefinitelyMissing" "- XbemMissingWithArgs")
 xbem_guest_test(hexdump COMMAND hexdump ${GOUT}/hello.exe 1000 32 EXPECT "00001000:( [0-9a-f][0-9a-f])+" "00001010:")
+xbem_guest_test(func_lookup COMMAND func ${GOUT}/hello.exe 1010
+                EXPECT "00001010: in .pdata range 00001000-" "function starts at 00001000"
+                       "disassemble the function: objdump -d -M intel --start-address=0x140001000 --stop-address=0x14")
 xbem_guest_test(package_summary COMMAND package ${PKG}
                 EXPECT "Identity: +Xbem.FilesTest" "Main executable: .*files.exe")
 xbem_guest_test(coverage_report COMMAND coverage ${GOUT}
@@ -242,5 +245,8 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_seh_unhandled COMMAND run ${GOUT}/seh_unhandled.exe EXIT 173
                   EXPECT "unhandled guest exception 0xe0badbad" "frame  1: seh_unhandled.exe\\+0x")
   xbem_guest_test(guest_crash_report COMMAND run ${GOUT}/crash.exe EXIT 139
-                  EXPECT "guest crash" "SIGSEGV" "RIP=[0-9a-f]+  crash.exe\\+0x")
+                  EXPECT "guest crash" "SIGSEGV" "RIP=[0-9a-f]+  crash.exe\\+0x"
+                         "#0  crash.exe\\+0x[0-9a-f]+  .(fn 0x)?"
+                         "#1  crash.exe\\+0x[0-9a-f]+  \\[fn 0x[0-9a-f]+ \\+0x[0-9a-f]+\\]  -> calls crash.exe\\+0x"
+                         "#2  crash.exe\\+0x[0-9a-f]+  \\[fn 0x[0-9a-f]+ \\+0x[0-9a-f]+\\]  -> calls crash.exe\\+0x")
 endif()

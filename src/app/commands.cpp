@@ -443,6 +443,59 @@ int cmd_hexdump(const Args& args) {
   return 0;
 }
 
+// Which function (.pdata entry) an RVA belongs to, following chained unwind
+// info to the function's real start, plus an objdump command for its code.
+int cmd_func(const Args& args) {
+  if (args.size() < 2) throw std::runtime_error("usage: xbem func <file.exe|dll> <rva (hex)>");
+  const pe::PeImage img = pe::PeImage::load(args[0]);
+  const uint32_t rva = static_cast<uint32_t>(std::stoul(args[1], nullptr, 16));
+  const auto& dir = img.directory(pe::kDirException);
+  const uint32_t count = img.exception_function_count();
+  if (!dir.VirtualAddress || !count) throw std::runtime_error("the file has no exception directory (.pdata)");
+  const auto entry = [&](uint32_t i) { return img.read_rva<pe::RuntimeFunction>(dir.VirtualAddress + i * 12); };
+  uint32_t lo = 0, hi = count;
+  std::optional<pe::RuntimeFunction> found;
+  while (lo < hi) {
+    const uint32_t mid = lo + (hi - lo) / 2;
+    const pe::RuntimeFunction f = entry(mid);
+    if (rva < f.BeginAddress) hi = mid;
+    else if (rva >= f.EndAddress) lo = mid + 1;
+    else { found = f; break; }
+  }
+  if (!found) {
+    std::printf("%08x: not covered by .pdata (a leaf function without unwind data, or not code)\n", rva);
+    return 1;
+  }
+  pe::RuntimeFunction fn = *found;
+  if (fn.UnwindData & 1) fn = img.read_rva<pe::RuntimeFunction>(fn.UnwindData & ~1u);  // indirect entry
+  std::printf("%08x: in .pdata range %08x-%08x", rva, fn.BeginAddress, fn.EndAddress);
+  pe::RuntimeFunction primary = fn;
+  for (int depth = 0; depth < 32; ++depth) {
+    const uint32_t head = img.read_rva<uint32_t>(primary.UnwindData);
+    const uint8_t flags = static_cast<uint8_t>((head & 0xFF) >> 3), codes = static_cast<uint8_t>(head >> 16);
+    if (depth == 0)
+      std::printf(", prolog %u bytes, %u unwind codes, frame register %u%s%s\n", (head >> 8) & 0xFF, codes,
+                  (head >> 24) & 0x0F, flags & 3 ? ", has a handler" : "", flags & 4 ? ", chained" : "");
+    if (!(flags & 4)) break;
+    primary = img.read_rva<pe::RuntimeFunction>(primary.UnwindData + 4 + ((codes + 1u) & ~1u) * 2);
+  }
+  if (primary.BeginAddress != fn.BeginAddress)
+    std::printf("function starts at %08x (primary range %08x-%08x)\n", primary.BeginAddress, primary.BeginAddress,
+                primary.EndAddress);
+  else
+    std::printf("function starts at %08x\n", fn.BeginAddress);
+  const uint64_t base = img.image_base();
+  std::printf("offset of %08x in the function: +0x%x\n", rva, rva - primary.BeginAddress);
+  const auto objdump = [&](const char* what, const pe::RuntimeFunction& f) {
+    std::printf("disassemble %s: objdump -d -M intel --start-address=0x%llx --stop-address=0x%llx %s\n", what,
+                static_cast<unsigned long long>(base + f.BeginAddress),
+                static_cast<unsigned long long>(base + f.EndAddress), args[0].c_str());
+  };
+  objdump("the function", primary);
+  if (primary.BeginAddress != fn.BeginAddress) objdump("the part holding the RVA", fn);
+  return 0;
+}
+
 // Disassembles RDNA2 GPU code from a file (e.g. a shader captured with
 // run --dump-shaders). Without --offset it lists where programs end
 // (s_endpgm) to help locate code inside container formats.

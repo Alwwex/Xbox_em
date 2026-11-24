@@ -24,6 +24,7 @@ void print_usage() {
       "  cpu                             check the host CPU against the Xbox Series (Zen 2) ISA\n"
       "  hle [module]                    list HLE modules / implemented functions\n"
       "  hexdump <file> <rva> [len]      bytes of a PE file at an RVA (hex), e.g. code to disassemble\n"
+      "  func <file> <rva>               the function an RVA is in (.pdata) and an objdump command for it\n"
       "  gpu-disasm <file> [--offset N] [--size N] [--all]\n"
       "                                  disassemble RDNA2 (Xbox Series GPU) shader code\n"
       "\n"
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
     if (command == "hle") return xbem::app::cmd_hle(rest);
     if (command == "run") return xbem::app::cmd_run(rest);
     if (command == "hexdump") return xbem::app::cmd_hexdump(rest);
+    if (command == "func") return xbem::app::cmd_func(rest);
     if (command == "gpu-disasm") return xbem::app::cmd_gpu_disasm(rest);
     if (command == "help" || command == "-h") {
       print_usage();

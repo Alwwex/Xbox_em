@@ -11,6 +11,7 @@ void set_memory_describer(AddressDescriber) {}
 void set_continue_after_breakpoint(bool) {}
 const char* patch_cache_hint_instruction(uint8_t*) { return nullptr; }
 void set_thread_context_printer(ThreadContextPrinter) {}
+void set_backtrace_printer(BacktracePrinter) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
 
@@ -71,6 +72,7 @@ constexpr int kMaxDumpThreads = 1024;
 DumpSlot g_dump_slots[kMaxDumpThreads];
 CallSiteDescriber g_call_site = nullptr;
 ThreadContextPrinter g_context_printer = nullptr;
+BacktracePrinter g_backtrace_printer = nullptr;
 std::atomic<int> g_dump_active{0};
 std::atomic<int> g_dump_done{0};
 std::atomic<bool> g_print_lock{false};
@@ -484,6 +486,15 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   if (!shown) write_str("  (none found)\n");
   print_outermost_frames(slot, line, sizeof line, where, sizeof where);
   if (g_context_printer) g_context_printer(&write_str);
+  // Last: the walk follows the title's unwind data through its stack; should
+  // it fault anyway, everything above is already written.
+  if (g_backtrace_printer && slot && slot->stack_high) {
+    const int order[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                           REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+    uint64_t gpr[16];
+    for (int i = 0; i < 16; ++i) gpr[i] = static_cast<uint64_t>(g[order[i]]);
+    g_backtrace_printer(gpr, rip, slot->stack_low, slot->stack_high, &write_str);
+  }
 #else
   (void)ctx_raw;
   (void)where;
@@ -512,6 +523,7 @@ void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site
 void set_memory_describer(AddressDescriber describer) { g_memory_describer = describer; }
 void set_continue_after_breakpoint(bool enabled) { g_continue_after_breakpoint.store(enabled); }
 void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
+void set_backtrace_printer(BacktracePrinter printer) { g_backtrace_printer = printer; }
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();
