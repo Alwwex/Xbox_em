@@ -631,6 +631,15 @@ int Process::run() {
   arm_watchpoints(*loader_, options_.watch);
   hle::set_file_read_log(options_.log_reads);
   g_run_start = std::chrono::steady_clock::now();
+  // Progress in the log: the status lines every 30 s (a long run without a
+  // window shows whether frames advance or the title hangs).
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+      const std::vector<std::string> lines = window_status_lines();
+      if (lines.size() >= 2) XBEM_INFO("status", "{}; {}", lines[0], lines[1]);
+    }
+  }).detach();
   if (options_.window) {
     std::string reason;
     if (platform::window_open(std::format("xbem - {}", main->name), &window_status_lines, reason))
