@@ -188,8 +188,22 @@ queue method the emulator only probes (Query/EnqueueSetEvent/GetErrorEvent
 in the PC order) before it requests the rest. Queue slot 12 is now
 EnqueueSetEvent (sets the event at once); Submit lines list the gaps in
 each file's request coverage; crash reports list where every other guest
-thread is. Next: the code before `0x247c833` (the lookup), the gaps in
-`shaders.rpf`, and the DirectStorage probe calls.
+thread is.
+
+The loader's loop (fn `0x247b6c0`, +0xf35..+0x1188) gets each program from
+fn `0x141d65750(state[c38], state[c40], state[c48], state[c50], state[c58],
+[effect+0xc88], &stages[4])`: five state objects picked by bytes of the
+pass entry, a configuration word and the four stage shaders from
+`[effect+0xce8]`; it returns 0 for most passes. The DirectStorage coverage
+shows **the first 64 KiB stream of every Submit batch missing** (the
+library's first stream at `0x10579000` before batch 1, then one stream
+before each later batch): 42, 6, 1, 474 and 3,676 requests, each batch
+starting one stream after the previous one ended, byte counts matching the
+requests exactly. The title never enqueued those streams, and no unknown
+queue method was called. If they are never loaded, the library's
+hash-sorted pipeline records have zeroed blocks and lookups fail. The Submit
+lines now check the memory each gap's data belongs to (between the
+neighbouring requests' destinations): all zero means nothing else loaded it.
 
 ## Known approximations
 

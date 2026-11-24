@@ -59,6 +59,9 @@ struct FileState {
   std::mutex coverage_mutex;
   std::map<uint64_t, uint64_t> covered;  // start -> end
   uint64_t requests = 0, requests_logged = 0;
+  // Where each request put its data (file offset -> destination, size): the
+  // memory a gap's data belongs to lies between its neighbours' destinations.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> dest_by_offset;
 
   void add_coverage(uint64_t start, uint64_t length) {
     constexpr uint64_t kSlack = 4096;
@@ -212,6 +215,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     }
   }
   if (!dest_size) dest_size = uncompressed_size ? uncompressed_size : source_size;
+  {
+    std::lock_guard lock(file->coverage_mutex);
+    file->dest_by_offset[offset] = {reinterpret_cast<uint64_t>(dest), dest_size};
+  }
   if (log)
     XBEM_INFO("dstorage",
               "  -> {} offset {:#x} size {:#x} (uncompressed {:#x}), compression {}, dest {} size {:#x}",
@@ -271,6 +278,40 @@ void log_file_coverage() {
     XBEM_INFO("dstorage", "  {}: {} requests cover {:#x}-{:#x} of {:#x} bytes; {} gaps ({:#x} bytes){}{}",
               f->guest_path, f->requests, f->covered.begin()->first, f->covered.rbegin()->second, f->size,
               f->covered.size() - 1, gap_bytes, gaps.empty() ? "" : ":", gaps);
+    // Did the data of each gap reach memory some other way (e.g. ReadFile)?
+    // Its destination lies between the neighbouring requests' destinations,
+    // and before the first request's when the data is laid out in order.
+    listed = 0;
+    for (auto it = f->covered.begin(); it != f->covered.end() && listed < 8; ++it) {
+      const bool before_first = it == f->covered.begin();
+      if (!before_first) ++listed;
+      const uint64_t gap_end = it->first;
+      const auto next = f->dest_by_offset.lower_bound(gap_end);
+      if (next == f->dest_by_offset.end()) continue;
+      uint64_t mem_start, mem_end = next->second.first;
+      if (before_first) {
+        mem_start = mem_end >= 0x10000 ? mem_end - 0x10000 : 0;  // one 64 KiB chunk before the first
+      } else {
+        const auto prev = std::prev(f->dest_by_offset.lower_bound(std::prev(it)->second));
+        mem_start = prev->second.first + prev->second.second;
+      }
+      if (mem_end <= mem_start || mem_end - mem_start > (16u << 20)) continue;
+      uint64_t nonzero = 0, first_nonzero = 0;
+      bool readable = true;
+      for (uint64_t a = mem_start; a < mem_end && readable; a += 4096) {
+        uint8_t page[4096];
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(4096, mem_end - a));
+        readable = platform::safe_read(a, page, n);
+        for (size_t k = 0; readable && k < n; ++k)
+          if (page[k] && !nonzero++) first_nonzero = a + k;
+      }
+      XBEM_INFO("dstorage", "    {} {:#x}: memory {:#x}-{:#x} ({:#x} bytes) {}",
+                before_first ? "before the first request, at" : "gap ending at", gap_end, mem_start, mem_end,
+                mem_end - mem_start,
+                !readable ? std::string("is not readable")
+                : nonzero ? std::format("has {:#x} non-zero bytes (first at {:#x})", nonzero, first_nonzero)
+                          : std::string("is all zero"));
+    }
   }
 }
 

@@ -508,10 +508,12 @@ static void test_dstorage(void) {
    * gap of 0x7800 bytes that no request reads. */
   void* file2 = 0;
   CHECK(((OpenFileFn)vt[4])(factory, wpath, kQueueIid, &file2) == 0 && file2);
-  static uint8_t piece[256];
+  /* Destinations in file order: the gap's memory (0x7800 bytes after the
+   * eighth piece) is never written, and the log says it is all zero. */
+  static uint8_t pieces[0x8800];
   for (int i = 0; i < 16; ++i) {
     const uint64_t offset = (i < 8 ? 0 : 0x7800) + (uint64_t)i * 0x100;
-    uint64_t r[12] = {0, (uint64_t)(uintptr_t)piece, 0, sizeof piece, (uint64_t)(uintptr_t)file2, offset, 0x100};
+    uint64_t r[12] = {0, (uint64_t)(uintptr_t)(pieces + offset), 0, 0x100, (uint64_t)(uintptr_t)file2, offset, 0x100};
     ((EnqueueFn)qv[3])(queue, r);
   }
   ((SubmitFn)qv[6])(queue);

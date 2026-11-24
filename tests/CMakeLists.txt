@@ -235,6 +235,7 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                            "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set \\(requests complete\\)"
                            "Submit #3: 19 requests so far"
                            "console.exe: 16 requests cover 0x0-0x8800 of 0x[0-9a-f]+ bytes; 1 gaps \\(0x7800 bytes\\): 0x800-0x8000"
+                           "gap ending at 0x8000: memory 0x[0-9a-f]+-0x[0-9a-f]+ \\(0x7800 bytes\\) is all zero"
                            "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this")
   endif()
   if(Python3_Interpreter_FOUND)
