@@ -80,6 +80,7 @@ ThreadContextPrinter g_context_printer = nullptr;
 BacktracePrinter g_backtrace_printer = nullptr;
 std::atomic<int> g_dump_active{0};
 std::atomic<int> g_dump_done{0};
+std::atomic<bool> g_dump_compact{false};  // crash reports: where each thread is, without call histories
 std::atomic<bool> g_print_lock{false};
 
 int dump_signal() { return SIGRTMIN + 4; }
@@ -125,8 +126,9 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
   write_str(line);
   // Scan the stack for return addresses into guest modules.
   const uint64_t high = slot.stack_high ? slot.stack_high : rsp + 0x10000;
+  const bool compact = g_dump_compact.load();
   int shown = 0;
-  for (uint64_t p = rsp & ~7ull; p + 8 <= high && shown < 24 && p - rsp < (4u << 20); p += 8) {
+  for (uint64_t p = rsp & ~7ull; p + 8 <= high && shown < (compact ? 6 : 24) && p - rsp < (4u << 20); p += 8) {
     const uint64_t v = *reinterpret_cast<const uint64_t*>(p);
     if (v < 0x10000) continue;
     where[0] = 0;
@@ -139,7 +141,7 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
     ++shown;
   }
   if (!shown) write_str("    (no guest return addresses found on the stack)\n");
-  if (g_context_printer) g_context_printer(&write_str);
+  if (g_context_printer && !compact) g_context_printer(&write_str);
   unlock_print();
 #else
   (void)slot;
@@ -191,6 +193,31 @@ void interrupt_handler(int sig, siginfo_t*, void* ctx) {
   g_dump_active.store(0);
 }
 
+
+// After a crash report: where every other guest thread is (one short entry
+// each), to spot a thread stuck waiting for something the emulator never does.
+void dump_other_threads_at_crash(int self) {
+  int requested = 0;
+  for (const DumpSlot& s : g_dump_slots) {
+    const int tid = s.tid.load();
+    if (tid && tid != self) ++requested;
+  }
+  if (!requested || g_dump_active.exchange(1)) return;
+  g_dump_compact.store(true);
+  g_dump_done.store(0);
+  write_str("Other guest threads at the crash (RIP and guest return addresses on the stack):\n");
+  requested = 0;
+  for (const DumpSlot& s : g_dump_slots) {
+    const int tid = s.tid.load();
+    if (tid && tid != self && syscall(SYS_tgkill, getpid(), tid, dump_signal()) == 0) ++requested;
+  }
+  for (int i = 0; i < 200 && g_dump_done.load() < requested; ++i) {
+    timespec ts{0, 10 * 1000 * 1000};
+    nanosleep(&ts, nullptr);
+  }
+  if (g_dump_done.load() < requested) write_str("(some threads did not respond)\n");
+  write_str("=== end of thread dump ===\n");
+}
 
 AddressDescriber g_memory_describer = nullptr;
 
@@ -511,7 +538,8 @@ int g_watch_log_writes = 16;
 struct WatchStep {
   bool active = false;
   uint64_t page = 0;
-  int watch = -1;  // the watchpoint written, -1 for another address on its page
+  int watch = -1;      // the watchpoint written, -1 for another address on its page
+  bool maybe = false;  // the store starts before the range: a hit only if the range changes
   uint64_t rip = 0;
   uint64_t gpr[16] = {};
   uint8_t before[16] = {};
@@ -571,12 +599,21 @@ bool handle_watch_fault(siginfo_t* info, ucontext_t* uc) {
   const uint64_t fault = reinterpret_cast<uint64_t>(info->si_addr);
   const uint64_t page = page_of(fault);
   int hit = -1;
+  bool maybe = false;
   bool on_page = false;
   for (int i = 0; i < count; ++i) {
     const Watchpoint& w = g_watchpoints[i];
     if (!w.armed.load() || (page_of(w.address) != page && page_of(w.address + w.length - 1) != page)) continue;
     on_page = true;
-    if (hit < 0 && fault + 32 > w.address && fault < w.address + w.length) hit = i;  // stores of up to 32 bytes
+    if (fault >= w.address && fault < w.address + w.length) {  // the store starts inside the range
+      hit = i;
+      maybe = false;
+      break;
+    }
+    if (hit < 0 && fault < w.address && fault + 32 > w.address) {  // a wider store may reach into it
+      hit = i;
+      maybe = true;
+    }
   }
   if (!on_page) return false;
   greg_t* g = uc->uc_mcontext.gregs;
@@ -584,6 +621,7 @@ bool handle_watch_fault(siginfo_t* info, ucontext_t* uc) {
   s.active = true;
   s.page = page;
   s.watch = hit;
+  s.maybe = maybe;
   s.rip = static_cast<uint64_t>(g[REG_RIP]);
   if (hit >= 0) {
     for (int k = 0; k < 16; ++k) s.gpr[k] = static_cast<uint64_t>(g[kUnwindOrder[k]]);
@@ -600,7 +638,14 @@ bool handle_watch_step(ucontext_t* uc) {
   if (!s.active) return false;
   s.active = false;
   uc->uc_mcontext.gregs[REG_EFL] &= ~kTrapFlag;
-  if (s.watch >= 0) log_watch_write(g_watchpoints[s.watch], s, slot_of_tid(current_tid()));
+  if (s.watch >= 0) {
+    const Watchpoint& w = g_watchpoints[s.watch];
+    uint8_t now[16] = {};
+    const uint32_t n = std::min<uint32_t>(w.length, 16);
+    safe_read(w.address, now, n);
+    if (!s.maybe || std::memcmp(now, s.before, n) != 0)
+      log_watch_write(g_watchpoints[s.watch], s, slot_of_tid(current_tid()));
+  }
   set_page_writable(s.page, false);
   return true;
 }
@@ -849,6 +894,7 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   (void)line;
 #endif
   write_str("===================================================\n");
+  dump_other_threads_at_crash(self);
   _exit(128 + sig);
 }
 

@@ -232,6 +232,9 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   if(XBEM_MINGW_WINDRES)
     xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --dump-shaders ${GOUT}/shaders
                     EXPECT "PASS console" "HEADLESS device" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #2: 3 requests so far"
+                           "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set \\(requests complete\\)"
+                           "Submit #3: 19 requests so far"
+                           "console.exe: 16 requests cover 0x0-0x8800 of 0x[0-9a-f]+ bytes; 1 gaps \\(0x7800 bytes\\): 0x800-0x8000"
                            "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this")
   endif()
   if(Python3_Interpreter_FOUND)
@@ -281,5 +284,7 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                   EXPECT "guest crash" "SIGSEGV" "RIP=[0-9a-f]+  crash.exe\\+0x"
                          "#0  crash.exe\\+0x[0-9a-f]+  .(fn 0x)?"
                          "#1  crash.exe\\+0x[0-9a-f]+  \\[fn 0x[0-9a-f]+ \\+0x[0-9a-f]+\\]  -> calls crash.exe\\+0x"
-                         "#2  crash.exe\\+0x[0-9a-f]+  \\[fn 0x[0-9a-f]+ \\+0x[0-9a-f]+\\]  -> calls crash.exe\\+0x")
+                         "#2  crash.exe\\+0x[0-9a-f]+  \\[fn 0x[0-9a-f]+ \\+0x[0-9a-f]+\\]  -> calls crash.exe\\+0x"
+                         "Other guest threads at the crash" "-> calls kernelx.dll!WaitForSingleObject"
+                         "=== end of thread dump ===")
 endif()

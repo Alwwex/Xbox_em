@@ -497,6 +497,24 @@ static void test_dstorage(void) {
   CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
   CHECK(text[0] == 'x' && text[5] == 'D' && text[263] == ' ' && text[264] == 0);
   CHECK(*(volatile const uint8_t*)&kZlibChunk[47] == 0x01); /* keeps the chunk in the image */
+
+  /* 12 EnqueueSetEvent(HANDLE): requests complete at once, so the event is set */
+  typedef void (*SetEventFn)(void*, HANDLE);
+  HANDLE done = CreateEventW(0, 1, 0, 0);
+  ((SetEventFn)qv[12])(queue, done);
+  CHECK(WaitForSingleObject(done, 0) == WAIT_OBJECT_0);
+
+  /* Coverage in the Submit log: 16 requests on a second file object, with a
+   * gap of 0x7800 bytes that no request reads. */
+  void* file2 = 0;
+  CHECK(((OpenFileFn)vt[4])(factory, wpath, kQueueIid, &file2) == 0 && file2);
+  static uint8_t piece[256];
+  for (int i = 0; i < 16; ++i) {
+    const uint64_t offset = (i < 8 ? 0 : 0x7800) + (uint64_t)i * 0x100;
+    uint64_t r[12] = {0, (uint64_t)(uintptr_t)piece, 0, sizeof piece, (uint64_t)(uintptr_t)file2, offset, 0x100};
+    ((EnqueueFn)qv[3])(queue, r);
+  }
+  ((SubmitFn)qv[6])(queue);
 }
 
 /* ------------------------------------------------- headless D3D12 */

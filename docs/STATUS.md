@@ -76,6 +76,9 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    crash can be watched from the start of the next run. Other writes to the
    page are stepped over silently (slow on a busy page). `xbem func EXE -`
    reads objdump lines from a pipe and prints the function of each address.
+   Crash reports end with every other guest thread's RIP and the guest
+   return addresses on its stack ("Other guest threads at the crash"): a
+   thread blocked in an emulated wait shows the call it waits in.
 6. `--continue-after-breakpoint` skips one known title assertion
    (+0x247af2d, a render-target budget check that expects the console's tiled
    texture sizes); everything after it runs normally.
@@ -169,9 +172,24 @@ were never created, the index is right. DirectStorage reported no failure
 The title's big allocation (VirtualAlloc by `0x141e1d186`, 0x49400000
 bytes) puts the objects at fixed offsets: the effect at `+0x74fd600`, its
 `+0xc78` field at `+0x74fe278`, the program table at `+0x7500c50`
-(entry 36 at `+0x7500d70`, entry 42 at `+0x7500da0`). Next: watch those
-(`--watch alloc:141e1d186+7500d70/8,...`) to find the code that creates
-programs, and why entry 42 is never written.
+(entry 36 at `+0x7500d70`, entry 42 at `+0x7500da0`).
+
+Watchpoints on those showed the effect loader, fn `0x247b6c0` (guest
+thread 340, called from fn `0x2499630`), store the table pointer (+0x6cb)
+and then every entry in a loop at +0x1173 (`0x247c833`, index in R14): it
+stores the program it found for index 36 and **0 for 39..42** - the
+program lookup itself fails. R11 = 0x246 after the successful lookup (it
+went through emulated code), 0xffffffff after the failed ones.
+
+DirectStorage delivered 4,198 full 64 KiB streams plus the short last one
+of the pipeline library: **6 full streams were never requested** (no
+failures, nothing pending). Candidates: the title waits for a DirectStorage
+queue method the emulator only probes (Query/EnqueueSetEvent/GetErrorEvent
+in the PC order) before it requests the rest. Queue slot 12 is now
+EnqueueSetEvent (sets the event at once); Submit lines list the gaps in
+each file's request coverage; crash reports list where every other guest
+thread is. Next: the code before `0x247c833` (the lookup), the gaps in
+`shaders.rpf`, and the DirectStorage probe calls.
 
 ## Known approximations
 

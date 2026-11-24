@@ -8,7 +8,8 @@
 //            (e.g. 8 = staging buffer size) are accepted and logged.
 //   file:    3 Close, 4 GetFileInformation(BY_HANDLE_FILE_INFORMATION*)
 //   queue:   3 EnqueueRequest(request*), 4 EnqueueStatus(array, index),
-//            5 EnqueueSignal(fence, value), 6 Submit, 8 Close
+//            5 EnqueueSignal(fence, value), 6 Submit, 8 Close,
+//            12 EnqueueSetEvent(HANDLE) (set at once when it is an event)
 //   status:  3 IsComplete(index), 4 GetHResult(index)
 //
 // Requests are executed synchronously when they are enqueued (file read, then
@@ -35,6 +36,7 @@
 #include "hle/probe_com.h"
 #include "hle/registry.h"
 #include "platform/memory.h"
+#include "runtime/objects.h"
 
 namespace xbem::hle {
 namespace {
@@ -50,6 +52,28 @@ struct FileState {
   std::ifstream stream;
   std::string guest_path;
   uint64_t size = 0;
+
+  // Which parts of the file requests have read (merged; gaps under 4 KiB,
+  // such as the padding between zlib streams, count as read). The Submit
+  // log lists the gaps, e.g. chunks of a file the title never asked for.
+  std::mutex coverage_mutex;
+  std::map<uint64_t, uint64_t> covered;  // start -> end
+  uint64_t requests = 0, requests_logged = 0;
+
+  void add_coverage(uint64_t start, uint64_t length) {
+    constexpr uint64_t kSlack = 4096;
+    std::lock_guard lock(coverage_mutex);
+    ++requests;
+    uint64_t end = start + length;
+    auto it = covered.upper_bound(start);
+    if (it != covered.begin() && std::prev(it)->second + kSlack >= start) --it;
+    while (it != covered.end() && it->first <= end + kSlack) {
+      start = std::min(start, it->first);
+      end = std::max(end, it->second);
+      it = covered.erase(it);
+    }
+    covered[start] = end;
+  }
 
   bool read(uint64_t offset, uint8_t* out, size_t n) {
     std::lock_guard lock(mutex);
@@ -169,6 +193,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   FileState* file = file_state(w[fi]);
   const uint64_t offset = w[fi + 1];
   const uint32_t source_size = static_cast<uint32_t>(w[fi + 2]);
+  file->add_coverage(offset, source_size);
   const uint32_t uncompressed_size = static_cast<uint32_t>(w[fi + 2] >> 32);
   const uint32_t compression = static_cast<uint32_t>(w[0] & 0xFF);
   {
@@ -223,6 +248,32 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   return S_OK;
 }
 
+// For the Submit log: files with new requests since the last log, the range
+// the requests cover and the gaps inside it.
+void log_file_coverage() {
+  std::vector<FileState*> files;
+  {
+    std::lock_guard lock(g_files_mutex);
+    for (const void* f : g_files) files.push_back(file_state(reinterpret_cast<uint64_t>(f)));
+  }
+  for (FileState* f : files) {
+    std::lock_guard lock(f->coverage_mutex);
+    if (f->requests == f->requests_logged || f->requests < 16 || f->covered.empty()) continue;
+    f->requests_logged = f->requests;
+    std::string gaps;
+    uint64_t gap_bytes = 0;
+    int listed = 0;
+    for (auto it = f->covered.begin(); std::next(it) != f->covered.end(); ++it) {
+      const uint64_t from = it->second, to = std::next(it)->first;
+      gap_bytes += to - from;
+      if (listed++ < 8) gaps += std::format(" {:#x}-{:#x}", from, to);
+    }
+    XBEM_INFO("dstorage", "  {}: {} requests cover {:#x}-{:#x} of {:#x} bytes; {} gaps ({:#x} bytes){}{}",
+              f->guest_path, f->requests, f->covered.begin()->first, f->covered.rbegin()->second, f->size,
+              f->covered.size() - 1, gap_bytes, gaps.empty() ? "" : ":", gaps);
+  }
+}
+
 HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* request) {
   auto* q = static_cast<QueueState*>(self->state);
   const HRESULT hr = execute_request(q, request, XBEM_RETURN_ADDRESS());
@@ -256,6 +307,18 @@ void XBEM_GUEST_ABI queue_enqueue_signal(ProbeObject*, void* fence, uint64_t val
   signal_d3d12_fence(fence, value);
 }
 
+// 12 EnqueueSetEvent(HANDLE) in the PC interface: the event is set when the
+// requests before it complete - which they already have. A handle that is no
+// event (the console slot meaning something else) is only logged.
+HRESULT XBEM_GUEST_ABI queue_enqueue_set_event(ProbeObject* self, uint64_t handle) {
+  auto event = proc().handles().get_as<rt::EventObject>(handle);
+  if (event) event->set();
+  probe_log(self, 12,
+            std::format("EnqueueSetEvent({:#x}) -> {}", handle, event ? "set (requests complete)" : "not an event"),
+            XBEM_RETURN_ADDRESS());
+  return S_OK;
+}
+
 void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
   auto* q = static_cast<QueueState*>(self->state);
   static std::atomic<int> logged{0};
@@ -268,6 +331,7 @@ void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
               "Submit #{}: {} requests so far, {:#x} bytes read, {:#x} bytes delivered; by compression format{}; "
               "failed {}, memory sources not executed {}",
               n + 1, q->requests, q->bytes_read, q->bytes_out, formats, q->failed, q->memory_sources);
+    log_file_coverage();
   }
 }
 
@@ -275,7 +339,8 @@ const ProbeVtable& queue_vtable() {
   static const ProbeVtable v = make_probe_vtable({{3, reinterpret_cast<void*>(&queue_enqueue_request)},
                                                   {4, reinterpret_cast<void*>(&queue_enqueue_status)},
                                                   {5, reinterpret_cast<void*>(&queue_enqueue_signal)},
-                                                  {6, reinterpret_cast<void*>(&queue_submit)}});
+                                                  {6, reinterpret_cast<void*>(&queue_submit)},
+                                                  {12, reinterpret_cast<void*>(&queue_enqueue_set_event)}});
   return v;
 }
 
