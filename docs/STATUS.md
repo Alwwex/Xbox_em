@@ -86,10 +86,11 @@ compression format 1 is zlib (`src/common/inflate.*`). Root signatures
 output (checked on the 52 captured shaders).
 
 The Leonida project (GPLv3, a static-recompilation effort for the same
-title) documents several of these slots; its documentation was used for
-facts only, no code was taken. Using its code (it has an RDNA2 → SPIR-V
-translator) would require this project to be GPLv3 - an open decision for
-the owner.
+title) documents several of these slots; so far its documentation was used
+for facts only. xbem is now licensed GPL-3.0-or-later (`LICENSE`), so
+Leonida's code - notably its RDNA2 → SPIR-V translator - may be reused with
+attribution (keep its copyright notices, name the source in the file
+header). Leonida is not in this repository; the owner uploads it when needed.
 
 ## Known approximations
 

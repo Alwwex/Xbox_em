@@ -156,3 +156,10 @@ Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Aktuální stav práce na
 - xbem neobsahuje žádný kód, klíče ani soubory Microsoftu. HLE moduly jsou
   vlastní reimplementace podle veřejné dokumentace Win32/GDK.
 - xbem **neobchází ochranu** obsahu: nedešifruje balíčky a nepracuje s klíči.
+
+## Licence
+
+xbem je svobodný software pod licencí **GNU General Public License verze 3
+nebo (dle tvé volby) jakékoli pozdější** (GPL-3.0-or-later), plný text je v
+[LICENSE](LICENSE). Kód převzatý z jiných projektů kompatibilních s GPLv3
+(např. Leonida) si nese uvedení původu u příslušných souborů.
