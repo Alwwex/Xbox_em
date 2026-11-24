@@ -6,4 +6,5 @@ EXPORTS
   XMemAllocatePhysicalPages
   XMemMapPhysicalPages
   XMemFreePhysicalPages
+  XMemMapPhysicalPagesScatter
   XMemIsToolsMemAvailable

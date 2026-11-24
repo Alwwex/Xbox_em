@@ -13,6 +13,7 @@ IMP void* XMemVirtualAlloc(void*, size_t, DWORD, uint64_t, DWORD);
 IMP int32_t XMemAllocatePhysicalPages(uint64_t, uint64_t*, uint64_t*);
 IMP void* XMemMapPhysicalPages(void*, uint64_t, const uint64_t*);
 IMP int32_t XMemFreePhysicalPages(uint64_t, const uint64_t*);
+IMP int32_t XMemMapPhysicalPagesScatter(void**, uint64_t, const uint64_t*);
 IMP BOOL XMemIsToolsMemAvailable(void);
 
 /* xg_xs.dll */
@@ -165,6 +166,26 @@ static void test_xmem(void) {
     CHECK(XMemMapPhysicalPages(w, 3, 0) == w);
     CHECK(free3(0x380, &n2, keep) >= 0 && free3(0x380, &n1, again) >= 0);
     CHECK(VirtualFree(w, 0, MEM_RELEASE));
+  }
+
+  /* Page frame numbers are in 4 KiB units (a 64 KiB page's is a multiple of
+     16): rounding one down to its 64 KiB page, as GTA VI does for the page
+     array of its scatter mappings, keeps distinct pages distinct. */
+  {
+    uint8_t* sp = XMemVirtualAlloc(0, 0x20000, MEM_RESERVE | 0x20000000 /*MEM_LARGE_PAGES*/, 0x3, PAGE_READWRITE);
+    uint64_t n = 2, pg[2] = {0};
+    CHECK(sp != 0 && XMemAllocatePhysicalPages(0x380, &n, pg) >= 0);
+    CHECK((pg[0] & 0xF) == 0 && (pg[1] & 0xF) == 0 && pg[0] != pg[1]);
+    void* vas[2] = {sp, sp + 0x10000};
+    const uint64_t frames[2] = {pg[0] & ~0xFull, pg[1] & ~0xFull};
+    CHECK(XMemMapPhysicalPagesScatter(vas, 2, frames) >= 0);
+    volatile uint8_t* vs = sp;
+    vs[0x40] = 0xA1;
+    vs[0x10040] = 0xB2;
+    CHECK(vs[0x40] == 0xA1 && vs[0x10040] == 0xB2); /* two pages, not one */
+    CHECK(XMemMapPhysicalPages(sp, 2, 0) == sp);
+    CHECK(XMemFreePhysicalPages(2, pg) >= 0);
+    CHECK(VirtualFree(sp, 0, MEM_RELEASE));
   }
 
   /* Placeholders: reserve, split, replace with an allocation, turn back into a

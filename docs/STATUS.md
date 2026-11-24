@@ -308,6 +308,20 @@ of two). A watchpoint on physical memory also guards the page's other
 mappings (`write N via ADDRESS`), and crash reports name the physical page
 of an address and where else it is mapped.
 
+Run on `d172f50` (page-array summaries, watchpoint on every view): the
+title never calls XMemFreePhysicalPages. It maps its 99,776-page allocation
+linearly, then **XMemMapPhysicalPagesScatter** (from `+0xf2cc43`) maps the
+6,720 pages of the 24 GiB pool reservation (where the shader pool lives)
+with the page array `pages[i] & ~0xF`: page `0x38f0` at the first 16
+addresses, `0x3900` at the next 16, and so on - the title takes page frame
+numbers in 4 KiB units (a 64 KiB page's PFN is a multiple of 16) and rounds
+them down to their 64 KiB page. We numbered 64 KiB pages 1, 2, 3..., so 16
+pages became one and the watchpoint saw nine more shader reads write the
+bytecode through `+0x10000`, `+0x20000`, ... (via the other views). **Fix:
+PFNs are now in 4 KiB units** (a 64 KiB page's is a multiple of 16; a frame
+inside a page maps its page). Guest test: a scatter mapping with rounded
+frames gives two pages, not one.
+
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
 the title loads the first chunk of each batch some other way, the pipeline

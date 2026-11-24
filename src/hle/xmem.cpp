@@ -206,7 +206,16 @@ SIZE_T XBEM_GUEST_ABI hle_XMemVirtualQuery(uint64_t a0, uint64_t a1, uint64_t a2
 
 constexpr uint64_t kPhysPageSize = 0x10000;       // 64 KiB physical pages
 constexpr uint64_t kPhysMemorySize = 64ull << 30;  // sparse backing object
-constexpr uint64_t kPfnBase = 0x100;              // page numbers handed out start here (never 0)
+constexpr uint64_t kPfnBase = 0x100;              // the first page handed out is page 0x100 (never 0)
+// Page frame numbers are in 4 KiB units, as on Windows: a 64 KiB page's PFN is
+// its physical address >> 12, a multiple of 16. Titles rely on it: GTA VI
+// builds the page array of its shader pool's scatter mapping as
+// `pfn & ~0xF` (the frame rounded down to 64 KiB). Numbering 64 KiB pages
+// 1, 2, 3... made that put 16 pages on one, and every shader in the pool
+// overwrote the previous one.
+constexpr uint64_t kFramesPerPage = kPhysPageSize / 0x1000;
+constexpr uint64_t pfn_of_page(uint64_t page) { return (kPfnBase + page) * kFramesPerPage; }
+constexpr uint64_t page_of_pfn(uint64_t pfn) { return pfn / kFramesPerPage - kPfnBase; }
 
 struct PageState {
   bool allocated = false;
@@ -228,7 +237,7 @@ struct PhysicalMemory {
   uint64_t next_page = 0;
   std::vector<uint64_t> free_pages;
   uint64_t in_use = 0;
-  std::vector<PageState> pages;                  // by page index (pfn - kPfnBase)
+  std::vector<PageState> pages;                  // by page index (page_of_pfn)
   std::unordered_map<uint64_t, uint64_t> va_pfn;  // mapped 64 KiB page -> pfn
   PhysEvents events;
 
@@ -240,8 +249,9 @@ struct PhysicalMemory {
     }
     return handle >= 0;
   }
-  bool valid(uint64_t pfn) const { return pfn >= kPfnBase && pfn - kPfnBase < next_page; }
-  PageState& state(uint64_t pfn) { return pages[pfn - kPfnBase]; }
+  // A PFN names the 64 KiB page holding that 4 KiB frame.
+  bool valid(uint64_t pfn) const { return pfn >= pfn_of_page(0) && page_of_pfn(pfn) < next_page; }
+  PageState& state(uint64_t pfn) { return pages[page_of_pfn(pfn)]; }
 };
 
 PhysicalMemory g_phys;
@@ -327,7 +337,7 @@ int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, u
         g_phys.pages.emplace_back();
       }
       g_phys.pages[page].allocated = true;
-      pages[k] = kPfnBase + page;
+      pages[k] = pfn_of_page(page);
       ++g_phys.in_use;
     }
     total = g_phys.in_use;
@@ -396,8 +406,8 @@ int32_t XBEM_GUEST_ABI hle_XMemFreePhysicalPages(uint64_t a0, uint64_t a1, uint6
         st.allocated = false;
         // The contents go (a freed page reads as zero when allocated again);
         // where it is still mapped, the title sees that too.
-        platform::discard_shared(g_phys.handle, (pfn - kPfnBase) * kPhysPageSize, kPhysPageSize);
-        g_phys.free_pages.push_back(pfn - kPfnBase);
+        platform::discard_shared(g_phys.handle, page_of_pfn(pfn) * kPhysPageSize, kPhysPageSize);
+        g_phys.free_pages.push_back(page_of_pfn(pfn));
         --g_phys.in_use;
         ++freed;
       }
@@ -422,8 +432,14 @@ void forget_mapping(uint64_t va, uint64_t pfn) {
 
 // Maps physical page `pfn` at `va` (64 KiB aligned) and records it. Called
 // with the mutex held.
-bool map_page(uint64_t va, uint64_t pfn, uint64_t caller) {
-  if (!g_phys.valid(pfn)) return false;
+bool map_page(uint64_t va, uint64_t frame, uint64_t caller) {
+  if (!g_phys.valid(frame)) return false;
+  // A frame inside a 64 KiB page maps the whole page (mappings are 64 KiB).
+  const uint64_t pfn = frame & ~(kFramesPerPage - 1);
+  static uint64_t unaligned = 0;
+  if (pfn != frame && log_event(++unaligned))
+    XBEM_WARN("xmem", "maps frame {:#x} at {:#x}: not the first 4 KiB frame of its 64 KiB page - mapped page {:#x} (#{})",
+              frame, va, pfn, unaligned);
   PageState& st = g_phys.state(pfn);
   if (!st.allocated && log_event(++g_phys.events.unallocated_maps))
     XBEM_WARN("xmem", "maps page {:#x} at {:#x}, but it is not allocated (freed?) - from {} (#{})", pfn, va,
@@ -439,7 +455,7 @@ bool map_page(uint64_t va, uint64_t pfn, uint64_t caller) {
   if (!here && !st.vas.empty() && log_event(++g_phys.events.aliases))
     XBEM_WARN("xmem", "maps page {:#x} at {:#x} while it is also mapped at {:#x} ({} other views) - from {} (#{})", pfn,
               va, st.vas.front(), st.vas.size(), describe_code_address(caller), g_phys.events.aliases);
-  if (!platform::map_shared(va, kPhysPageSize, platform::Prot::RW, g_phys.handle, (pfn - kPfnBase) * kPhysPageSize))
+  if (!platform::map_shared(va, kPhysPageSize, platform::Prot::RW, g_phys.handle, page_of_pfn(pfn) * kPhysPageSize))
     return false;
   g_phys.va_pfn[va] = pfn;
   if (!here) st.vas.push_back(va);
