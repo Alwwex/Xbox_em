@@ -220,7 +220,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     std::lock_guard lock(file->coverage_mutex);
     file->dest_by_offset[offset] = {reinterpret_cast<uint64_t>(dest), dest_size};
   }
-  if (file_reads_logged(file->guest_path) && take_read_log_slot())
+  if (file_reads_logged(file->guest_path) && take_dstorage_log_slot())
     XBEM_INFO("read", "{} DirectStorage at {:#x} size {:#x} (uncompressed {:#x}, compression {}) into {} size {:#x} from {}",
               file->guest_path, offset, source_size, uncompressed_size, compression, static_cast<void*>(dest),
               dest_size, describe_code_address(caller));

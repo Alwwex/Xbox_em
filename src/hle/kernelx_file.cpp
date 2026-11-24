@@ -14,6 +14,7 @@
 
 #include "hle/discovery.h"
 #include "hle/file_log.h"
+#include "hle/heap.h"
 #include "hle/hle_util.h"
 #include "platform/crash.h"
 
@@ -111,8 +112,8 @@ uint64_t to_filetime(fs::file_time_type t) {
 // --log-reads: file operations on files whose guest path contains the
 // pattern (case-insensitive) are logged, the first 600 of them.
 std::string g_read_log_pattern;
-std::atomic<int> g_read_log_count{0};
-constexpr int kReadLogLimit = 600;
+std::atomic<int> g_read_log_count{0}, g_dstorage_log_count{0};
+constexpr int kReadLogLimit = 2000, kDstorageLogLimit = 100;
 
 // Files the title opens and does not find (the first 64), with the host path
 // they map to: a missing or misnamed file shows up here.
@@ -278,8 +279,12 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
   // when the read gave an offset in an OVERLAPPED (Windows semantics).
   if (!f->overlapped) f->position = offset + got;
   if (f->log_reads && take_read_log_slot())
-    XBEM_INFO("read", "{} ReadFile at {:#x} size {:#x}{} -> {:#x} bytes into {} from {}", f->guest_path, offset,
-              count, ov ? " (OVERLAPPED)" : "", got, buffer, describe_code_address(XBEM_RETURN_ADDRESS()));
+  {
+    const std::string dest = describe_destination(buffer);
+    XBEM_INFO("read", "{} ReadFile at {:#x} size {:#x}{} -> {:#x} bytes into {}{} from {}", f->guest_path, offset,
+              count, ov ? " (OVERLAPPED)" : "", got, buffer, dest.empty() ? "" : " (" + dest + ")",
+              describe_code_address(XBEM_RETURN_ADDRESS()));
+  }
   if (read) *read = static_cast<DWORD>(got);
   return TRUE;  // reading at EOF succeeds with 0 bytes
 }
@@ -906,6 +911,18 @@ bool take_read_log_slot() {
   const int n = g_read_log_count.fetch_add(1);
   if (n == kReadLogLimit) XBEM_INFO("read", "(further file operations are not logged)");
   return n < kReadLogLimit;
+}
+
+bool take_dstorage_log_slot() {
+  const int n = g_dstorage_log_count.fetch_add(1);
+  if (n == kDstorageLogLimit) XBEM_INFO("read", "(further DirectStorage requests are not logged)");
+  return n < kDstorageLogLimit;
+}
+
+std::string describe_destination(const void* address) {
+  char where[256] = {};
+  if (describe_virtual_memory(reinterpret_cast<uint64_t>(address), where, sizeof where)) return where;
+  return {};
 }
 
 }  // namespace xbem::hle

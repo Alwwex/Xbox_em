@@ -253,6 +253,17 @@ pointer (Windows does) - fixed. `run --log-reads shaders.rpf` logs every
 CreateFile/SetFilePointer(Ex)/ReadFile/DirectStorage request on the file
 (offset, size, destination, caller). Next: which read fetched `0x1039d2c8`.
 
+Run on `a87db4d`: the OVERLAPPED fix did not change the 1,215 failures.
+The title opens `shaders.rpf` with `FILE_FLAG_NO_BUFFERING` and reads
+sector-aligned blocks (0x1000/0x10000) with OVERLAPPED offsets into a
+static buffer in the executable (`0x1479fb000`, from `+0x314275`) - that is
+how the first chunk of each library batch arrives. The read log ran out on
+DirectStorage requests before the shader reads; ReadFile and DirectStorage
+now have separate limits (2,000 / 100) and reads name their destination
+region. The failing shader object sits at `+0x4ce7aa0` in the big
+allocation in every run: watching its `+0x08` (bytecode pointer) and
+`+0x20` (size) shows the code that loads it.
+
 The memory check of the DirectStorage gaps (run on commit `169d1d0`) found
 data in all of them (55-87 % non-zero bytes; the first gap is two chunks):
 the title loads the first chunk of each batch some other way, the pipeline
