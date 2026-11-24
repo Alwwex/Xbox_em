@@ -5,22 +5,37 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 xbem, exe = sys.argv[1], sys.argv[2]
-proc = subprocess.Popen([xbem, "run", exe], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-deadline = time.time() + 10
-time.sleep(0.5)
+proc = subprocess.Popen([xbem, "run", exe, "--no-window"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+lines = []
+
+
+def read_output():
+    for line in proc.stdout:
+        lines.append(line.decode(errors="replace"))
+
+
+reader = threading.Thread(target=read_output, daemon=True)
+reader.start()
+# Signal only once both guest threads wait (startup takes longer under load).
+deadline = time.time() + 20
+while time.time() < deadline and not any("waiting forever" in l for l in lines):
+    time.sleep(0.05)
+time.sleep(0.3)
 proc.send_signal(signal.SIGQUIT)
 time.sleep(0.5)
 proc.send_signal(signal.SIGINT)
 try:
-    out, _ = proc.communicate(timeout=10)
+    proc.wait(timeout=10)
 except subprocess.TimeoutExpired:
     proc.kill()
     print("xbem did not exit after SIGINT")
     sys.exit(1)
-text = out.decode(errors="replace")
+reader.join(timeout=5)
+text = "".join(lines)
 print(text)
 checks = [
     (r"guest thread dump \(Ctrl\+\\, continuing\)", "SIGQUIT dump"),
