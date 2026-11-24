@@ -115,7 +115,7 @@ endforeach()
 # Console-title APIs (xmem, NLS, resources, ordinal imports, offline network).
 find_program(XBEM_MINGW_WINDRES NAMES x86_64-w64-mingw32-windres)
 if(XBEM_MINGW_WINDRES)
-  set(CONSOLE_LIBS kernelx xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs acphal xapu)
+  set(CONSOLE_LIBS kernelx xgameruntime xmem ws2_32 winhttp oleaut32_ord ntuser gameinput xcrdapi d3d12_xs xg_xs acphal xapu)
   set(CONSOLE_DEPS)
   foreach(lib ${CONSOLE_LIBS})
     list(APPEND CONSOLE_DEPS ${GOUT}/lib${lib}.a)

@@ -8,15 +8,19 @@
 // title with `xbem inspect` - the names below follow the public GDK headers.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 
 #include "hle/discovery.h"
 #include "hle/hle_util.h"
+#include "hle/probe_com.h"
 #include "platform/memory.h"
 
 namespace xbem::hle {
@@ -261,7 +265,10 @@ HRESULT XBEM_GUEST_ABI hle_XSystemGetConsoleId(size_t size, char* buffer, size_t
 }
 
 HRESULT XBEM_GUEST_ABI hle_XSystemGetXboxLiveSandboxId(size_t size, char* buffer, size_t* used) {
-  return copy_id("XDKS.1", size, buffer, used);  // the default development sandbox
+  // A retail console's sandbox. GTA VI compares it with RETAIL, CERT, CERT.DEBUG
+  // and RKTR.* (fn 0x3dda560) and asserts on any other (the development
+  // sandbox XDKS.1 included).
+  return copy_id("RETAIL", size, buffer, used);
 }
 
 HRESULT XBEM_GUEST_ABI hle_XSystemGetAppSpecificDeviceId(size_t size, char* buffer, size_t* used) {
@@ -343,9 +350,62 @@ HRESULT XBEM_GUEST_ABI hle_InitializeApiImplEx2(uint64_t a, uint64_t b, uint64_t
   log_binding_call("InitializeApiImplEx2", a, b, c, d);
   return S_OK;
 }
+// API families the runtime library binds through QueryApiImpl(clsid, iid,
+// &object). Each object is IUnknown (slots 0-2) followed by the family's
+// functions; slots not listed here are probe slots (logged, S_OK).
+
+// XSystem {e349bd1a-fc20-4e40-b99c-4178cc6b409f} / {1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf}:
+// slot 3 GetConsoleId, 4 GetXboxLiveSandboxId, 5 GetAppSpecificDeviceId
+// (measured: the title's wrappers pass 39 and 45 byte buffers to 3 and 5).
+HRESULT XBEM_GUEST_ABI xsystem_console_id(ProbeObject*, size_t size, char* buffer, size_t* used) {
+  return hle_XSystemGetConsoleId(size, buffer, used);
+}
+HRESULT XBEM_GUEST_ABI xsystem_sandbox_id(ProbeObject*, size_t size, char* buffer, size_t* used) {
+  return hle_XSystemGetXboxLiveSandboxId(size, buffer, used);
+}
+HRESULT XBEM_GUEST_ABI xsystem_app_device_id(ProbeObject*, size_t size, char* buffer, size_t* used) {
+  return hle_XSystemGetAppSpecificDeviceId(size, buffer, used);
+}
+
+constexpr uint8_t kXSystemClsid[16] = {0x1a, 0xbd, 0x49, 0xe3, 0x20, 0xfc, 0x40, 0x4e,
+                                       0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f};
+
+// The object implementing `clsid`, or null.
+void* api_implementation(const uint8_t clsid[16]) {
+  if (std::memcmp(clsid, kXSystemClsid, 16) == 0) {
+    static const ProbeVtable vtable = make_probe_vtable({{3, reinterpret_cast<void*>(&xsystem_console_id)},
+                                                         {4, reinterpret_cast<void*>(&xsystem_sandbox_id)},
+                                                         {5, reinterpret_cast<void*>(&xsystem_app_device_id)}});
+    static void* object = make_probe_object("xgameruntime.XSystem", &vtable);
+    return object;
+  }
+  return nullptr;
+}
+
+// The title's runtime library queries the implementation again on every call
+// of a GDK function it could not bind, so polled functions query it thousands
+// of times: the first calls per (class, interface) pair are logged with the
+// call site, later ones counted.
 HRESULT XBEM_GUEST_ABI hle_QueryApiImpl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
-  log_binding_call("QueryApiImpl", a, b, c, d);
-  return E_NOINTERFACE;
+  static std::mutex lock;
+  static std::map<std::pair<std::string, std::string>, uint64_t> calls;
+  uint8_t clsid[16] = {}, iid[16] = {};
+  platform::safe_read(a, clsid, 16);
+  platform::safe_read(b, iid, 16);
+  uint64_t n;
+  {
+    std::lock_guard guard(lock);
+    n = ++calls[{guid_to_string(clsid), guid_to_string(iid)}];
+  }
+  void* object = api_implementation(clsid);
+  if (n <= 3 || std::has_single_bit(n))
+    XBEM_WARN("xgameruntime", "QueryApiImpl({}, {}, {}) from {} -> {} (call {} for this pair)", describe_arg(a),
+              describe_arg(b), describe_arg(c), describe_code_address(XBEM_RETURN_ADDRESS()),
+              object ? "S_OK" : "E_NOINTERFACE", n);
+  if (!object) return E_NOINTERFACE;
+  if (!c) return E_POINTER;
+  *reinterpret_cast<void**>(c) = object;
+  return S_OK;
 }
 HRESULT XBEM_GUEST_ABI hle_UninitializeApiImpl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   log_binding_call("UninitializeApiImpl", a, b, c, d);

@@ -75,6 +75,10 @@ IMP HRESULT D3D12CreateRootSignatureDeserializer(const void* data, size_t size, 
 /* xcrdapi.dll */
 IMP HRESULT DStorageGetFactory(const void* iid, void** factory);
 
+/* xgameruntime.dll */
+IMP HRESULT XSystemGetXboxLiveSandboxId(size_t size, char* buffer, size_t* used);
+IMP HRESULT QueryApiImpl(const void* clsid, const void* iid, void** object);
+
 /* AcpHal.dll, xapu.dll (audio co-processor) */
 IMP HRESULT ApuCreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes);
 IMP HRESULT ApuAlloc(void** va, uint32_t* apu_address, uint32_t size, uint32_t alignment, uint32_t flags);
@@ -535,6 +539,33 @@ static void test_audio(void) {
   CHECK(XApuDisconnect(queue) == 0);
 }
 
+/* A retail console's sandbox (the title asserts on unknown ones). */
+static void test_sandbox(void) {
+  char id[32];
+  size_t used = 0;
+  CHECK(XSystemGetXboxLiveSandboxId(sizeof id, id, &used) == 0 && used == 7);
+  CHECK(id[0] == 'R' && id[1] == 'E' && id[2] == 'T' && id[3] == 'A' && id[4] == 'I' && id[5] == 'L' && id[6] == 0);
+  CHECK(XSystemGetXboxLiveSandboxId(4, id, &used) < 0);
+
+  /* The same through the runtime binding: XSystem's slot 4 */
+  static const uint8_t xsystem_clsid[16] = {0x1a, 0xbd, 0x49, 0xe3, 0x20, 0xfc, 0x40, 0x4e,
+                                            0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f};
+  static const uint8_t xsystem_iid[16] = {0x2e, 0xcf, 0x61, 0x18, 0x8b, 0xe1, 0x34, 0x48,
+                                          0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf};
+  static const uint8_t unknown_clsid[16] = {1, 2, 3};
+  typedef HRESULT (*IdFn)(void*, size_t, char*, size_t*);
+  typedef uint32_t (*ReleaseFn)(void*);
+  void* xsystem = 0;
+  CHECK(QueryApiImpl(unknown_clsid, unknown_clsid, &xsystem) < 0 && !xsystem);
+  CHECK(QueryApiImpl(xsystem_clsid, xsystem_iid, &xsystem) == 0 && xsystem);
+  used = 0;
+  CHECK(((IdFn)VT(xsystem)[4])(xsystem, sizeof id, id, &used) == 0 && used == 7 && id[0] == 'R' && id[5] == 'L');
+  CHECK(((IdFn)VT(xsystem)[3])(xsystem, sizeof id, id, &used) < 0); /* console IDs need 39 bytes */
+  char console_id[39];
+  CHECK(((IdFn)VT(xsystem)[3])(xsystem, sizeof console_id, console_id, &used) == 0 && used == 39);
+  ((ReleaseFn)VT(xsystem)[2])(xsystem);
+}
+
 static void test_gameinput(void) {
   void* gi = 0;
   CHECK(GameInputCreate(&gi) == 0 && gi);
@@ -934,6 +965,7 @@ DWORD guest_main(void* peb) {
   test_dstorage();
   test_gameinput();
   test_audio();
+  test_sandbox();
   test_locale();
   test_time();
   test_topology();
