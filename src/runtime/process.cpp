@@ -220,10 +220,117 @@ uint64_t resolve_code_spec(ModuleLoader& loader, const std::string& spec, std::s
   return m->handle() + offset;
 }
 
+int register_number(std::string_view name) {
+  static const char* const kNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                         "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+  for (int i = 0; i < 16; ++i)
+    if (name == kNames[i]) return i;
+  return -1;
+}
+
+// "+0x10", "-20" (hex) -> signed value; an empty string is 0.
+bool parse_offset(std::string_view text, int64_t& out) {
+  out = 0;
+  if (text.empty()) return true;
+  if (text[0] != '+' && text[0] != '-') return false;
+  std::string digits(text.substr(1));
+  if (digits.empty()) return false;
+  try {
+    size_t used = 0;
+    const uint64_t v = std::stoull(digits, &used, 16);
+    if (used != digits.size()) return false;
+    out = text[0] == '-' ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// "reg[+-off]" -> register number and offset.
+bool parse_reg_offset(std::string_view text, int& reg, int64_t& offset) {
+  const size_t sign = text.find_first_of("+-");
+  reg = register_number(text.substr(0, sign));
+  return reg >= 0 && parse_offset(sign == std::string_view::npos ? std::string_view() : text.substr(sign), offset);
+}
+
+// "reg[+-off][/len]" or "[reg[+-off]][+-off][/len]"
+bool parse_trace_memory(const std::string& text, platform::TraceMemory& m, std::string& error) {
+  std::snprintf(m.text, sizeof m.text, "%s", text.c_str());
+  std::string_view body = text;
+  if (const size_t slash = body.find('/'); slash != std::string_view::npos) {
+    try {
+      m.length = static_cast<uint32_t>(std::stoul(std::string(body.substr(slash + 1)), nullptr, 0));
+    } catch (const std::exception&) {
+      error = "bad length in " + text;
+      return false;
+    }
+    body = body.substr(0, slash);
+  }
+  if (!body.empty() && body[0] == '[') {
+    const size_t close = body.find(']');
+    if (close == std::string_view::npos || !parse_reg_offset(body.substr(1, close - 1), m.reg, m.inner) ||
+        !parse_offset(body.substr(close + 1), m.outer)) {
+      error = "bad memory operand " + text + " (expected [reg+off]+off/len)";
+      return false;
+    }
+    m.indirect = true;
+    return true;
+  }
+  if (!parse_reg_offset(body, m.reg, m.outer)) {
+    error = "bad memory operand " + text + " (expected reg+off/len, registers rax..r15)";
+    return false;
+  }
+  return true;
+}
+
+// "ADDRESS[?reg=hex|?reg!=hex][@memory...]"
+bool parse_trace_options(const std::string& spec, std::string& address, std::string& condition,
+                         platform::TracepointOptions& o, std::string& error) {
+  std::vector<std::string> parts;
+  for (size_t start = 0;;) {
+    const size_t at = spec.find('@', start);
+    parts.push_back(spec.substr(start, at == std::string::npos ? std::string::npos : at - start));
+    if (at == std::string::npos) break;
+    start = at + 1;
+  }
+  if (parts.size() > 5) {
+    error = "at most 4 memory ranges";
+    return false;
+  }
+  address = parts[0];
+  if (const size_t q = address.find('?'); q != std::string::npos) {
+    condition = address.substr(q + 1);
+    address.resize(q);
+    const size_t ne = condition.find("!=");
+    const size_t eq = condition.find('=');
+    const size_t op = ne != std::string::npos ? ne : eq;
+    o.cond_reg = op == std::string::npos ? -1 : register_number(condition.substr(0, op));
+    o.cond_not_equal = ne != std::string::npos;
+    const std::string value = op == std::string::npos ? std::string() : condition.substr(op + (o.cond_not_equal ? 2 : 1));
+    try {
+      size_t used = 0;
+      o.cond_value = std::stoull(value, &used, 16);
+      if (used != value.size()) o.cond_reg = -1;
+    } catch (const std::exception&) {
+      o.cond_reg = -1;
+    }
+    if (o.cond_reg < 0) {
+      error = "bad condition " + condition + " (expected reg=hex or reg!=hex)";
+      return false;
+    }
+  }
+  for (size_t i = 1; i < parts.size(); ++i)
+    if (!parse_trace_memory(parts[i], o.memory[i - 1], error)) return false;
+  return true;
+}
+
 void arm_tracepoints(ModuleLoader& loader, const std::vector<std::string>& specs) {
   for (const std::string& spec : specs) {
-    std::string error;
-    const uint64_t address = resolve_code_spec(loader, spec, error);
+    std::string error, address_text, condition;
+    platform::TracepointOptions options;
+    uint64_t address = 0;
+    if (parse_trace_options(spec, address_text, condition, options, error))
+      address = resolve_code_spec(loader, address_text, error);
     LoadedModule* m = address ? loader.find_containing(address) : nullptr;
     if (address && (!m || !m->image)) error = "not in a game module (emulated code cannot be traced)";
     if (!error.empty()) {
@@ -232,9 +339,11 @@ void arm_tracepoints(ModuleLoader& loader, const std::vector<std::string>& specs
     }
     char where[200];
     describe_address(address, where, sizeof where);
-    const std::string label = spec.find('!') != std::string::npos ? std::format("{} ({})", spec, where) : where;
+    std::string label =
+        address_text.find('!') != std::string::npos ? std::format("{} ({})", address_text, where) : where;
+    if (!condition.empty()) label += " if " + condition;
     const uint8_t first = *reinterpret_cast<const uint8_t*>(address);
-    if (!platform::add_tracepoint(address, label.c_str())) {
+    if (!platform::add_tracepoint(address, label.c_str(), options)) {
       XBEM_WARN("trace", "--trace-at {}: cannot patch the code (or more than 64 tracepoints)", spec);
       continue;
     }

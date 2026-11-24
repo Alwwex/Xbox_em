@@ -56,7 +56,11 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    on each instruction; the first hits (`--trace-log N`, default 8) are
    logged with all registers, `[rsp]` and a 6-frame backtrace, and the crash
    report lists hit counts and the last hits of all tracepoints in order
-   (`sed -n '/^Tracepoints:/,/^Backtrace/p' run.log`). A good set: every
+   (`sed -n '/^Tracepoints:/,/^Backtrace/p' run.log`). `ADDR?r8=0` logs
+   and records only hits where R8 is 0 (`?reg!=hex` the opposite);
+   `ADDR@rcx+0xc40/0x60` and `ADDR@[rcx+0xc78]/0x200` dump memory at a
+   register (+offset) or through a pointer read from one, with each logged
+   hit (hex and ASCII). Quote the list in single quotes in bash. A good set: every
    instruction that stores the field a crash reads (found with
    `objdump ... | grep -E "PTR \[[a-z0-9]+\+0xOFFSET\],"`), plus the
    functions in the crash backtrace.
@@ -135,7 +139,17 @@ Tracepoints on all 22 stores to `ctx+0x12328` (one run, guest thread 340):
 
 fn `0x517acd0` binds a cached pipeline: `ctx+0x12330` = pipeline,
 `ctx+0x12328` = `[pipeline+8]`, topology byte `[pipeline+0x1e]` (not reached
-before the crash). Next: where fn `0x54793f0` gets the null program.
+before the crash).
+
+fn `0x54793f0(effect, ctx, pass, variant)` picks the program as
+`[effect+0xc78][bits 15..23 of [effect+0xc68][pass] + variant]`; in the
+crash the index is 42 and that entry is null, while the pass-state entry at
+`[effect+0xc70] + 42*24` exists. fn `0xb39840` (called by the fullscreen
+pass) computes pass and variant and tail-jumps there. Open: a missing
+program (shader data not loaded - DirectStorage now logs requests per
+compression format, failures and unexecuted memory-source requests in its
+Submit lines), or a variant chosen from a device property the emulator
+reports differently from the console.
 
 ## Known approximations
 

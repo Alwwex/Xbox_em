@@ -22,6 +22,7 @@
 #include <fstream>
 #include <cstring>
 #include <format>
+#include <map>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -136,6 +137,10 @@ struct QueueState {
   std::mutex mutex;
   HRESULT first_error = S_OK;  // since the last status/signal
   uint64_t requests = 0, bytes_read = 0, bytes_out = 0;
+  // Statistics for the Submit log: requests per compression format, failed
+  // requests, and requests whose source is memory (not executed yet).
+  std::map<uint32_t, uint64_t> by_compression;
+  uint64_t failed = 0, memory_sources = 0;
 };
 
 std::string hex_qwords(const uint64_t* q, int n) {
@@ -166,6 +171,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   const uint32_t source_size = static_cast<uint32_t>(w[fi + 2]);
   const uint32_t uncompressed_size = static_cast<uint32_t>(w[fi + 2] >> 32);
   const uint32_t compression = static_cast<uint32_t>(w[0] & 0xFF);
+  {
+    std::lock_guard lock(q->mutex);
+    ++q->by_compression[compression];
+  }
   // Destination memory: the first pointer before the file, its size the next
   // non-zero word.
   uint8_t* dest = nullptr;
@@ -220,6 +229,8 @@ HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* r
   if (hr < 0) {
     std::lock_guard lock(q->mutex);
     if (q->first_error >= 0) q->first_error = hr;
+    if (hr == E_NOTIMPL) ++q->memory_sources;
+    else ++q->failed;
   }
   return S_OK;  // EnqueueRequest itself returns void on the PC; errors surface through status arrays
 }
@@ -251,8 +262,12 @@ void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
   const int n = logged.fetch_add(1);
   if (n < 3 || (n & (n - 1)) == 0) {
     std::lock_guard lock(q->mutex);
-    XBEM_INFO("dstorage", "Submit #{}: {} requests so far, {:#x} bytes read, {:#x} bytes delivered", n + 1,
-              q->requests, q->bytes_read, q->bytes_out);
+    std::string formats;
+    for (const auto& [format, count] : q->by_compression) formats += std::format(" {}:{}", format, count);
+    XBEM_INFO("dstorage",
+              "Submit #{}: {} requests so far, {:#x} bytes read, {:#x} bytes delivered; by compression format{}; "
+              "failed {}, memory sources not executed {}",
+              n + 1, q->requests, q->bytes_read, q->bytes_out, formats, q->failed, q->memory_sources);
   }
 }
 

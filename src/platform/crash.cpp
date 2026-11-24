@@ -12,7 +12,7 @@ void set_continue_after_breakpoint(bool) {}
 const char* patch_cache_hint_instruction(uint8_t*) { return nullptr; }
 void set_thread_context_printer(ThreadContextPrinter) {}
 void set_backtrace_printer(BacktracePrinter) {}
-bool add_tracepoint(uint64_t, const char*) { return false; }
+bool add_tracepoint(uint64_t, const char*, const TracepointOptions&) { return false; }
 void set_tracepoint_log_hits(int) {}
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
@@ -369,7 +369,9 @@ struct Tracepoint {
   uint64_t address = 0;
   uint8_t original = 0;
   char label[160] = {};
+  TracepointOptions options;
   std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> matched{0};  // hits that met the condition (all hits without one)
   std::atomic<bool> armed{false};
   TraceHit ring[kRing];
 };
@@ -406,9 +408,57 @@ void write_hit(const Tracepoint& t, const TraceHit& h, const char* prefix) {
   write_str(line);
 }
 
+// Memory a tracepoint asks for, as hex and ASCII, 32 bytes per line.
+void write_memory_dumps(const Tracepoint& t, const uint64_t* gpr) {
+  char line[400];
+  for (const TraceMemory& m : t.options.memory) {
+    if (m.reg < 0) continue;
+    uint64_t address = gpr[m.reg] + static_cast<uint64_t>(m.outer);
+    if (m.indirect) {
+      uint64_t pointer = 0;
+      if (!safe_read(gpr[m.reg] + static_cast<uint64_t>(m.inner), &pointer, 8)) {
+        std::snprintf(line, sizeof line, "    mem %s: the pointer is not readable\n", m.text);
+        write_str(line);
+        continue;
+      }
+      address = pointer + static_cast<uint64_t>(m.outer);
+    }
+    std::snprintf(line, sizeof line, "    mem %s = %llx:\n", m.text, static_cast<unsigned long long>(address));
+    write_str(line);
+    for (uint32_t off = 0; off < m.length; off += 32) {
+      uint8_t bytes[32];
+      const uint32_t n = std::min<uint32_t>(32, m.length - off);
+      if (!safe_read(address + off, bytes, n)) {
+        std::snprintf(line, sizeof line, "      +%03x: (not readable)\n", off);
+        write_str(line);
+        break;
+      }
+      size_t used = static_cast<size_t>(std::snprintf(line, sizeof line, "      +%03x:", off));
+      for (uint32_t k = 0; k < n; ++k)
+        used += static_cast<size_t>(std::snprintf(line + used, sizeof line - used, "%s%02x", k % 8 ? " " : "  ", bytes[k]));
+      used += static_cast<size_t>(std::snprintf(line + used, sizeof line - used, "  |"));
+      for (uint32_t k = 0; k < n && used + 3 < sizeof line; ++k)
+        line[used++] = bytes[k] >= 0x20 && bytes[k] < 0x7f ? static_cast<char>(bytes[k]) : '.';
+      std::snprintf(line + used, sizeof line - used, "|\n");
+      write_str(line);
+    }
+  }
+}
+
 void record_hit(Tracepoint& t, const greg_t* g) {
   const uint64_t n = t.hits.fetch_add(1) + 1;
-  TraceHit& h = t.ring[(n - 1) % Tracepoint::kRing];
+  if (n == kTraceDisarmAfter) {
+    t.armed.store(false);
+    char line[300];
+    std::snprintf(line, sizeof line, "[warn ][trace] %s disarmed after %llu hits\n", t.label,
+                  static_cast<unsigned long long>(n));
+    write_str(line);
+  }
+  const TracepointOptions& o = t.options;
+  if (o.cond_reg >= 0 && (static_cast<uint64_t>(g[kUnwindOrder[o.cond_reg]]) == o.cond_value) == o.cond_not_equal)
+    return;
+  const uint64_t m = t.matched.fetch_add(1) + 1;
+  TraceHit& h = t.ring[(m - 1) % Tracepoint::kRing];
   h.seq = 0;
   const DumpSlot* slot = slot_of_tid(current_tid());
   h.guest_thread = slot ? slot->guest_id : 0;
@@ -416,23 +466,17 @@ void record_hit(Tracepoint& t, const greg_t* g) {
   h.ret = 0;
   safe_read(h.gpr[4], &h.ret, 8);
   h.seq = g_trace_seq.fetch_add(1) + 1;
-  if (n <= static_cast<uint64_t>(g_trace_log_hits)) {
+  if (m <= static_cast<uint64_t>(g_trace_log_hits)) {
     lock_print();
     char head[300];
     std::snprintf(head, sizeof head, "[trace] %s hit %llu%s\n", t.label, static_cast<unsigned long long>(n),
-                  n == static_cast<uint64_t>(g_trace_log_hits) ? " (later hits are counted, not logged)" : "");
+                  m == static_cast<uint64_t>(g_trace_log_hits) ? " (later hits are counted, not logged)" : "");
     write_str(head);
     write_hit(t, h, "  ");
+    write_memory_dumps(t, h.gpr);
     if (g_backtrace_printer && slot && slot->stack_high)
       g_backtrace_printer(h.gpr, t.address, slot->stack_low, slot->stack_high, 6, &write_str);
     unlock_print();
-  }
-  if (n == kTraceDisarmAfter) {
-    t.armed.store(false);
-    char line[300];
-    std::snprintf(line, sizeof line, "[warn ][trace] %s disarmed after %llu hits\n", t.label,
-                  static_cast<unsigned long long>(n));
-    write_str(line);
   }
 }
 
@@ -481,8 +525,11 @@ void print_tracepoint_summary() {
   int n = 0;
   for (int i = 0; i < count; ++i) {
     const Tracepoint& t = g_tracepoints[i];
-    std::snprintf(line, sizeof line, "  %s: %llu hits%s\n", t.label, static_cast<unsigned long long>(t.hits.load()),
-                  t.armed.load() ? "" : " (disarmed)");
+    char matched[64] = "";
+    if (t.options.cond_reg >= 0)
+      std::snprintf(matched, sizeof matched, ", %llu matched", static_cast<unsigned long long>(t.matched.load()));
+    std::snprintf(line, sizeof line, "  %s: %llu hits%s%s\n", t.label, static_cast<unsigned long long>(t.hits.load()),
+                  matched, t.armed.load() ? "" : " (disarmed)");
     write_str(line);
     for (int k = 0; k < static_cast<int>(Tracepoint::kRing); ++k)
       if (t.ring[k].seq) refs[n++] = {t.ring[k].seq, i, k};
@@ -673,7 +720,7 @@ void set_continue_after_breakpoint(bool enabled) { g_continue_after_breakpoint.s
 void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
 void set_backtrace_printer(BacktracePrinter printer) { g_backtrace_printer = printer; }
 
-bool add_tracepoint(uint64_t address, const char* label) {
+bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions& options) {
   const int i = g_tracepoint_count.load();
   if (i >= kMaxTracepoints) return false;
   for (int k = 0; k < i; ++k)
@@ -684,6 +731,8 @@ bool add_tracepoint(uint64_t address, const char* label) {
   t.address = address;
   t.original = *reinterpret_cast<const uint8_t*>(address);
   std::snprintf(t.label, sizeof t.label, "%s", label);
+  t.options = options;
+  for (TraceMemory& m : t.options.memory) m.length = std::min<uint32_t>(m.length, 1024);
   t.armed.store(true);
   g_tracepoint_count.store(i + 1);  // published before the int3 can be reached
   put_code_byte(address, 0xCC);

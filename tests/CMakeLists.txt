@@ -248,12 +248,18 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   # (three calls -> three hits), the title still runs to the end; bad specs warn.
   xbem_guest_test(guest_tracepoints
                   COMMAND run ${GOUT}/dlls.exe --trace-at
-                          gamelib.dll!gamelib_add,gamelib.dll+0x7fffffff,nosuch.dll!f,gamelib.dll!gamelib_tick
-                  EXPECT "tracepoint at gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\)"
-                         "\\[trace\\] gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\) hit 3"
+                          gamelib.dll!gamelib_add?rdx=2@rsp/16@[rsp]-0x10/48,gamelib.dll+0x7fffffff,nosuch.dll!f,gamelib.dll!gamelib_tick,gamelib.dll+0x1000@xyz/8,gamelib.dll+0x1000?rcx~1
+                  EXPECT "tracepoint at gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\) if rdx=2"
+                         "\\[trace\\] gamelib.dll!gamelib_add \\(gamelib.dll\\+0x[0-9a-f]+\\) if rdx=2 hit 3"
                          "    rax=[0-9a-f]+ rcx=[0-9a-f]+ rdx=2 "
+                         "    mem rsp/16 = [0-9a-f]+:\n      \\+000:  [0-9a-f][0-9a-f] "
+                         "    mem .rsp.-0x10/48 = 14[0-9a-f]+:\n      \\+000:  .*\n      \\+020:  "
                          "offset is outside gamelib.dll" "module nosuch.dll is not loaded"
-                         "no export gamelib_tick in gamelib.dll" "PASS dlls")
+                         "no export gamelib_tick in gamelib.dll" "bad memory operand xyz/8" "bad condition rcx~1"
+                         "PASS dlls")
+  # A condition that never holds: hits are counted, none logged or recorded.
+  xbem_guest_test(guest_tracepoint_condition COMMAND run ${GOUT}/crash.exe --trace-at crash.exe!call_fault?rcx!=10
+                  EXIT 139 EXPECT "crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\) if rcx!=10: 1 hits, 0 matched")
   xbem_guest_test(guest_tracepoint_crash COMMAND run ${GOUT}/crash.exe --trace-at crash.exe!call_fault EXIT 139
                   EXPECT "\\[trace\\] crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\) hit 1"
                          "Tracepoints:" "crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\): 1 hits"
