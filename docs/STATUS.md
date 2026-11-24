@@ -21,7 +21,9 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    artifact `xbem-linux-x64` in the job "Linux (build, unit tests, …)"
    (about 1.5 minutes; the guest-test and Windows jobs take longer and do not
    matter for the artifact).
-2. The owner downloads it in Windows (Downloads folder), then in WSL:
+2. The owner downloads it in Windows (Downloads folder), then in WSL
+   (`xbem --version` and the first log line print the commit the binary
+   was built from - compare it with the pushed one):
 
    ```bash
    cd ~/xbem && unzip -o /mnt/c/Users/alexa/Downloads/xbem-linux-x64.zip && chmod +x build/bin/xbem
@@ -204,6 +206,20 @@ queue method was called. If they are never loaded, the library's
 hash-sorted pipeline records have zeroed blocks and lookups fail. The Submit
 lines now check the memory each gap's data belongs to (between the
 neighbouring requests' destinations): all zero means nothing else loaded it.
+
+A counting tracepoint (`14247c833?rax=0`, `--trace-log 0`) showed **1,215
+of 1,234 program lookups returning null** - a systematic failure, not a few
+missing records. fn `0x141d65750(s0..s4, cfg, stages)` hashes the five
+shader objects (their `+0x18` hashes, CityHash-style mixing with
+`0x9ddfea08eb382d69`), looks the hash up in a global program cache
+(`0x1475d59a0`, capacity `0x1475d5998`, lock `0x1475d5968`), and on a miss
+allocates a program (`0x141f765a0`), fills it (`+8..+0x28` the five
+objects, `+0x30` the stages via `0x142476d40`, `+0x60` cfg, `+0x68` hash,
+`+0x70` refcount 1, `+0x74` OR of the objects' `+0x28` flags, `+0x78` stage
+count) and calls **`0x142476e20(program)`**: when that returns false the
+program is destroyed and null returned. The failing calls never reach
+emulated code (R11 keeps the title's value), so `0x142476e20` rejects them
+on its own. Next: its code.
 
 ## Known approximations
 

@@ -24,6 +24,20 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# The git commit the binary is built from: `xbem --version` and the first
+# line of every run print it, so a stale binary is easy to spot in a log.
+set(XBEM_GIT_COMMIT "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE XBEM_GIT_COMMIT_OUT OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE XBEM_GIT_RESULT)
+  if(XBEM_GIT_RESULT EQUAL 0 AND XBEM_GIT_COMMIT_OUT)
+    set(XBEM_GIT_COMMIT ${XBEM_GIT_COMMIT_OUT})
+  endif()
+endif()
+
 add_subdirectory(src)
 
 if(XBEM_BUILD_TESTS)

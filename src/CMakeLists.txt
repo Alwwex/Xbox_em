@@ -80,6 +80,8 @@ add_executable(xbem
   app/main.cpp
   app/commands.cpp
 )
+set_source_files_properties(app/main.cpp PROPERTIES
+  COMPILE_DEFINITIONS "XBEM_VERSION=\"${PROJECT_VERSION}\";XBEM_GIT_COMMIT=\"${XBEM_GIT_COMMIT}\"")
 target_link_libraries(xbem PRIVATE xbem_core)
 if(NOT MSVC)
   target_compile_options(xbem PRIVATE -Wall -Wextra -Wno-unused-parameter)

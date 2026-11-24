@@ -14,6 +14,7 @@ void print_usage() {
       "xbem - experimental Xbox Series X|S compatibility layer (research prototype)\n"
       "\n"
       "usage: xbem [--log-level trace|debug|info|warn|error] <command> [args]\n"
+      "       xbem --version\n"
       "\n"
       "analysis (work on any host):\n"
       "  inspect <file.exe|dll>          PE headers, sections, TLS, PDB, imports with HLE coverage\n"
@@ -72,6 +73,9 @@ int main(int argc, char** argv) {
     } else if (args[i] == "--help") {
       print_usage();
       return 0;
+    } else if (args[i] == "--version") {
+      std::printf("xbem %s (commit %s)\n", XBEM_VERSION, XBEM_GIT_COMMIT);
+      return 0;
     } else {
       break;
     }
@@ -90,7 +94,10 @@ int main(int argc, char** argv) {
     if (command == "xvd") return xbem::app::cmd_xvd(rest);
     if (command == "cpu") return xbem::app::cmd_cpu(rest);
     if (command == "hle") return xbem::app::cmd_hle(rest);
-    if (command == "run") return xbem::app::cmd_run(rest);
+    if (command == "run") {
+      XBEM_INFO("xbem", "xbem {} (commit {})", XBEM_VERSION, XBEM_GIT_COMMIT);
+      return xbem::app::cmd_run(rest);
+    }
     if (command == "hexdump") return xbem::app::cmd_hexdump(rest);
     if (command == "func") return xbem::app::cmd_func(rest);
     if (command == "gpu-disasm") return xbem::app::cmd_gpu_disasm(rest);

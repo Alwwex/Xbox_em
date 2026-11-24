@@ -194,6 +194,7 @@ endfunction()
 # Analysis commands work on every host.
 xbem_guest_test(inspect_imports COMMAND inspect ${GOUT}/unimplemented.exe
                 EXPECT "kernelx.dll  \\[HLE\\]  3/5 resolved" "- XbemDefinitelyMissing" "- XbemMissingWithArgs")
+xbem_guest_test(version COMMAND --version EXPECT "xbem [0-9]+\\.[0-9]+\\.[0-9]+ \\(commit [0-9a-f]+\\)")
 xbem_guest_test(hexdump COMMAND hexdump ${GOUT}/hello.exe 1000 32 EXPECT "00001000:( [0-9a-f][0-9a-f])+" "00001010:")
 xbem_guest_test(func_lookup_many COMMAND func ${GOUT}/hello.exe 1010 140001020 ffffff
                 EXPECT "00001010  fn 00001000 \\+0x10" "00001020  fn 00001000 \\+0x20" "00ffffff  -")
