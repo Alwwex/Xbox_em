@@ -12,7 +12,7 @@
 |---|---|---|
 | **CPU** | AMD Zen 2, x86‑64 | **Nic se neemuluje** – kód hry běží nativně na tvém CPU (stejný princip jako Wine/Proton). `xbem cpu` ověří, že tvoje CPU má potřebné instrukce. |
 | **OS / systémové DLL** | upravené Windows jádro, `kernelx.dll`, GDK runtime (`XGameRuntime`) | **HLE** (high‑level emulace): vlastní reimplementace funkcí, které hra importuje. Co chybí, se automaticky nahradí stubem, který to zaloguje. |
-| **GPU** | RDNA2, Direct3D 12.X, shadery předkompilované do nativního strojového kódu GPU | **Největší chybějící kus.** Zatím jen „null“ backend, který vrátí chybu při vytváření zařízení. Plán je v [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#gpu). |
+| **GPU** | RDNA2, Direct3D 12.X, shadery předkompilované do nativního strojového kódu GPU | **Největší chybějící kus.** Hra dostává „headless“ D3D12.X zařízení (práce GPU se hned dokončí, nic se nekreslí); shadery se dají zachytit a disassemblovat (RDNA2). Plán je v [docs/GPU.md](docs/GPU.md). |
 | **Balíčky** | `.xvc` / `.msixvc` (šifrované) | xbem **nic nedešifruje** a nepracuje s klíči. Potřebuješ „loose“ build – složku, kterou vytvoří build GDK před zabalením. |
 
 ### Nejdřív upřímná rada
@@ -124,7 +124,7 @@ Volby pro `run`: `--strict`, `--device series-x|series-s|devkit`,
    herní kód (x86‑64) běží přímo na CPU hostitele; do xbem se dostane jen voláním importů
 ```
 
-Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Detaily: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Aktuální stav práce na konkrétní hře, testovací smyčka a další kroky: [docs/STATUS.md](docs/STATUS.md).
 
 ## Struktura repozitáře
 

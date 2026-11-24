@@ -576,6 +576,12 @@ static void test_headless_d3d12(void) {
   void* const fence_vtable = *(void**)fence;
   CHECK(((QueueSignalFn)VT(queue)[16])(queue, fence, 9) == 0);
   CHECK(*(void**)fence == fence_vtable && ((FenceValueFn)VT(fence)[8])(fence) == 9);
+  /* Console fence slot 12: the address of the fence value, read by the title */
+  typedef const uint64_t* (*FenceAddrFn)(void*, uint64_t, void*, uint64_t);
+  uint64_t fence_args[2] = {0x1234, 0x5678};
+  const uint64_t* fence_value = ((FenceAddrFn)VT(fence)[12])(fence, 2, fence_args, 1);
+  CHECK(fence_value && *fence_value == 9 && fence_args[0] == 0x1234);
+  CHECK(((QueueSignalFn)VT(queue)[16])(queue, fence, 11) == 0 && *fence_value == 11);
   typedef HRESULT (*FreqFn)(void*, uint64_t*);
   uint64_t frequency = 0;
   CHECK(((FreqFn)VT(queue)[18])(queue, &frequency) == 0 && frequency == 100000000);

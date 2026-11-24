@@ -181,9 +181,19 @@ HRESULT XBEM_GUEST_ABI fence_signal_cpu(ProbeObject* self, uint64_t value) {
   fence_signal(static_cast<FenceState*>(self->state), value);
   return S_OK;
 }
+// 12 (console): the address of the fence's 64-bit value. Console fences are
+// memory the GPU writes; a real title calls this and then reads the value
+// itself, comparing it with UINT64_MAX (device removed) like the PC
+// GetCompletedValue. The arguments (2, a structure on the caller's stack, a
+// flag) are logged and left untouched.
+const uint64_t* XBEM_GUEST_ABI fence_get_value_address(ProbeObject* self, uint64_t a0, uint64_t a1, uint64_t a2) {
+  probe_log(self, 12, std::format("GetValueAddressX({:#x}, {:#x}, {:#x})", a0, a1, a2), XBEM_RETURN_ADDRESS());
+  return &static_cast<FenceState*>(self->state)->value;
+}
 const ProbeVtable g_fence_vtable = make_vtable({{8, fn(&fence_get_completed_value)},
                                                 {9, fn(&fence_set_event_on_completion)},
-                                                {10, fn(&fence_signal_cpu)}});
+                                                {10, fn(&fence_signal_cpu)},
+                                                {12, fn(&fence_get_value_address)}});
 
 void* new_fence(const std::string& name, uint64_t initial) {
   auto* state = new FenceState;
