@@ -296,6 +296,12 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                          "rdx=2: rcx\\+0x3000/8: write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 01 00 00 00 00 00 00 00 -> 02 00 00 00 00 00 00 00"
                          "write 2 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 02 00 00 00 00 00 00 00 -> 03 00"
                          "\\[trace\\] watch.exe!after_store \\(watch.exe\\+0x[0-9a-f]+\\) hit 1" "PASS watch")
+  # Crash reports list a runtime-armed watchpoint with its address and what it holds now.
+  xbem_guest_test(guest_watchpoint_at_crash COMMAND run ${GOUT}/crash.exe --watch at:crash.exe!call_fault:rsp-0x100/8
+                  EXIT 139
+                  EXPECT "\\[watch\\] at crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\): rsp-0x100/8: armed at 0x[0-9a-f]+ \\(hit 1\\)"
+                         "Watchpoints .last writes"
+                         "rsp-0x100/8 at 0x[0-9a-f]+: [0-9]+ writes, now [0-9a-f][0-9a-f] ")
   # The run window's display surface: a back buffer made like the title's
   # (no DISPLAY in tests: the window is reported as not opened).
   xbem_guest_test(guest_present COMMAND run ${GOUT}/present.exe

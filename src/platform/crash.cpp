@@ -708,10 +708,19 @@ void print_watchpoint_summary() {
   write_str("Watchpoints (last writes, oldest first):\n");
   for (int i = 0; i < count; ++i) {
     const Watchpoint& w = g_watchpoints[i];
-    std::snprintf(line, sizeof line, "  %s: %llu writes%s\n", w.label, static_cast<unsigned long long>(w.writes.load()),
-                  w.armed.load() ? "" : " (never armed)");
-    write_str(line);
     const uint32_t shown = std::min<uint32_t>(w.length, 16);
+    // What the range holds now: a change no logged write explains means the
+    // page lost its protection (remapped, recommitted) or the kernel wrote it.
+    uint8_t now[16] = {};
+    char now_text[64] = "not readable";
+    if (w.armed.load() && safe_read(w.address, now, shown)) write_bytes(now_text, sizeof now_text, now, shown);
+    if (w.armed.load())
+      std::snprintf(line, sizeof line, "  %s at %#llx: %llu writes, now %s\n", w.label,
+                    static_cast<unsigned long long>(w.address), static_cast<unsigned long long>(w.writes.load()),
+                    now_text);
+    else
+      std::snprintf(line, sizeof line, "  %s: never armed\n", w.label);
+    write_str(line);
     for (uint32_t k = 0; k < Watchpoint::kRing; ++k) {
       const uint64_t n = w.writes.load();
       if (n <= k) break;
