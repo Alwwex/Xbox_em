@@ -481,7 +481,8 @@ void* XBEM_GUEST_ABI hle_XMemMapPhysicalPages(uint64_t va, uint64_t count, uint6
     std::lock_guard lock(g_phys.mutex);
     for (uint64_t k = 0; k < count && ok; ++k) {
       const uint64_t page_va = va + k * kPhysPageSize;
-      ok = pages ? map_page(page_va, pages[k], caller) : unmap_page(page_va);
+      // A 0 entry unmaps its page, as in MapUserPhysicalPages.
+      ok = pages && pages[k] ? map_page(page_va, pages[k], caller) : unmap_page(page_va);
     }
   }
   platform::refresh_watchpoint_views();  // a new mapping replaced the protection of watched pages
@@ -509,7 +510,11 @@ int32_t XBEM_GUEST_ABI hle_XMemMapPhysicalPagesScatter(uint64_t a0, uint64_t a1,
     std::lock_guard lock(g_phys.mutex);
     ok = true;
     for (uint64_t k = 0; k < a1 && ok; ++k)
-      ok = (vas[k] % kPhysPageSize) == 0 && (pages ? map_page(vas[k], pages[k], caller) : unmap_page(vas[k]));
+      // A 0 entry unmaps its address (MapUserPhysicalPagesScatter): GTA VI
+      // maps a few pages, then unmaps them with the same addresses and zeros
+      // and asserts (int3) that it worked.
+      ok = (vas[k] % kPhysPageSize) == 0 &&
+           (pages && pages[k] ? map_page(vas[k], pages[k], caller) : unmap_page(vas[k]));
   }
   platform::refresh_watchpoint_views();
   static std::atomic<uint64_t> calls{0};

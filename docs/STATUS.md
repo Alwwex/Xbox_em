@@ -146,6 +146,17 @@ the thread entry `0x2215ea0`): `mov rax, [0x14ab5cdf8]` then
 lists the code that reads and writes it; `run --watch 14ab5cdf8` shows
 whether anything stores it.
 
+Run on `ce41254`: 296 references, two stores - fn `0x24306e0` +0x26 clears
+it, **fn `0x5a6f390` +0x1f sets it** (`mov [rip+...], rsi`) - and the
+watchpoint saw no write: the setter never ran. At the crash the loader
+threads were still busy (thread 340 in fn `0x4e8aa73`, thread 304 reading
+shaders). On the way: the title's second XMemMapPhysicalPagesScatter call
+(from `+0xf2cc43`) with the same addresses and **0 page entries FAILED**,
+and the title asserts on it (`int3` at `+0xf2cc4b`): a 0 entry unmaps its
+address (as in MapUserPhysicalPagesScatter) - fixed for both map calls.
+`xrefs` now also lists direct calls/jumps to an address and 8-byte pointers
+to it in data sections (vtables), to find who calls the setter.
+
 Earlier crash (fixed by the PFN change):
 
 `game_scarlett_master.exe+0xb5a5f8` (fn `0xb5a5d0`, the title's graphics

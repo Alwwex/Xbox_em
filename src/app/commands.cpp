@@ -546,11 +546,13 @@ int cmd_func(const Args& args) {
   return 0;
 }
 
-// Finds the instructions in an image's code that address [address, address +
-// length) RIP-relatively (globals): a ModRM byte with mod 00 and r/m 101, then
-// a 32-bit displacement that, from the end of the instruction, reaches the
-// range. The immediate size comes from the opcode; prefixes are found by a
-// short look back, so the instruction start is a good guess, not a decode.
+// Finds what refers to [address, address + length) in an image: instructions
+// that address it RIP-relatively (globals: a ModRM byte with mod 00 and r/m
+// 101, then a 32-bit displacement that reaches the range from the end of the
+// instruction - the immediate size comes from the opcode, prefixes from a
+// short look back, so the instruction start is a good guess, not a decode),
+// direct calls and jumps to it (E8/E9/0F 8x rel32), and 8-byte pointers to it
+// in data sections (vtables, function tables).
 int cmd_xrefs(const Args& args) {
   if (args.size() < 2)
     throw std::runtime_error("usage: xbem xrefs <file.exe|dll> <address|rva|export>[/length]...");
@@ -606,9 +608,47 @@ int cmd_xrefs(const Args& args) {
     std::printf("references to %llx (rva %08x, %u bytes):\n", static_cast<unsigned long long>(base + target), target,
                 length);
     int found = 0;
+    const auto print_ref = [&](uint32_t insn_rva, const char* kind, size_t from, size_t to, uint64_t ref) {
+      char bytes[64] = {0};
+      size_t used = 0;
+      for (size_t k = from; k < to && used + 4 < sizeof bytes; ++k)
+        used += static_cast<size_t>(std::snprintf(bytes + used, sizeof bytes - used, "%s%02x", k == from ? "" : " ", file[k]));
+      const auto fn = function_of(insn_rva);
+      char where[48] = "no .pdata entry";
+      if (fn) std::snprintf(where, sizeof where, "fn %08x +0x%x", *fn, insn_rva - *fn);
+      std::printf("  %llx  %-20s %-8s %s%s\n", static_cast<unsigned long long>(base + insn_rva), where, kind, bytes,
+                  ref != target ? std::format("  (+{:#x})", ref - target).c_str() : "");
+      ++found;
+    };
     for (const pe::Section& sec : img.sections()) {
-      if (!sec.executable()) continue;
       const size_t begin = sec.raw_offset, end = std::min<size_t>(file.size(), size_t{sec.raw_offset} + sec.raw_size);
+      if (!sec.executable()) {
+        // Absolute pointers (vtables, function tables, data pointing at data).
+        if (sec.name == ".pdata" || sec.name == ".reloc") continue;
+        for (size_t p = begin + ((8 - (sec.virtual_address & 7)) & 7); p + 8 <= end; p += 8) {
+          uint64_t v;
+          std::memcpy(&v, file.data() + p, 8);
+          if (v < base + target || v >= base + target + length) continue;
+          const uint32_t at = sec.virtual_address + static_cast<uint32_t>(p - begin);
+          std::printf("  %llx  %-20s %-8s %s+0x%x holds %llx\n", static_cast<unsigned long long>(base + at), "data",
+                      "pointer", sec.name.c_str(), at - sec.virtual_address, static_cast<unsigned long long>(v));
+          ++found;
+        }
+        continue;
+      }
+      // Direct calls and jumps: E8/E9 rel32, 0F 80..8F rel32.
+      for (size_t p = begin; p + 5 <= end; ++p) {
+        const bool call_or_jmp = file[p] == 0xE8 || file[p] == 0xE9;
+        const bool jcc = file[p] == 0x0F && p + 6 <= end && (file[p + 1] & 0xF0) == 0x80;
+        if (!call_or_jmp && !jcc) continue;
+        const size_t len = jcc ? 6 : 5;
+        int32_t rel;
+        std::memcpy(&rel, file.data() + p + len - 4, 4);
+        const uint32_t at = sec.virtual_address + static_cast<uint32_t>(p - begin);
+        const uint64_t dest = static_cast<uint64_t>(at) + len + static_cast<int64_t>(rel);
+        if (dest < target || dest >= static_cast<uint64_t>(target) + length) continue;
+        print_ref(at, file[p] == 0xE8 ? "call" : file[p] == 0xE9 ? "jmp" : "jcc", p, p + len, dest);
+      }
       for (size_t p = begin + 2; p + 4 <= end; ++p) {
         const uint8_t modrm = file[p - 1];
         if ((modrm & 0xC7) != 0x05) continue;
@@ -659,16 +699,7 @@ int cmd_xrefs(const Args& args) {
           else if (op == 0xB1 || op == 0xC1) kind = "modify";
         }
         const uint32_t insn_rva = sec.virtual_address + static_cast<uint32_t>(start - begin);
-        char bytes[64] = {0};
-        size_t used = 0;
-        for (size_t k = start; k < p + 4 + imm && k < end && used + 4 < sizeof bytes; ++k)
-          used += static_cast<size_t>(std::snprintf(bytes + used, sizeof bytes - used, "%s%02x", k == start ? "" : " ", file[k]));
-        const auto fn = function_of(insn_rva);
-        char where[48] = "no .pdata entry";
-        if (fn) std::snprintf(where, sizeof where, "fn %08x +0x%x", *fn, insn_rva - *fn);
-        std::printf("  %llx  %-20s %-8s %s%s\n", static_cast<unsigned long long>(base + insn_rva), where, kind, bytes,
-                    ref != target ? std::format("  (+{:#x})", ref - target).c_str() : "");
-        ++found;
+        print_ref(insn_rva, kind, start, std::min(p + 4 + imm, end), ref);
       }
     }
     std::printf("%d reference%s\n", found, found == 1 ? "" : "s");

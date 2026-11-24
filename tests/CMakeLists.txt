@@ -207,6 +207,9 @@ xbem_guest_test(xrefs_global COMMAND xrefs ${GOUT}/watch.exe watched_global
                 EXPECT "references to 14000[0-9a-f]+ \\(rva [0-9a-f]+, 8 bytes\\)"
                        "  14000[0-9a-f]+  fn [0-9a-f]+ \\+0x[0-9a-f]+ +store +48 c7 05 [0-9a-f ]+ 02 00 00 00"
                        "  14000[0-9a-f]+  fn [0-9a-f]+ \\+0x[0-9a-f]+ +load +48 8b 05" "3 references")
+# Calls to a function: guest_main calls store_at three times.
+xbem_guest_test(xrefs_calls COMMAND xrefs ${GOUT}/watch.exe store_at/1
+                EXPECT "  14000[0-9a-f]+  fn [0-9a-f]+ \\+0x[0-9a-f]+ +call +e8 " "3 references")
 xbem_guest_test(func_lookup COMMAND func ${GOUT}/hello.exe 1010
                 EXPECT "00001010: in .pdata range 00001000-" "function starts at 00001000"
                        "disassemble the function: objdump -d -M intel --start-address=0x140001000 --stop-address=0x14")

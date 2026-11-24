@@ -183,6 +183,11 @@ static void test_xmem(void) {
     vs[0x40] = 0xA1;
     vs[0x10040] = 0xB2;
     CHECK(vs[0x40] == 0xA1 && vs[0x10040] == 0xB2); /* two pages, not one */
+    /* 0 entries unmap their addresses (the title unmaps this way and asserts success) */
+    const uint64_t zeros[2] = {0, 0};
+    CHECK(XMemMapPhysicalPagesScatter(vas, 2, zeros) >= 0);
+    CHECK(XMemMapPhysicalPagesScatter(vas, 2, frames) >= 0); /* the pages kept their bytes */
+    CHECK(vs[0x40] == 0xA1 && vs[0x10040] == 0xB2);
     CHECK(XMemMapPhysicalPages(sp, 2, 0) == sp);
     CHECK(XMemFreePhysicalPages(2, pg) >= 0);
     CHECK(VirtualFree(sp, 0, MEM_RELEASE));
