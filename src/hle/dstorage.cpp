@@ -260,7 +260,7 @@ void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
   auto* q = static_cast<QueueState*>(self->state);
   static std::atomic<int> logged{0};
   const int n = logged.fetch_add(1);
-  if (n < 3 || (n & (n - 1)) == 0) {
+  if (n < 64 || (n & (n - 1)) == 0) {
     std::lock_guard lock(q->mutex);
     std::string formats;
     for (const auto& [format, count] : q->by_compression) formats += std::format(" {}:{}", format, count);

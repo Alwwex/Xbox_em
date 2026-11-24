@@ -81,6 +81,22 @@ struct TracepointOptions {
 };
 bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions& options = TracepointOptions{});
 void set_tracepoint_log_hits(int hits);
+
+// Data watchpoints (run --watch). The page holding [address, address +
+// length) becomes read-only; a write into the range is logged (writing
+// instruction, bytes before and after, registers, a short backtrace) and
+// recorded for crash reports, then the instruction is single-stepped with the
+// page writable. Other writes to the page are stepped over silently, so a
+// busy page slows the title down. Writes by the kernel (read() into the
+// page) would fail instead of faulting: watch data structures, not I/O
+// buffers. `length` is 1..64 bytes; the first `log_writes` writes of each
+// watchpoint are logged.
+bool add_watchpoint(uint64_t address, uint32_t length, const char* label);
+void set_watchpoint_log_writes(int writes);
+// True when [address, address + size) touches a page a watchpoint protects:
+// emulated functions that let the kernel write guest memory (read() into a
+// title buffer) go through a bounce buffer there.
+bool overlaps_watched_page(uint64_t address, uint64_t size);
 void unregister_dump_thread();
 
 }  // namespace xbem::platform

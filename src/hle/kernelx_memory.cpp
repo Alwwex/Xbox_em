@@ -10,10 +10,14 @@
 #include <map>
 #include <cstdio>
 #include <mutex>
+#include <vector>
+#include <string>
+#include <format>
 
 #include "hle/discovery.h"
 #include "hle/heap.h"
 #include "hle/hle_util.h"
+#include "platform/crash.h"
 #include "platform/memory.h"
 
 namespace xbem::hle {
@@ -97,6 +101,31 @@ constexpr DWORD MEM_RESERVE_PLACEHOLDER = 0x40000;
 
 std::mutex g_vm_mutex;
 std::map<uint64_t, Reservation> g_reservations;  // keyed by base address
+
+struct AllocationWatch {
+  uint64_t caller_begin, caller_end, offset;
+  uint32_t length;
+  std::string label;
+  bool armed = false;
+};
+std::vector<AllocationWatch> g_allocation_watches;  // guarded by g_vm_mutex
+
+// Arms the --watch alloc: watchpoints that fall into a newly committed range
+// of the reservation at `base` (reserved by `caller`).
+void arm_allocation_watches(uint64_t base, uint64_t size, uint64_t caller, uint64_t committed_begin,
+                            uint64_t committed_end) {
+  for (AllocationWatch& w : g_allocation_watches) {
+    if (w.armed || caller < w.caller_begin || caller >= w.caller_end || w.offset >= size) continue;
+    const uint64_t address = base + w.offset;
+    if (address < committed_begin || address + w.length > committed_end) continue;
+    w.armed = true;
+    const std::string label = std::format("{} ({:#x})", w.label, address);
+    if (platform::add_watchpoint(address, w.length, label.c_str()))
+      XBEM_INFO("watch", "watching {}: allocation {:#x}+{:#x} from {:#x}", label, base, size, caller);
+    else
+      XBEM_WARN("watch", "cannot watch {} (more than 16 watchpoints?)", label);
+  }
+}
 
 Prot to_prot(DWORD protect) {
   switch (protect & 0xFF) {  // strip PAGE_GUARD / NOCACHE / WRITECOMBINE modifiers
@@ -200,6 +229,7 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
     r.placeholder = (type & MEM_RESERVE_PLACEHOLDER) != 0;
     g_reservations[base] = r;
     XBEM_TRACE("kernelx", "VirtualAlloc reserve {:#x} +{:#x} commit={}", base, length, commit);
+    if (commit && !g_allocation_watches.empty()) arm_allocation_watches(base, length, caller, base, base + length);
     return p;
   }
 
@@ -217,7 +247,14 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
   }
   it->second.commit_protect = protect;
   it->second.commit_caller = caller;
+  if (!g_allocation_watches.empty()) arm_allocation_watches(it->first, it->second.size, it->second.caller, start, end);
   return reinterpret_cast<void*>(start);
+}
+
+void add_allocation_watch(uint64_t caller_begin, uint64_t caller_end, uint64_t offset, uint32_t length,
+                          const std::string& label) {
+  std::lock_guard lock(g_vm_mutex);
+  g_allocation_watches.push_back({caller_begin, caller_end, offset, length, label});
 }
 
 namespace {

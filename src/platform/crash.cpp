@@ -14,6 +14,9 @@ void set_thread_context_printer(ThreadContextPrinter) {}
 void set_backtrace_printer(BacktracePrinter) {}
 bool add_tracepoint(uint64_t, const char*, const TracepointOptions&) { return false; }
 void set_tracepoint_log_hits(int) {}
+bool add_watchpoint(uint64_t, uint32_t, const char*) { return false; }
+void set_watchpoint_log_writes(int) {}
+bool overlaps_watched_page(uint64_t, uint64_t) { return false; }
 void unregister_dump_thread() {}
 }  // namespace xbem::platform
 
@@ -480,8 +483,156 @@ void record_hit(Tracepoint& t, const greg_t* g) {
   }
 }
 
+// ------------------------------------------------------------ watchpoints
+
+struct WatchWrite {
+  uint64_t seq = 0;
+  uint32_t guest_thread = 0;
+  uint64_t rip = 0;
+  uint8_t before[16] = {}, after[16] = {};
+};
+
+struct Watchpoint {
+  static constexpr uint32_t kRing = 4;
+  uint64_t address = 0;
+  uint32_t length = 8;
+  char label[160] = {};
+  std::atomic<bool> armed{false};
+  std::atomic<uint64_t> writes{0};
+  WatchWrite ring[kRing];
+};
+
+constexpr int kMaxWatchpoints = 16;
+Watchpoint g_watchpoints[kMaxWatchpoints];
+std::atomic<int> g_watchpoint_count{0};
+int g_watch_log_writes = 16;
+
+// The write this thread is single-stepping over with the page writable.
+struct WatchStep {
+  bool active = false;
+  uint64_t page = 0;
+  int watch = -1;  // the watchpoint written, -1 for another address on its page
+  uint64_t rip = 0;
+  uint64_t gpr[16] = {};
+  uint8_t before[16] = {};
+};
+thread_local WatchStep t_watch_step;
+
+uint64_t host_page_size() {
+  static const uint64_t size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+  return size;
+}
+uint64_t page_of(uint64_t address) { return address & ~(host_page_size() - 1); }
+void set_page_writable(uint64_t page, bool writable) {
+  mprotect(reinterpret_cast<void*>(page), host_page_size(), writable ? PROT_READ | PROT_WRITE : PROT_READ);
+}
+
+void write_bytes(char* out, size_t size, const uint8_t* bytes, uint32_t n) {
+  size_t used = 0;
+  out[0] = 0;
+  for (uint32_t k = 0; k < n && used + 4 < size; ++k)
+    used += static_cast<size_t>(std::snprintf(out + used, size - used, "%s%02x", k ? " " : "", bytes[k]));
+}
+
+void log_watch_write(Watchpoint& w, const WatchStep& s, const DumpSlot* slot) {
+  const uint64_t n = w.writes.fetch_add(1) + 1;
+  WatchWrite& r = w.ring[(n - 1) % Watchpoint::kRing];
+  const uint32_t shown = std::min<uint32_t>(w.length, 16);
+  r.seq = g_trace_seq.fetch_add(1) + 1;
+  r.guest_thread = slot ? slot->guest_id : 0;
+  r.rip = s.rip;
+  std::memcpy(r.before, s.before, shown);
+  safe_read(w.address, r.after, shown);
+  if (n > static_cast<uint64_t>(g_watch_log_writes)) return;
+  char line[700], where[256] = {0}, before[64], after[64], regs[400];
+  if (g_describer) g_describer(s.rip, where, sizeof where);
+  write_bytes(before, sizeof before, r.before, shown);
+  write_bytes(after, sizeof after, r.after, shown);
+  lock_print();
+  std::snprintf(line, sizeof line, "[watch] %s: write %llu by %s (guest thread %u): %s -> %s%s\n", w.label,
+                static_cast<unsigned long long>(n), where[0] ? where : "?", r.guest_thread, before, after,
+                n == static_cast<uint64_t>(g_watch_log_writes) ? " (later writes are counted, not logged)" : "");
+  write_str(line);
+  format_regs(regs, sizeof regs, s.gpr, 0, 8);
+  std::snprintf(line, sizeof line, "      %s\n", regs);
+  write_str(line);
+  format_regs(regs, sizeof regs, s.gpr, 8, 16);
+  std::snprintf(line, sizeof line, "      %s\n", regs);
+  write_str(line);
+  if (g_backtrace_printer && slot && slot->stack_high)
+    g_backtrace_printer(s.gpr, s.rip, slot->stack_low, slot->stack_high, 6, &write_str);
+  unlock_print();
+}
+
+// SIGSEGV on a watched page: let the write happen, one instruction.
+bool handle_watch_fault(siginfo_t* info, ucontext_t* uc) {
+  const int count = g_watchpoint_count.load();
+  if (!count || info->si_code != SEGV_ACCERR) return false;
+  const uint64_t fault = reinterpret_cast<uint64_t>(info->si_addr);
+  const uint64_t page = page_of(fault);
+  int hit = -1;
+  bool on_page = false;
+  for (int i = 0; i < count; ++i) {
+    const Watchpoint& w = g_watchpoints[i];
+    if (!w.armed.load() || (page_of(w.address) != page && page_of(w.address + w.length - 1) != page)) continue;
+    on_page = true;
+    if (hit < 0 && fault + 32 > w.address && fault < w.address + w.length) hit = i;  // stores of up to 32 bytes
+  }
+  if (!on_page) return false;
+  greg_t* g = uc->uc_mcontext.gregs;
+  WatchStep& s = t_watch_step;
+  s.active = true;
+  s.page = page;
+  s.watch = hit;
+  s.rip = static_cast<uint64_t>(g[REG_RIP]);
+  if (hit >= 0) {
+    for (int k = 0; k < 16; ++k) s.gpr[k] = static_cast<uint64_t>(g[kUnwindOrder[k]]);
+    safe_read(g_watchpoints[hit].address, s.before, std::min<uint32_t>(g_watchpoints[hit].length, 16));
+  }
+  set_page_writable(page, true);
+  g[REG_EFL] |= kTrapFlag;
+  return true;
+}
+
+// SIGTRAP after the stepped write: log it and protect the page again.
+bool handle_watch_step(ucontext_t* uc) {
+  WatchStep& s = t_watch_step;
+  if (!s.active) return false;
+  s.active = false;
+  uc->uc_mcontext.gregs[REG_EFL] &= ~kTrapFlag;
+  if (s.watch >= 0) log_watch_write(g_watchpoints[s.watch], s, slot_of_tid(current_tid()));
+  set_page_writable(s.page, false);
+  return true;
+}
+
+void print_watchpoint_summary() {
+  const int count = g_watchpoint_count.load();
+  if (!count) return;
+  char line[600], where[256], before[64], after[64];
+  write_str("Watchpoints (last writes, oldest first):\n");
+  for (int i = 0; i < count; ++i) {
+    const Watchpoint& w = g_watchpoints[i];
+    std::snprintf(line, sizeof line, "  %s: %llu writes\n", w.label, static_cast<unsigned long long>(w.writes.load()));
+    write_str(line);
+    const uint32_t shown = std::min<uint32_t>(w.length, 16);
+    for (uint32_t k = 0; k < Watchpoint::kRing; ++k) {
+      const uint64_t n = w.writes.load();
+      if (n <= k) break;
+      const WatchWrite& r = w.ring[(n > Watchpoint::kRing ? n - Watchpoint::kRing + k : k) % Watchpoint::kRing];
+      where[0] = 0;
+      if (g_describer) g_describer(r.rip, where, sizeof where);
+      write_bytes(before, sizeof before, r.before, shown);
+      write_bytes(after, sizeof after, r.after, shown);
+      std::snprintf(line, sizeof line, "    #%llu by %s (guest thread %u): %s -> %s\n",
+                    static_cast<unsigned long long>(r.seq), where[0] ? where : "?", r.guest_thread, before, after);
+      write_str(line);
+    }
+  }
+}
+
 // SIGTRAP: a tracepoint's int3, or the single step over its instruction.
 bool handle_tracepoint_trap(ucontext_t* uc) {
+  if (handle_watch_step(uc)) return true;
   greg_t* g = uc->uc_mcontext.gregs;
   if (t_trace_step >= 0) {
     Tracepoint& t = g_tracepoints[t_trace_step];
@@ -543,6 +694,7 @@ void print_tracepoint_summary() {
 
 void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
 #if defined(__x86_64__)
+  if (sig == SIGSEGV && handle_watch_fault(info, static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGILL && handle_unsupported_instruction(static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGTRAP && handle_tracepoint_trap(static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGTRAP && g_continue_after_breakpoint.load()) {
@@ -682,6 +834,7 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   print_outermost_frames(slot, line, sizeof line, where, sizeof where);
   if (g_context_printer) g_context_printer(&write_str);
   print_tracepoint_summary();
+  print_watchpoint_summary();
   // Last: the walk follows the title's unwind data through its stack; should
   // it fault anyway, everything above is already written.
   if (g_backtrace_printer && slot && slot->stack_high) {
@@ -740,6 +893,37 @@ bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions
 }
 
 void set_tracepoint_log_hits(int hits) { g_trace_log_hits = hits < 0 ? 0 : hits; }
+
+bool add_watchpoint(uint64_t address, uint32_t length, const char* label) {
+  const int i = g_watchpoint_count.load();
+  if (i >= kMaxWatchpoints || !length) return false;
+  Watchpoint& w = g_watchpoints[i];
+  w.address = address;
+  w.length = std::min<uint32_t>(length, 64);
+  std::snprintf(w.label, sizeof w.label, "%s", label);
+  uint8_t probe;
+  if (!safe_read(address, &probe, 1) || !safe_read(address + w.length - 1, &probe, 1)) return false;
+  w.armed.store(true);
+  g_watchpoint_count.store(i + 1);  // published before the first fault can happen
+  set_page_writable(page_of(address), false);
+  if (page_of(address + w.length - 1) != page_of(address)) set_page_writable(page_of(address + w.length - 1), false);
+  return true;
+}
+
+void set_watchpoint_log_writes(int writes) { g_watch_log_writes = writes < 0 ? 0 : writes; }
+
+bool overlaps_watched_page(uint64_t address, uint64_t size) {
+  const int count = g_watchpoint_count.load();
+  if (!count || !size) return false;
+  const uint64_t first = page_of(address), last = page_of(address + size - 1);
+  for (int i = 0; i < count; ++i) {
+    const Watchpoint& w = g_watchpoints[i];
+    if (!w.armed.load()) continue;
+    const uint64_t a = page_of(w.address), b = page_of(w.address + w.length - 1);
+    if (a <= last && b >= first) return true;
+  }
+  return false;
+}
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();

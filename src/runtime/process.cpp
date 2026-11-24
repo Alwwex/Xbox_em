@@ -351,6 +351,88 @@ void arm_tracepoints(ModuleLoader& loader, const std::vector<std::string>& specs
   }
 }
 
+// A data address from a --watch spec: like resolve_code_spec, and a plain hex
+// number that is neither inside a module nor an RVA is taken as an address.
+uint64_t resolve_data_spec(ModuleLoader& loader, const std::string& spec, std::string& error) {
+  if (spec.find_first_of("!+") == std::string::npos) {
+    try {
+      size_t used = 0;
+      const uint64_t value = std::stoull(spec, &used, 16);
+      LoadedModule* main = loader.main_module();
+      if (used == spec.size() && (!main || (!main->contains(value) && value >= main->size))) return value;
+    } catch (const std::exception&) {
+    }
+  }
+  return resolve_code_spec(loader, spec, error);
+}
+
+// --watch: "ADDRESS[/len]" (see resolve_data_spec) or "alloc:CALLER+OFFSET[/len]",
+// the allocation made by the function holding the code address CALLER.
+void arm_watchpoints(ModuleLoader& loader, const std::vector<std::string>& specs) {
+  for (const std::string& spec : specs) {
+    std::string body = spec, error;
+    uint32_t length = 8;
+    if (const size_t slash = body.find('/'); slash != std::string::npos) {
+      try {
+        length = static_cast<uint32_t>(std::stoul(body.substr(slash + 1), nullptr, 0));
+      } catch (const std::exception&) {
+        length = 0;
+      }
+      body.resize(slash);
+    }
+    if (!length || length > 64) {
+      XBEM_WARN("watch", "--watch {}: the length must be 1..64 bytes", spec);
+      continue;
+    }
+    if (body.rfind("alloc:", 0) == 0) {
+      const size_t plus = body.rfind('+');
+      uint64_t offset = 0;
+      try {
+        if (plus == std::string::npos || plus < 7) throw std::invalid_argument("offset");
+        size_t used = 0;
+        offset = std::stoull(body.substr(plus + 1), &used, 16);
+        if (used != body.size() - plus - 1) throw std::invalid_argument("offset");
+      } catch (const std::exception&) {
+        XBEM_WARN("watch", "--watch {}: expected alloc:CALLER+OFFSET (hex)", spec);
+        continue;
+      }
+      const std::string caller_spec = body.substr(6, plus - 6);
+      const uint64_t caller = resolve_code_spec(loader, caller_spec, error);
+      if (!caller) {
+        XBEM_WARN("watch", "--watch {}: {}", spec, error);
+        continue;
+      }
+      uint64_t begin = caller, end = caller + 1, image_base = 0;
+      if (const seh::RuntimeFunction* fn = seh::lookup_function_entry(caller, &image_base)) {
+        begin = image_base + fn->BeginAddress;
+        end = image_base + fn->EndAddress;
+      }
+      char where[200];
+      describe_address(caller, where, sizeof where);
+      const std::string label = std::format("alloc by {} +{:#x}", caller_spec.find('!') != std::string::npos
+                                                                      ? caller_spec : std::string(where),
+                                            offset);
+      hle::add_allocation_watch(begin, end, offset, length, label);
+      XBEM_INFO("watch", "{}: armed when code at {:#x}..{:#x} allocates", label, begin, end);
+      continue;
+    }
+    const uint64_t address = resolve_data_spec(loader, body, error);
+    if (!address) {
+      XBEM_WARN("watch", "--watch {}: {}", spec, error);
+      continue;
+    }
+    char where[200] = {};
+    describe_address(address, where, sizeof where);
+    const std::string label = where[0] ? (body.find('!') != std::string::npos ? std::format("{} ({})", body, where)
+                                                                               : std::string(where))
+                                       : std::format("{:#x}", address);
+    if (platform::add_watchpoint(address, length, label.c_str()))
+      XBEM_INFO("watch", "watching {} ({} bytes)", label, length);
+    else
+      XBEM_WARN("watch", "--watch {}: the memory is not mapped (or more than 16 watchpoints)", spec);
+  }
+}
+
 std::string quote_arg(const std::string& a) {
   if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
   std::string out = "\"";
@@ -465,6 +547,8 @@ int Process::run() {
   platform::set_backtrace_printer(&print_unwind_backtrace);
   platform::set_tracepoint_log_hits(options_.trace_log_hits);
   arm_tracepoints(*loader_, options_.trace_at);
+  platform::set_watchpoint_log_writes(options_.watch_log_writes);
+  arm_watchpoints(*loader_, options_.watch);
 
   const uint64_t reserve = main->image->optional_header().SizeOfStackReserve;
   // Generous: host pages are only used when touched, and console titles can

@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -445,46 +447,93 @@ int cmd_hexdump(const Args& args) {
 
 // Which function (.pdata entry) an RVA belongs to, following chained unwind
 // info to the function's real start, plus an objdump command for its code.
+// With several RVAs (or "-": read them from stdin, one per line, e.g. objdump
+// addresses from a grep) it prints one line per RVA. Addresses inside the
+// image (as objdump prints them) are accepted too.
 int cmd_func(const Args& args) {
-  if (args.size() < 2) throw std::runtime_error("usage: xbem func <file.exe|dll> <rva (hex)>");
+  if (args.size() < 2) throw std::runtime_error("usage: xbem func <file.exe|dll> <rva (hex)>... | -");
   const pe::PeImage img = pe::PeImage::load(args[0]);
-  const uint32_t rva = static_cast<uint32_t>(std::stoul(args[1], nullptr, 16));
   const auto& dir = img.directory(pe::kDirException);
   const uint32_t count = img.exception_function_count();
   if (!dir.VirtualAddress || !count) throw std::runtime_error("the file has no exception directory (.pdata)");
+  const uint64_t base = img.image_base();
   const auto entry = [&](uint32_t i) { return img.read_rva<pe::RuntimeFunction>(dir.VirtualAddress + i * 12); };
-  uint32_t lo = 0, hi = count;
-  std::optional<pe::RuntimeFunction> found;
-  while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
-    const pe::RuntimeFunction f = entry(mid);
-    if (rva < f.BeginAddress) hi = mid;
-    else if (rva >= f.EndAddress) lo = mid + 1;
-    else { found = f; break; }
+  // The .pdata entry holding `rva` (indirect entries resolved), if any.
+  const auto find = [&](uint32_t rva) -> std::optional<pe::RuntimeFunction> {
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      const pe::RuntimeFunction f = entry(mid);
+      if (rva < f.BeginAddress) hi = mid;
+      else if (rva >= f.EndAddress) lo = mid + 1;
+      else return (f.UnwindData & 1) ? img.read_rva<pe::RuntimeFunction>(f.UnwindData & ~1u) : f;
+    }
+    return std::nullopt;
+  };
+  // Follows chained unwind info to the primary entry (the function's start).
+  const auto primary_of = [&](pe::RuntimeFunction fn) {
+    for (int depth = 0; depth < 32; ++depth) {
+      const uint32_t head = img.read_rva<uint32_t>(fn.UnwindData);
+      if (!(((head & 0xFF) >> 3) & 4)) break;
+      const uint8_t codes = static_cast<uint8_t>(head >> 16);
+      fn = img.read_rva<pe::RuntimeFunction>(fn.UnwindData + 4 + ((codes + 1u) & ~1u) * 2);
+    }
+    return fn;
+  };
+  const auto to_rva = [&](const std::string& text) {
+    const uint64_t v = std::stoull(text, nullptr, 16);
+    return static_cast<uint32_t>(v >= base && v - base < img.size_of_image() ? v - base : v);
+  };
+
+  if (args.size() > 2 || args[1] == "-") {
+    std::vector<std::string> list(args.begin() + 1, args.end());
+    if (args[1] == "-") {
+      list.clear();
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        const size_t b = line.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        const size_t e = line.find_first_of(" \t:", b);
+        list.push_back(line.substr(b, e == std::string::npos ? std::string::npos : e - b));
+      }
+    }
+    for (const std::string& text : list) {
+      uint32_t rva = 0;
+      try {
+        rva = to_rva(text);
+      } catch (const std::exception&) {
+        std::printf("%s: not a hex number\n", text.c_str());
+        continue;
+      }
+      const auto fn = find(rva);
+      if (!fn) {
+        std::printf("%08x  -\n", rva);
+        continue;
+      }
+      const pe::RuntimeFunction p = primary_of(*fn);
+      std::printf("%08x  fn %08x +0x%x\n", rva, p.BeginAddress, rva - p.BeginAddress);
+    }
+    return 0;
   }
+
+  const uint32_t rva = to_rva(args[1]);
+  const auto found = find(rva);
   if (!found) {
     std::printf("%08x: not covered by .pdata (a leaf function without unwind data, or not code)\n", rva);
     return 1;
   }
-  pe::RuntimeFunction fn = *found;
-  if (fn.UnwindData & 1) fn = img.read_rva<pe::RuntimeFunction>(fn.UnwindData & ~1u);  // indirect entry
-  std::printf("%08x: in .pdata range %08x-%08x", rva, fn.BeginAddress, fn.EndAddress);
-  pe::RuntimeFunction primary = fn;
-  for (int depth = 0; depth < 32; ++depth) {
-    const uint32_t head = img.read_rva<uint32_t>(primary.UnwindData);
-    const uint8_t flags = static_cast<uint8_t>((head & 0xFF) >> 3), codes = static_cast<uint8_t>(head >> 16);
-    if (depth == 0)
-      std::printf(", prolog %u bytes, %u unwind codes, frame register %u%s%s\n", (head >> 8) & 0xFF, codes,
-                  (head >> 24) & 0x0F, flags & 3 ? ", has a handler" : "", flags & 4 ? ", chained" : "");
-    if (!(flags & 4)) break;
-    primary = img.read_rva<pe::RuntimeFunction>(primary.UnwindData + 4 + ((codes + 1u) & ~1u) * 2);
-  }
+  const pe::RuntimeFunction fn = *found;
+  const uint32_t head = img.read_rva<uint32_t>(fn.UnwindData);
+  const uint8_t flags = static_cast<uint8_t>((head & 0xFF) >> 3), codes = static_cast<uint8_t>(head >> 16);
+  std::printf("%08x: in .pdata range %08x-%08x, prolog %u bytes, %u unwind codes, frame register %u%s%s\n", rva,
+              fn.BeginAddress, fn.EndAddress, (head >> 8) & 0xFF, codes, (head >> 24) & 0x0F,
+              flags & 3 ? ", has a handler" : "", flags & 4 ? ", chained" : "");
+  const pe::RuntimeFunction primary = primary_of(fn);
   if (primary.BeginAddress != fn.BeginAddress)
     std::printf("function starts at %08x (primary range %08x-%08x)\n", primary.BeginAddress, primary.BeginAddress,
                 primary.EndAddress);
   else
     std::printf("function starts at %08x\n", fn.BeginAddress);
-  const uint64_t base = img.image_base();
   std::printf("offset of %08x in the function: +0x%x\n", rva, rva - primary.BeginAddress);
   const auto objdump = [&](const char* what, const pe::RuntimeFunction& f) {
     std::printf("disassemble %s: objdump -d -M intel --start-address=0x%llx --stop-address=0x%llx %s\n", what,
@@ -568,6 +617,15 @@ int cmd_run(const Args& args) {
       }
     } else if (a == "--trace-log") {
       opt.trace_log_hits = std::stoi(value());
+    } else if (a == "--watch") {
+      const std::string& list = value();
+      for (size_t start = 0; start <= list.size();) {
+        const size_t comma = std::min(list.find(',', start), list.size());
+        if (comma > start) opt.watch.push_back(list.substr(start, comma - start));
+        start = comma + 1;
+      }
+    } else if (a == "--watch-log") {
+      opt.watch_log_writes = std::stoi(value());
     } else if (a == "--device") {
       const std::string& d = value();
       if (d == "series-x") opt.device = rt::DeviceType::XboxScarlettAnaconda;

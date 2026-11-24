@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace xbem::hle {
 
@@ -24,5 +25,11 @@ bool virtual_free(void* address, uint64_t size, uint32_t type);
 // (who allocated it and with which protection). Never blocks.
 bool describe_virtual_memory(uint64_t address, char* out, size_t out_size);
 size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
+
+// run --watch alloc:CALLER+OFFSET: a data watchpoint armed at `offset` into
+// the first committed allocation made from code in [caller_begin, caller_end)
+// (the function holding the allocating call) that is larger than `offset`.
+void add_allocation_watch(uint64_t caller_begin, uint64_t caller_end, uint64_t offset, uint32_t length,
+                          const std::string& label);
 
 }  // namespace xbem::hle

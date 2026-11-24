@@ -83,7 +83,7 @@ add_custom_command(
   COMMENT "Guest DLL tlsdll.dll")
 
 set(GUEST_OUTPUTS ${GOUT}/gamelib.dll ${GOUT}/plugin.dll ${GOUT}/tlsdll.dll)
-foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang breakpoint)
+foreach(prog hello threads tls files xgr unimplemented crash dlls seh seh_unhandled system hang breakpoint watch)
   set(extra_libs -lkernelx -lxgameruntime)
   set(extra_deps ${GOUT}/libkernelx.a ${GOUT}/libxgameruntime.a)
   if(prog STREQUAL "system")
@@ -195,6 +195,8 @@ endfunction()
 xbem_guest_test(inspect_imports COMMAND inspect ${GOUT}/unimplemented.exe
                 EXPECT "kernelx.dll  \\[HLE\\]  3/5 resolved" "- XbemDefinitelyMissing" "- XbemMissingWithArgs")
 xbem_guest_test(hexdump COMMAND hexdump ${GOUT}/hello.exe 1000 32 EXPECT "00001000:( [0-9a-f][0-9a-f])+" "00001010:")
+xbem_guest_test(func_lookup_many COMMAND func ${GOUT}/hello.exe 1010 140001020 ffffff
+                EXPECT "00001010  fn 00001000 \\+0x10" "00001020  fn 00001000 \\+0x20" "00ffffff  -")
 xbem_guest_test(func_lookup COMMAND func ${GOUT}/hello.exe 1010
                 EXPECT "00001010: in .pdata range 00001000-" "function starts at 00001000"
                        "disassemble the function: objdump -d -M intel --start-address=0x140001000 --stop-address=0x14")
@@ -257,6 +259,17 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                          "offset is outside gamelib.dll" "module nosuch.dll is not loaded"
                          "no export gamelib_tick in gamelib.dll" "bad memory operand xyz/8" "bad condition rcx~1"
                          "PASS dlls")
+  # Data watchpoints: a global and a place in a VirtualAlloc block, old -> new
+  # bytes and the writing code; bad specs give their messages.
+  xbem_guest_test(guest_watchpoints
+                  COMMAND run ${GOUT}/watch.exe --watch
+                          watch.exe!watched_global,alloc:watch.exe!alloc_block+0x2008/8,watch.exe!watched_global/65,alloc:watch.exe!alloc_block
+                  EXPECT "watching watch.exe!watched_global \\(watch.exe\\+0x[0-9a-f]+\\) \\(8 bytes\\)"
+                         "\\[watch\\] watch.exe!watched_global \\(watch.exe\\+0x[0-9a-f]+\\): write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 01 00 00 00 00 00 00 00 -> 02 00 00 00 00 00 00 00"
+                         "write 2 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 02 00 00 00 00 00 00 00 -> 03 00"
+                         "\\[watch\\] alloc by watch.exe!alloc_block \\+0x2008 \\(0x[0-9a-f]+\\): write 1 by watch.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 00 00 00 00 00 00 00 00 -> 88 77 66 55 44 33 22 11"
+                         "#0  watch.exe\\+0x[0-9a-f]+  .fn 0x"
+                         "the length must be 1..64 bytes" "expected alloc:CALLER\\+OFFSET" "PASS watch")
   # A condition that never holds: hits are counted, none logged or recorded.
   xbem_guest_test(guest_tracepoint_condition COMMAND run ${GOUT}/crash.exe --trace-at crash.exe!call_fault?rcx!=10
                   EXIT 139 EXPECT "crash.exe!call_fault \\(crash.exe\\+0x[0-9a-f]+\\) if rcx!=10: 1 hits, 0 matched")

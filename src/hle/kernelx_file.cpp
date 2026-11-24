@@ -1,7 +1,9 @@
 // kernelx: files, directories and console handles on top of the VFS
 // (see runtime/vfs.h for how guest paths map to host paths).
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <functional>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "hle/hle_util.h"
+#include "platform/crash.h"
 
 namespace xbem::hle {
 namespace {
@@ -99,6 +102,16 @@ uint64_t to_filetime(fs::file_time_type t) {
 
 // ------------------------------------------------------------- open/close
 
+// Files the title opens and does not find (the first 64), with the host path
+// they map to: a missing or misnamed file shows up here.
+void log_missing_file(const std::string& guest_path, const fs::path& host_path) {
+  static std::atomic<int> logged{0};
+  const int n = logged.fetch_add(1);
+  if (n < 64)
+    XBEM_INFO("file", "not found: {} ({}){}", guest_path, host_path.string(),
+              n == 63 ? " - further misses are not logged" : "");
+}
+
 HANDLE create_file(const std::string& guest_path, DWORD access, DWORD disposition, DWORD flags) {
   if (iequals(guest_path, "CONOUT$")) return proc().handles().insert(std::make_shared<ConsoleObject>(1));
   if (iequals(guest_path, "CONIN$")) return proc().handles().insert(std::make_shared<ConsoleObject>(0));
@@ -106,6 +119,7 @@ HANDLE create_file(const std::string& guest_path, DWORD access, DWORD dispositio
   auto r = proc().vfs().resolve(std::string_view(guest_path));
   if (!r) {
     XBEM_DEBUG("kernelx", "CreateFile({}): no mount for this path", guest_path);
+    log_missing_file(guest_path, "(no drive mapping)");
     set_last_error(ERROR_PATH_NOT_FOUND);
     return INVALID_HANDLE_VALUE;
   }
@@ -150,6 +164,7 @@ HANDLE create_file(const std::string& guest_path, DWORD access, DWORD dispositio
     case OPEN_EXISTING:
       if (!exists) {
         set_last_error(fs::exists(r->host_path.parent_path(), ec) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND);
+        log_missing_file(guest_path, r->host_path);
         return INVALID_HANDLE_VALUE;
       }
       mode = want_write ? "r+b" : "rb";
@@ -229,7 +244,17 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
   std::lock_guard lock(f->mutex);
   const uint64_t offset = ov ? (static_cast<uint64_t>(ov->offset_high) << 32 | ov->offset) : f->position;
   size_t got = 0;
-  if (seek_host(f->file, offset)) got = std::fread(buffer, 1, count, f->file);
+  if (seek_host(f->file, offset)) {
+    if (platform::overlaps_watched_page(reinterpret_cast<uint64_t>(buffer), count)) {
+      // A watchpoint protects the destination: the kernel's write would fail
+      // (EFAULT) instead of faulting, so copy in user space.
+      std::vector<uint8_t> bounce(count);
+      got = std::fread(bounce.data(), 1, count, f->file);
+      std::memcpy(buffer, bounce.data(), got);
+    } else {
+      got = std::fread(buffer, 1, count, f->file);
+    }
+  }
   if (ov) complete_overlapped(ov, got);
   else f->position += got;
   if (read) *read = static_cast<DWORD>(got);

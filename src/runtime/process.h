@@ -39,6 +39,8 @@ struct ProcessOptions {
   std::filesystem::path dump_shaders_dir;  // save shader binaries the title creates
   std::vector<std::string> trace_at;  // code tracepoints: module!export[+off], module+off, or an offset in the exe
   int trace_log_hits = 8;             // hits of each tracepoint logged as they happen
+  std::vector<std::string> watch;    // data watchpoints: ADDRESS[/len] or alloc:CALLER+OFFSET[/len]
+  int watch_log_writes = 16;          // writes of each watchpoint logged as they happen
   DeviceType device = DeviceType::XboxScarlettAnaconda;
   std::filesystem::path scratch_dir;  // host directory for T:\ (created if missing)
   std::vector<std::pair<char, std::filesystem::path>> extra_mounts;

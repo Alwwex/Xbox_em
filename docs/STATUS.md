@@ -64,7 +64,19 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    instruction that stores the field a crash reads (found with
    `objdump ... | grep -E "PTR \[[a-z0-9]+\+0xOFFSET\],"`), plus the
    functions in the crash backtrace.
-5. `--continue-after-breakpoint` skips one known title assertion
+5. Watchpoints answer "who writes this": `--watch ADDR[/LEN]` (1..64 bytes,
+   default 8) makes the page read-only and logs each write into the range
+   with the writing instruction, the bytes before and after, the registers
+   and a backtrace (crash reports list the last writes). `ADDR` is a module
+   address as for tracepoints, a plain hex address, or
+   `alloc:CALLER+OFFSET`: OFFSET into the first allocation made by the
+   function holding CALLER (the "by 0x..." return address the crash reports
+   print for VirtualAlloc regions). The title's allocations land at the same
+   offsets in every run, only the region base moves, so a field seen in one
+   crash can be watched from the start of the next run. Other writes to the
+   page are stepped over silently (slow on a busy page). `xbem func EXE -`
+   reads objdump lines from a pipe and prints the function of each address.
+6. `--continue-after-breakpoint` skips one known title assertion
    (+0x247af2d, a render-target budget check that expects the console's tiled
    texture sizes); everything after it runs normally.
 
@@ -145,11 +157,21 @@ fn `0x54793f0(effect, ctx, pass, variant)` picks the program as
 `[effect+0xc78][bits 15..23 of [effect+0xc68][pass] + variant]`; in the
 crash the index is 42 and that entry is null, while the pass-state entry at
 `[effect+0xc70] + 42*24` exists. fn `0xb39840` (called by the fullscreen
-pass) computes pass and variant and tail-jumps there. Open: a missing
-program (shader data not loaded - DirectStorage now logs requests per
-compression format, failures and unexecuted memory-source requests in its
-Submit lines), or a variant chosen from a device property the emulator
-reports differently from the console.
+pass) computes pass and variant and tail-jumps there. A conditional
+tracepoint on the null bind (`0x547941d?r8=0`, with memory dumps) showed
+pass 42, variant 0, index 42, and the effect's program table
+(`[effect+0xc78]`) holding only entry 36 among the first 64: the programs
+were never created, the index is right. DirectStorage reported no failure
+(4,199 zlib requests; the pipeline library at the end of `shaders.rpf` is
+275,540,780 bytes in 4,205 zlib streams per Leonida's `pso_cache.md`, and
+4,199 of them had been delivered at the last logged Submit).
+
+The title's big allocation (VirtualAlloc by `0x141e1d186`, 0x49400000
+bytes) puts the objects at fixed offsets: the effect at `+0x74fd600`, its
+`+0xc78` field at `+0x74fe278`, the program table at `+0x7500c50`
+(entry 36 at `+0x7500d70`, entry 42 at `+0x7500da0`). Next: watch those
+(`--watch alloc:141e1d186+7500d70/8,...`) to find the code that creates
+programs, and why entry 42 is never written.
 
 ## Known approximations
 
