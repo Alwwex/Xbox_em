@@ -34,6 +34,7 @@ add_library(xbem_core STATIC
   hle/gameinput.cpp
   hle/probe_com.cpp
   hle/console_devices.cpp
+  hle/audio_endpoint.cpp
   hle/xg.cpp
   hle/dstorage.cpp
   hle/user32.cpp

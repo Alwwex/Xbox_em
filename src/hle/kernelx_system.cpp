@@ -9,6 +9,7 @@
 #include <new>
 #include <random>
 
+#include "hle/audio_endpoint.h"
 #include "hle/heap.h"
 #include "hle/hle_util.h"
 
@@ -129,7 +130,8 @@ BOOLEAN XBEM_GUEST_ABI hle_SystemFunction036(void* buffer, ULONG length) {  // R
 }
 
 // ---------------------------------------------------------------------- COM
-// No COM servers exist, so object creation fails with "class not registered".
+// The only COM server is Core Audio (audio_endpoint.cpp); other classes fail
+// with "class not registered".
 
 HRESULT XBEM_GUEST_ABI hle_CoInitializeEx(void*, DWORD) { return S_OK; }
 HRESULT XBEM_GUEST_ABI hle_CoInitialize(void*) { return S_OK; }
@@ -137,6 +139,8 @@ void XBEM_GUEST_ABI hle_CoUninitialize() {}
 
 HRESULT XBEM_GUEST_ABI hle_CoCreateInstance(const void* clsid, void*, DWORD, const void* iid, void** out) {
   if (out) *out = nullptr;
+  HRESULT result;
+  if (create_audio_com_object(clsid, iid, out, &result)) return result;
   XBEM_WARN("kernelx", "CoCreateInstance(clsid {}, iid {}) -> REGDB_E_CLASSNOTREG", guid_text(clsid), guid_text(iid));
   return REGDB_E_CLASSNOTREG;
 }

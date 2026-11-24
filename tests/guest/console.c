@@ -94,6 +94,10 @@ IMP HRESULT XApuEnqueueCommand(void* handle, const void* command, uint32_t flags
 IMP uint32_t XApuGetResultCount(void* handle, uint32_t kind);
 IMP HRESULT XApuDisconnect(void* handle);
 
+/* combase (through kernelx.dll) */
+IMP HRESULT CoCreateInstance(const void* clsid, void* outer, DWORD context, const void* iid, void** out);
+IMP void CoTaskMemFree(void*);
+
 /* gameinput.dll (ordinal 1) */
 IMP HRESULT GameInputCreate(void** game_input);
 
@@ -566,6 +570,98 @@ static void test_sandbox(void) {
   ((ReleaseFn)VT(xsystem)[2])(xsystem);
 }
 
+/* Core Audio as the title's audio start-up uses it: one render device, its
+ * mix format, a Spatial Audio stream whose event the emulator signals every
+ * 10 ms, and static objects with 480-frame buffers. */
+static void test_audio_endpoint(void) {
+  static const uint8_t clsid_enumerator[16] = {0x95, 0x03, 0xde, 0xbc, 0x2f, 0xe5, 0x7c, 0x46,
+                                               0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e};
+  static const uint8_t iid_enumerator[16] = {0xd2, 0x64, 0x56, 0xa9, 0x14, 0x96, 0x35, 0x4f,
+                                             0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6};
+  static const uint8_t iid_audio_client[16] = {0x4c, 0xad, 0xb9, 0x1c, 0xfa, 0xdb, 0x32, 0x4c,
+                                               0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2};
+  static const uint8_t iid_spatial_client[16] = {0x66, 0xe0, 0xf8, 0xbb, 0xaa, 0xaa, 0xbe, 0x49,
+                                                 0x9a, 0x4d, 0xfd, 0x2a, 0x85, 0x8e, 0xa2, 0x7f};
+  static const uint8_t iid_stream[16] = {0x73, 0xf4, 0xb5, 0xba, 0x23, 0xb4, 0x7b, 0x47,
+                                         0x85, 0xf5, 0xb5, 0xa3, 0x32, 0xa0, 0x41, 0x53};
+  typedef HRESULT (*EnumFn)(void*, uint32_t, uint32_t, void**);
+  typedef HRESULT (*U32OutFn)(void*, uint32_t*);
+  typedef HRESULT (*ItemFn)(void*, uint32_t, void**);
+  typedef HRESULT (*ActivateFn)(void*, const void*, uint32_t, const void*, void**);
+  typedef HRESULT (*PtrOutFn)(void*, void**);
+  typedef HRESULT (*FormatFn)(void*, const void*);
+  typedef HRESULT (*StreamFn)(void*, const void*, const void*, void**);
+  typedef HRESULT (*NoArgFn)(void*);
+  typedef HRESULT (*BeginFn)(void*, uint32_t*, uint32_t*);
+  typedef HRESULT (*BufferFn)(void*, uint8_t**, uint32_t*);
+  typedef HRESULT (*PositionFn)(void*, uint32_t, float*, float*, float*);
+
+  void* enumerator = 0;
+  CHECK(CoCreateInstance(clsid_enumerator, 0, 0x17, iid_enumerator, &enumerator) == 0 && enumerator);
+  void* collection = 0;
+  uint32_t count = 0;
+  CHECK(((EnumFn)VT(enumerator)[3])(enumerator, 0, 1, &collection) == 0 && collection);
+  CHECK(((U32OutFn)VT(collection)[3])(collection, &count) == 0 && count == 1);
+  void* device = 0;
+  CHECK(((ItemFn)VT(collection)[4])(collection, 0, &device) == 0 && device);
+  void* capture = (void*)1;
+  CHECK(((EnumFn)VT(enumerator)[4])(enumerator, 1, 0, &capture) < 0 && !capture); /* no capture devices */
+  void* render = 0;
+  CHECK(((EnumFn)VT(enumerator)[4])(enumerator, 0, 0, &render) == 0 && render == device);
+
+  /* IAudioClient::GetMixFormat: WAVEFORMATEXTENSIBLE, 48 kHz float stereo */
+  void* client = 0;
+  CHECK(((ActivateFn)VT(device)[3])(device, iid_audio_client, 1, 0, &client) == 0 && client);
+  uint8_t* mix = 0;
+  CHECK(((PtrOutFn)VT(client)[8])(client, (void**)&mix) == 0 && mix);
+  CHECK(*(uint16_t*)mix == 0xfffe && *(uint16_t*)(mix + 2) == 2 && *(uint32_t*)(mix + 4) == 48000);
+  CoTaskMemFree(mix);
+
+  /* ISpatialAudioClient */
+  void* spatial = 0;
+  CHECK(((ActivateFn)VT(device)[3])(device, iid_spatial_client, 1, 0, &spatial) == 0 && spatial);
+  float x = 0, y = 1, z = 0;
+  CHECK(((PositionFn)VT(spatial)[3])(spatial, 0x2, &x, &y, &z) == 0 && x < 0 && y == 0 && z < 0);
+  void* formats = 0;
+  CHECK(((PtrOutFn)VT(spatial)[6])(spatial, &formats) == 0 && formats);
+  CHECK(((U32OutFn)VT(formats)[3])(formats, &count) == 0 && count == 1);
+  const uint8_t* format = 0;
+  CHECK(((ItemFn)VT(formats)[4])(formats, 0, (void**)&format) == 0 && format);
+  CHECK(*(uint16_t*)format == 3 && *(uint16_t*)(format + 2) == 1 && *(uint32_t*)(format + 4) == 48000);
+  CHECK(((FormatFn)VT(spatial)[8])(spatial, format) == 0);
+
+  HANDLE event = CreateEventW(0, 0, 0, 0);
+  struct {
+    const void* format;
+    uint32_t static_mask, min_dynamic, max_dynamic, category;
+    HANDLE event;
+    void* notify;
+  } params = {format, 0x6, 0, 0, 6, event, 0};
+  struct {
+    uint16_t vt, r1, r2, r3;
+    uint32_t size, pad;
+    void* data;
+  } pv = {0x41, 0, 0, 0, 0x28, 0, &params};
+  void* stream = 0;
+  CHECK(((StreamFn)VT(spatial)[10])(spatial, &pv, iid_stream, &stream) == 0 && stream);
+  CHECK(WaitForSingleObject(event, 100) == WAIT_TIMEOUT); /* not started */
+  CHECK(((NoArgFn)VT(stream)[5])(stream) == 0);           /* Start */
+  CHECK(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0); /* and again 10 ms later */
+  void* left = 0;
+  void* none = (void*)1;
+  CHECK(((ItemFn)VT(stream)[10])(stream, 0x2, &left) == 0 && left);
+  CHECK(((ItemFn)VT(stream)[10])(stream, 0x8, &none) < 0 && !none); /* not in the static mask */
+  uint32_t dynamic = 9, frames = 0, bytes = 0;
+  uint8_t* buffer = 0;
+  CHECK(((BeginFn)VT(stream)[8])(stream, &dynamic, &frames) == 0 && dynamic == 0 && frames == 480);
+  CHECK(((BufferFn)VT(left)[3])(left, &buffer, &bytes) == 0 && buffer && bytes == 480 * 4 && buffer[bytes - 1] == 0);
+  buffer[bytes - 1] = 1;
+  CHECK(((NoArgFn)VT(stream)[9])(stream) == 0);
+  CHECK(((NoArgFn)VT(stream)[6])(stream) == 0); /* Stop */
+  CloseHandle(event);
+}
+
 static void test_gameinput(void) {
   void* gi = 0;
   CHECK(GameInputCreate(&gi) == 0 && gi);
@@ -966,6 +1062,7 @@ DWORD guest_main(void* peb) {
   test_gameinput();
   test_audio();
   test_sandbox();
+  test_audio_endpoint();
   test_locale();
   test_time();
   test_topology();

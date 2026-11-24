@@ -109,3 +109,4 @@ EXPORTS
   InitializeProcThreadAttributeList
   VirtualQuery
   VirtualAlloc2
+  CoTaskMemFree
