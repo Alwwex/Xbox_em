@@ -118,12 +118,24 @@ header). Leonida is not in this repository; the owner uploads it when needed.
 `game_scarlett_master.exe+0xb5a5f8` (fn `0xb5a5d0`, the title's graphics
 pipeline lookup) reads `[rax+0x68]` with RAX = 0. Its caller fn `0x32520`
 (draw state, called from fn `0xbfa70`, the draw) builds a key on its stack
-from the title's render context `ctx` (RDI): key+0 = `ctx+0x12328`,
-key+8 = `ctx+0x12320`; the lookup needs one of the two to be non-null (both
-are, probably the bound shaders), and `ctx+0x12330` (the cached pipeline) is
-null. The previous draw, topology 4, went through; the failing one is a
-RECTLIST fullscreen pass. Next: find who writes `ctx+0x12320/0x12328`
-(objdump of the whole executable, grep for stores to those offsets).
+from the title's render context `ctx` (RDI): key+0 = `ctx+0x12328` (the
+shader program; read unconditionally), key+8 = `ctx+0x12320` (set, valid).
+
+Tracepoints on all 22 stores to `ctx+0x12328` (one run, guest thread 340):
+
+1. fn `0x4e8a640` (+0x173) sets a valid program four times;
+2. the clear, fn `0x122630` (called from fn `0x1209b0`), swaps in its own
+   program and restores the previous one;
+3. the fullscreen pass fn `0x124760` calls `0xb39840(&state, 0xf, 0)` at
+   `+0x1ee`; that reaches fn `0x54793f0`, which stores **0** at +0x169
+   (`0x5479559`, `mov [rdx+0x12328], r8`);
+4. the pass sets `ctx+0x12320` from the global `0x149dd6f38` (valid),
+   topology RECTLIST, `0x517a290(ctx, 3, 0x18, …)` (3 vertices of 24 bytes)
+   and draws; the pipeline lookup dereferences the null program.
+
+fn `0x517acd0` binds a cached pipeline: `ctx+0x12330` = pipeline,
+`ctx+0x12328` = `[pipeline+8]`, topology byte `[pipeline+0x1e]` (not reached
+before the crash). Next: where fn `0x54793f0` gets the null program.
 
 ## Known approximations
 
