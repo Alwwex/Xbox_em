@@ -148,6 +148,27 @@ or its "physical index" is out of the pool -> crash.
   once the failing vpage repeats), compare with the op history
   (`--trace-at 0xf2c612` logs every op in rcx).
 
+Deeper (run with `--trace-at 0xf2c612,0x931e0,0xe8890,0x221b7d0,...` and
+`--trace-log 900000`, then filter by the failing page; not a race - it
+crashes the same way pinned to one core with `taskset -c 0`):
+- Timeline of a failing page: refcount +1 (0x221bad0 queueing), +1
+  (0x4f21b40), map by a type-2 op, -1 (0x4f658c0), then 0x4f8f330
+  (free of a GPU VA range: -1 per 64 KiB page) decrements it three times
+  -> 0 -> page freed (0x221b7d0) -> underflow -> the later type-5 unmap
+  fails.
+- The over-decrementing frees: `0x41db90(obj)` frees
+  align64K((word[obj+0xc] & 0xfff) * dword[obj+8]) bytes at [obj+0x18];
+  called from the buffer destroy fn 0x43c4d90 (+0x14e), which before that
+  queues type-5 unmaps per page (0x1428cb9b0 with ecx=5). In one run all 5
+  such frees were 0x160000 bytes (stride 0x580 x 1024 elements, object
+  vtable 0x1461ecdb0, constructor 0x501f390) at addresses one page apart -
+  so the allocations were much smaller than what is freed: the object's
+  count/stride differ between allocation and free, or the allocation used
+  another size. Next: find where these objects get their memory (the
+  type-2 map path, 0x1428cb9b0 with ecx=2) and what size it used; check
+  whether the 1024 / 0x580 come from data we provide (XG layout fields,
+  GetResourceAllocationInfo, a parsed file).
+
 New debugging aids: `--trace-log SKIP+N` (log hits after skipping SKIP),
 tracepoint memory operands nest (`[[reg+a]+b]+c`), renderer present log
 lists the top skip reasons.
