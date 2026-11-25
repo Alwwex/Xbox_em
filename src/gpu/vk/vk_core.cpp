@@ -1,5 +1,7 @@
 #include "gpu/vk/vk_core.h"
 
+#include <algorithm>
+
 #include <dlfcn.h>
 #include <sys/stat.h>
 
@@ -198,16 +200,24 @@ Buffer Core::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hos
 }
 
 Image Core::create_image(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage) {
+  return create_image(width, height, 1, 1, false, format, usage);
+}
+
+Image Core::create_image(uint32_t width, uint32_t height, uint32_t depth, uint32_t layers, bool volume,
+                         VkFormat format, VkImageUsageFlags usage) {
   Image img;
   img.format = format;
   img.width = width;
   img.height = height;
+  img.depth = volume ? std::max(depth, 1u) : 1;
+  img.layers = volume ? 1 : std::max(layers, 1u);
+  img.volume = volume;
   VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
   ici.format = format;
-  ici.extent = {width, height, 1};
+  ici.extent = {width, height, img.depth};
   ici.mipLevels = 1;
-  ici.arrayLayers = 1;
+  ici.arrayLayers = img.layers;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
   ici.usage = usage;
@@ -223,15 +233,20 @@ Image Core::create_image(uint32_t width, uint32_t height, VkFormat format, VkIma
     return {};
   }
   fn_.vkBindImageMemory(device_, img.image, img.memory, 0);
-  const bool depth = format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
-                     format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D16_UNORM;
+  const bool is_depth = format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                        format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D16_UNORM;
   VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vci.image = img.image;
-  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
   vci.format = format;
-  vci.subresourceRange = {static_cast<VkImageAspectFlags>(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+  vci.subresourceRange = {static_cast<VkImageAspectFlags>(is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
                           0, 1, 0, 1};
   fn_.vkCreateImageView(device_, &vci, nullptr, &img.view);
+  if (!volume && !is_depth) {
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vci.subresourceRange.layerCount = img.layers;
+    fn_.vkCreateImageView(device_, &vci, nullptr, &img.array_view);
+  }
   return img;
 }
 

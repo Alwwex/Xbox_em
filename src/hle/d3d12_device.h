@@ -35,6 +35,10 @@ struct GraphicsPipeline {
   uint64_t vs_hash = 0, ps_hash = 0;  // as named by --dump-shaders
   uint64_t part_hashes[6] = {};       // state a, state b, ps, ps meta, vs, vs meta
   bool blend_override = false;        // created by slot 55
+  // Device slot 86 (a PC pipeline stream with DXIL): GTA VI's only such
+  // pipeline is VS_Clear/PS_Clear - a full-target fill with a colour from
+  // root parameter 0 - which the renderer performs as a clear.
+  bool stream_clear = false;
   uint8_t blend[0x148] = {};          // its D3D12_BLEND_DESC
 };
 

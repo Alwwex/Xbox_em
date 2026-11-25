@@ -571,22 +571,34 @@ class Translator {
     const uint32_t vaddr = w1 & 0xff, vdata = (w1 >> 8) & 0xff, srsrc = ((w1 >> 16) & 0x1f) * 4,
                    ssamp = ((w1 >> 21) & 0x1f) * 4;
     if (nsa) return fail("NSA image addresses");
-    if (dim != 1) return fail(std::format("image dimension {}", dim));
-    const uint32_t tex = add_slot(SlotKind::Texture, srsrc, 2);
+    // dim: 1 2D, 2 3D, 5 2D array (others not yet). The texture slot holds
+    // the image's index in each bindless array: 2D, 2D array, 3D.
+    if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image dimension {}", dim));
+    const uint32_t tex = add_slot(SlotKind::Texture, srsrc, 4);
+    const char* type = dim == 1 ? "sampler2D" : dim == 2 ? "sampler3D" : "sampler2DArray";
+    const std::string array =
+        dim == 1 ? std::format("textures[nonuniformEXT(D({}))]", tex)
+        : dim == 2 ? std::format("textures_3d[nonuniformEXT(D({}))]", tex + 3)
+                   : std::format("textures_a[nonuniformEXT(D({}))]", tex + 2);
+    const int coords = dim == 1 ? 2 : 3;
     std::string value;
     if (n == "image_sample" || n == "image_sample_lz" || n == "image_sample_l" || n == "image_sample_b") {
       const uint32_t smp = add_slot(SlotKind::Sampler, ssamp, 1);
       // image_sample_b takes the bias before the coordinates, _l the lod after.
       const uint32_t c = vaddr + (n == "image_sample_b" ? 1 : 0);
-      const std::string coord = std::format("vec2(uintBitsToFloat({}), uintBitsToFloat({}))", vreg(c), vreg(c + 1));
-      const std::string sampler =
-          std::format("sampler2D(textures[nonuniformEXT(D({}))], samplers[nonuniformEXT(D({}))])", tex, smp);
+      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", vreg(c), vreg(c + 1));
+      if (coords == 3)
+        coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", vreg(c + 2))
+                          : std::format(", uintBitsToFloat({})", vreg(c + 2));
+      coord = std::format("vec{}({})", coords, coord);
+      const std::string sampler = std::format("{}({}, samplers[nonuniformEXT(D({}))])", type, array, smp);
       if (n == "image_sample_lz") value = std::format("textureLod({}, {}, 0.0)", sampler, coord);
-      else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, vreg(c + 2));
+      else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, vreg(c + coords));
       else value = std::format("texture({}, {})", sampler, coord);
     } else if (n == "image_load") {
-      value = std::format("texelFetch(sampler2D(textures[nonuniformEXT(D({}))], samplers[0]), ivec2({}, {}), 0)", tex,
-                          vreg(vaddr), vreg(vaddr + 1));
+      std::string coord = std::format("int({}), int({})", vreg(vaddr), vreg(vaddr + 1));
+      if (coords == 3) coord += std::format(", int({})", vreg(vaddr + 2));
+      value = std::format("texelFetch({}({}, samplers[0]), ivec{}({}), 0)", type, array, coords, coord);
     } else {
       return fail("");
     }
@@ -727,6 +739,8 @@ class Translator {
                     "layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };\n"
                     "%PUSH%"
                     "layout(set = 0, binding = 0) uniform texture2D textures[];\n"
+                    "layout(set = 0, binding = 2) uniform texture2DArray textures_a[];\n"
+                    "layout(set = 0, binding = 3) uniform texture3D textures_3d[];\n"
                     "layout(set = 0, binding = 1) uniform sampler samplers[];\n"
                     "uint D(uint i) { return Words(pc.data).w[i]; }\n"
                     "uint ld32(uint64_t a) {\n"

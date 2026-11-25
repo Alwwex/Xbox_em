@@ -34,7 +34,7 @@ enum class ShaderStage { Vertex, Pixel };
 enum class SlotKind : uint8_t {
   Sgpr,     // 1 word: an SGPR's value at that point of the program
   Buffer,   // 4 words: device address (lo, hi), stride, size limit (records)
-  Texture,  // 2 words: bindless texture index, image info (width | height << 16)
+  Texture,  // 4 words: bindless 2D index, image info (width | height << 16), 2D array index, 3D index
   Sampler,  // 1 word: bindless sampler index
 };
 

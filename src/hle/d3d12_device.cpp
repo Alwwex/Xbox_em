@@ -1462,10 +1462,26 @@ uint64_t XBEM_GUEST_ABI device_create_pipeline_state_stream(ProbeObject* self, u
     std::memcpy(&w, bytes.data() + i, 8);
     words += std::format("{}{:x}", i ? " " : "", w);
   }
-  XBEM_WARN("d3d12", "pipeline stream {:#x} bytes: {}", size, words);
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 4) XBEM_INFO("d3d12", "pipeline stream {:#x} bytes: {}", size, words);
   (void)riid;
-  probe_log(self, 86, std::format("CreatePipelineState(stream {:#x} bytes)", size), XBEM_RETURN_ADDRESS());
-  return create_into(make_probe_object(child_name("spso")), reinterpret_cast<void**>(out));
+  // Subobjects: a 4-byte type aligned to 8, then its data; shader bytecode
+  // (types 1 VS, 2 PS) is (pointer, size).
+  auto* pso = new GraphicsPipeline;
+  for (size_t i = 0; i + 24 <= bytes.size(); i += 8) {
+    uint64_t type, code, code_size;
+    std::memcpy(&type, bytes.data() + i, 8);
+    if (type != 2) continue;
+    std::memcpy(&code, bytes.data() + i + 8, 8);
+    std::memcpy(&code_size, bytes.data() + i + 16, 8);
+    const std::vector<uint8_t> ps = copy_guest(code, code_size);
+    const std::string_view text(reinterpret_cast<const char*>(ps.data()), ps.size());
+    if (text.substr(0, 4) == "DXBC" && text.find("PS_Clear") != std::string_view::npos) pso->stream_clear = true;
+    break;
+  }
+  const std::string name = child_name(pso->stream_clear ? "spso-clear" : "spso");
+  probe_log(self, 86, std::format("CreatePipelineState(stream {:#x} bytes) -> {}", size, name), XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(name, &g_graphics_pso_vtable, pso), reinterpret_cast<void**>(out));
 }
 
 HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint8_t* desc, uint64_t, uint64_t,

@@ -80,6 +80,7 @@ namespace xbem::gpu::vk {
   X(vkCmdSetViewport)                            \
   X(vkCmdSetScissor)                             \
   X(vkCmdDraw)                                   \
+  X(vkCmdClearAttachments)                       \
   X(vkCmdDrawIndexed)
 
 struct Functions {
@@ -104,6 +105,9 @@ struct Image {
   VkImageView view = VK_NULL_HANDLE;
   VkFormat format = VK_FORMAT_UNDEFINED;
   uint32_t width = 0, height = 0;
+  uint32_t depth = 1, layers = 1;  // a 3D image has depth > 1; an array has layers > 1
+  bool volume = false;             // VK_IMAGE_TYPE_3D
+  VkImageView array_view = VK_NULL_HANDLE;  // 2D_ARRAY view of all layers (2D images)
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
@@ -121,6 +125,11 @@ class Core {
 
   Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
   Image create_image(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage);
+  // A 2D array (`layers`) or a 3D image (`volume`, `depth`). `view` is a 2D
+  // view of layer 0 (2D) or the 3D view; `array_view` a 2D_ARRAY view of all
+  // layers (2D only).
+  Image create_image(uint32_t width, uint32_t height, uint32_t depth, uint32_t layers, bool volume, VkFormat format,
+                     VkImageUsageFlags usage);
   bool format_supported(VkFormat format, VkFormatFeatureFlags features) const;
 
  private:

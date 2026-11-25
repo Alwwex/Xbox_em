@@ -52,7 +52,7 @@ using gpu::vk::Buffer;
 using gpu::vk::Core;
 using gpu::vk::Image;
 
-constexpr uint32_t kMaxTextures = 4096, kSamplers = 8;
+constexpr uint32_t kMaxTextures = 4096, kSamplers = 8, kMaxArrayTextures = 1024, kMaxVolumeTextures = 256;
 constexpr VkDeviceSize kRingSize = 256ull << 20;
 
 uint64_t fnv1a(const void* data, size_t size, uint64_t h = 1469598103934665603ull) {
@@ -110,7 +110,9 @@ struct PipelineKey {
 // One render target or texture on the GPU, for a guest resource.
 struct GpuImage {
   Image image;
-  uint32_t texture_index = 0;  // in the bindless array, 0 = not yet
+  uint32_t texture_index = 0;  // in the bindless 2D array, 0 = not yet (or a 3D image)
+  uint32_t array_index = 0;    // in the bindless 2D-array array (2D images, all layers)
+  uint32_t volume_index = 0;   // in the bindless 3D array (3D images)
   bool rendered = false;       // the GPU holds its contents
   uint64_t last_render = 0;
   uint64_t uploaded_frame = 0;  // textures from guest memory: refreshed once per frame they are used
@@ -144,24 +146,24 @@ class Renderer {
     f.vkCreateFence(dev, &fci, nullptr, &fence_);
 
     // Bindless textures and samplers.
-    VkDescriptorSetLayoutBinding b[2]{};
-    b[0].binding = 0;
-    b[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    b[0].descriptorCount = kMaxTextures;
-    b[0].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
-    b[1].binding = 1;
-    b[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    b[1].descriptorCount = kSamplers;
-    b[1].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
-    VkDescriptorBindingFlags bflags[2] = {
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, 0};
+    // Bindings: 0 2D textures, 1 samplers, 2 2D-array textures, 3 3D textures.
+    VkDescriptorSetLayoutBinding b[4]{};
+    const uint32_t counts[4] = {kMaxTextures, kSamplers, kMaxArrayTextures, kMaxVolumeTextures};
+    for (uint32_t i = 0; i < 4; ++i) {
+      b[i].binding = i;
+      b[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      b[i].descriptorCount = counts[i];
+      b[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
+    const VkDescriptorBindingFlags bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+    VkDescriptorBindingFlags bflags[4] = {bound, 0, bound, bound};
     VkDescriptorSetLayoutBindingFlagsCreateInfo bfi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-    bfi.bindingCount = 2;
+    bfi.bindingCount = 4;
     bfi.pBindingFlags = bflags;
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     lci.pNext = &bfi;
     lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-    lci.bindingCount = 2;
+    lci.bindingCount = 4;
     lci.pBindings = b;
     if (f.vkCreateDescriptorSetLayout(dev, &lci, nullptr, &set_layout_) != VK_SUCCESS) {
       info = "descriptor set layout failed";
@@ -175,7 +177,7 @@ class Renderer {
     plci.pushConstantRangeCount = 2;
     plci.pPushConstantRanges = push;
     f.vkCreatePipelineLayout(dev, &plci, nullptr, &layout_);
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures},
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures + kMaxArrayTextures + kMaxVolumeTextures},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplers}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
@@ -223,7 +225,17 @@ class Renderer {
     copy_to_image(white_, at, 1, 1);
     submit();
     bind_texture(0, white_.view);
-    next_texture_ = 1;
+    bind_texture(0, white_.array_view, 2);
+    white_volume_ = core_.create_image(1, 1, 1, 1, true, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    begin();
+    transition(white_volume_.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    const VkDeviceSize at3 = ring_alloc(4, 4);
+    std::memcpy(static_cast<uint8_t*>(ring_.mapped) + at3, &px, 4);
+    copy_to_image(white_volume_, at3, 1, 1);
+    submit();
+    bind_texture(0, white_volume_.view, 3);
+    next_texture_ = next_array_ = next_volume_ = 1;
 
     const char* home = std::getenv("HOME");
     cache_dir_ = fs::path(home ? home : "/tmp") / ".cache" / "xbem" / "spirv";
@@ -321,7 +333,7 @@ class Renderer {
     b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
-    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    b.subresourceRange = {aspect, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
     core_.fn().vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &b);
   }
@@ -335,21 +347,22 @@ class Renderer {
                                     &mb, 0, nullptr, 0, nullptr);
   }
 
-  void copy_to_image(const Image& img, VkDeviceSize at, uint32_t row_texels, uint32_t rows) {
+  // One layer (or the whole volume of a 3D image) from the ring.
+  void copy_to_image(const Image& img, VkDeviceSize at, uint32_t row_texels, uint32_t rows, uint32_t layer = 0) {
     VkBufferImageCopy region{};
     region.bufferOffset = at;
     region.bufferRowLength = row_texels;
     region.bufferImageHeight = rows;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {img.width, img.height, 1};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+    region.imageExtent = {img.width, img.height, img.depth};
     core_.fn().vkCmdCopyBufferToImage(cmd_, ring_.buffer, img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
   }
 
-  void bind_texture(uint32_t index, VkImageView view) {
+  void bind_texture(uint32_t index, VkImageView view, uint32_t binding = 0) {
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set_;
-    w.dstBinding = 0;
+    w.dstBinding = binding;
     w.dstArrayElement = index;
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -378,21 +391,29 @@ class Renderer {
     }
     uint32_t dimension, height, format;
     uint64_t width;
+    uint16_t depth_or_array;
     std::memcpy(&dimension, r->desc, 4);
     std::memcpy(&width, r->desc + 16, 8);
     std::memcpy(&height, r->desc + 24, 4);
+    std::memcpy(&depth_or_array, r->desc + 28, 2);
     std::memcpy(&format, r->desc + 32, 4);
     const VkFormat vf = vk_format(format);
-    if (dimension != 3 || vf == VK_FORMAT_UNDEFINED || !width || !height || width > 16384 || height > 16384) {
+    if ((dimension != 3 && dimension != 4) || vf == VK_FORMAT_UNDEFINED || !width || !height || width > 16384 ||
+        height > 16384 || (for_render && dimension == 4)) {
       note(std::format("resource format {} dimension {} not supported", format, dimension));
       return nullptr;
     }
+    const bool volume = dimension == 4;
+    const uint32_t slices = std::clamp<uint32_t>(depth_or_array, 1, volume ? 2048 : 2048);
     const bool block = vf >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vf <= VK_FORMAT_BC7_SRGB_BLOCK;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (!block) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     auto g = std::make_unique<GpuImage>();
-    g->image = core_.create_image(static_cast<uint32_t>(width), height, vf, usage);
+    if (volume || slices > 1) usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    g->image = volume || slices > 1
+                   ? core_.create_image(static_cast<uint32_t>(width), height, slices, slices, volume, vf, usage)
+                   : core_.create_image(static_cast<uint32_t>(width), height, vf, usage);
     if (!g->image.image) {
       note(std::format("cannot create a {}x{} image of format {}", width, height, format));
       return nullptr;
@@ -413,9 +434,17 @@ class Renderer {
       upload_texture(*g, r, format, block);
       g->uploaded_frame = presents_;
     }
-    if (next_texture_ < kMaxTextures) {
+    if (!volume && next_texture_ < kMaxTextures) {
       g->texture_index = next_texture_++;
       bind_texture(g->texture_index, g->image.view);
+    }
+    if (!volume && g->image.array_view && next_array_ < kMaxArrayTextures) {
+      g->array_index = next_array_++;
+      bind_texture(g->array_index, g->image.array_view, 2);
+    }
+    if (volume && next_volume_ < kMaxVolumeTextures) {
+      g->volume_index = next_volume_++;
+      bind_texture(g->volume_index, g->image.view, 3);
     }
     GpuImage* raw = g.get();
     images_[r] = std::move(g);
@@ -427,17 +456,23 @@ class Renderer {
     const TextureLayout l = linear_layout(r->desc);
     if (l.mip.empty()) return;
     const MipLayout& m = l.mip[0];
-    const VkDeviceSize size = uint64_t{m.pitch_bytes} * m.height_elements;
+    // Mip 0 of every array slice (each slice_stride apart), or all depth
+    // slices of a 3D image's mip 0 (contiguous, slice_2d apart).
+    const uint32_t layers = g.image.volume ? 1 : g.image.layers;
+    const VkDeviceSize one = g.image.volume ? m.slice_2d * g.image.depth : uint64_t{m.pitch_bytes} * m.height_elements;
+    const VkDeviceSize size = one * layers;
     if (size > (64u << 20)) return;
     scratch_.resize(size);
-    if (!platform::safe_read(r->gpu_va, scratch_.data(), size)) return;
+    for (uint32_t k = 0; k < layers; ++k)
+      if (!platform::safe_read(r->gpu_va + k * l.slice_stride, scratch_.data() + k * one, one)) return;
     const uint64_t hash = fnv1a(scratch_.data(), size);
     if (hash == g.content_hash) return;
     g.content_hash = hash;
     const VkDeviceSize at = ring_alloc(size, 16);
     std::memcpy(static_cast<uint8_t*>(ring_.mapped) + at, scratch_.data(), size);
     const uint32_t row_texels = block ? m.pitch_bytes / l.element.bytes * 4 : m.pitch_bytes / l.element.bytes;
-    copy_to_image(g.image, at, row_texels, block ? m.height_elements * 4 : m.height_elements);
+    const uint32_t rows = block ? m.height_elements * 4 : m.height_elements;
+    for (uint32_t k = 0; k < layers; ++k) copy_to_image(g.image, at + k * one, row_texels, rows, k);
     full_barrier();
     (void)format;
   }
@@ -829,6 +864,8 @@ class Renderer {
         GpuImage* g = image_from_descriptor(bytes, false);
         out[0] = g ? g->texture_index : 0;
         out[1] = g ? (g->image.width | (g->image.height << 16)) : 0x00010001;
+        out[2] = g ? g->array_index : 0;
+        out[3] = g ? g->volume_index : 0;
         break;
       }
       case gpu::SlotKind::Sampler: {
@@ -841,11 +878,62 @@ class Renderer {
     }
   }
 
+  void begin_rendering() {
+    if (rendering_ && current_target_ == state_.target) return;
+    end_rendering();
+    VkRenderingAttachmentInfoKHR color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+    color.imageView = state_.target->image.view;
+    color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+    ri.renderArea = {{0, 0}, {state_.target->image.width, state_.target->image.height}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &color;
+    core_.fn().vkCmdBeginRendering(cmd_, &ri);
+    rendering_ = true;
+    current_target_ = state_.target;
+  }
+
+  // The DXIL clear pipeline (device slot 86): the colour is the float4 its
+  // root parameter 0 (a root SRV) points at; the fill covers the scissor.
+  void stream_clear() {
+    float rgba[4] = {0, 0, 0, 1};
+    const auto it = state_.params.find(0);
+    const uint64_t va = it != state_.params.end() ? it->second.value : 0;
+    if (!va || !platform::safe_read(va, rgba, sizeof rgba)) return skip("clear pipeline without a colour");
+    static int logged = 0;
+    if (logged++ < 4) {
+      uint32_t raw[16] = {};
+      platform::safe_read(va, raw, sizeof raw);
+      std::string w;
+      for (uint32_t x : raw) w += std::format(" {:08x}", x);
+      XBEM_INFO("gpu", "clear pipeline: root parameter 0 at {:#x}:{}", va, w);
+    }
+    begin_rendering();
+    VkClearAttachment ca{};
+    ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca.colorAttachment = 0;
+    std::memcpy(ca.clearValue.color.float32, rgba, sizeof rgba);
+    VkClearRect rect{};
+    rect.rect = state_.has_scissor ? state_.scissor
+                                   : VkRect2D{{0, 0}, {state_.target->image.width, state_.target->image.height}};
+    rect.rect.extent.width = std::min(rect.rect.extent.width, state_.target->image.width - std::min<uint32_t>(rect.rect.offset.x, state_.target->image.width));
+    rect.rect.extent.height = std::min(rect.rect.extent.height, state_.target->image.height - std::min<uint32_t>(rect.rect.offset.y, state_.target->image.height));
+    rect.layerCount = 1;
+    if (rect.rect.extent.width && rect.rect.extent.height) core_.fn().vkCmdClearAttachments(cmd_, 1, &ca, 1, &rect);
+    state_.target->rendered = true;
+    state_.target->last_render = ++render_serial_;
+    ++draws_;
+  }
+
   void draw(uint32_t count, uint32_t instances, uint32_t start, uint32_t start_instance, bool indexed,
             int32_t base_vertex) {
     GraphicsPipeline* p = state_.pipeline;
     if (!p) return skip(std::format("pipeline {} not from slot 57/55", state_.pipeline_name));
     if (!state_.target) return skip("no render target");
+    if (p->stream_clear) return stream_clear();
     if (p->vs_code.empty() || p->ps_code.empty()) return skip("pipeline without shader code");
     ShaderEntry* vs = shader(p->vs_code, p->vs_hash, gpu::ShaderStage::Vertex);
     ShaderEntry* ps = shader(p->ps_code, p->ps_hash, gpu::ShaderStage::Pixel);
@@ -951,22 +1039,7 @@ class Renderer {
         return;
       }
     }
-    if (!rendering_ || current_target_ != state_.target) {
-      end_rendering();
-      VkRenderingAttachmentInfoKHR color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-      color.imageView = state_.target->image.view;
-      color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-      color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
-      ri.renderArea = {{0, 0}, {state_.target->image.width, state_.target->image.height}};
-      ri.layerCount = 1;
-      ri.colorAttachmentCount = 1;
-      ri.pColorAttachments = &color;
-      f.vkCmdBeginRendering(cmd_, &ri);
-      rendering_ = true;
-      current_target_ = state_.target;
-    }
+    begin_rendering();
     f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set_, 0, nullptr);
     f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8, &data[0]);
@@ -1041,8 +1114,8 @@ class Renderer {
   VkDescriptorPool dpool_ = VK_NULL_HANDLE;
   VkDescriptorSet set_ = VK_NULL_HANDLE;
   VkSampler samplers_[kSamplers] = {};
-  Image white_;
-  uint32_t next_texture_ = 0;
+  Image white_, white_volume_;
+  uint32_t next_texture_ = 0, next_array_ = 0, next_volume_ = 0;
   std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> images_;
   std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> shaders_;
   std::map<uint32_t, VkShaderModule> rect_gs_;
