@@ -1220,6 +1220,41 @@ HRESULT XBEM_GUEST_ABI device_create_command_queue_x(ProbeObject* self, const ui
 }
 
 // 62 CreateComputePipelineState(desc, w2, w3, riid, ppv) with a PC compute desc.
+// 55 / 57: graphics pipelines (console). Being mapped: the first calls dump
+// their descriptions; 57's carries two native shader blobs (pointer, size)
+// at +0x08/+0x10 and +0x18/+0x20.
+std::string hex_block(uint64_t address, size_t size) {
+  std::vector<uint8_t> b(size);
+  if (!platform::safe_read(address, b.data(), size)) return "(unreadable)";
+  std::string out;
+  for (size_t i = 0; i < size; i += 16) {
+    out += std::format("\n      +{:03x}:", i);
+    for (size_t k = 0; k < 16 && i + k < size; k += 8) {
+      uint64_t v;
+      std::memcpy(&v, b.data() + i + k, 8);
+      out += std::format(" {:016x}", v);
+    }
+  }
+  return out;
+}
+template <int Slot>
+uint64_t XBEM_GUEST_ABI device_graphics_pso_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3,
+                                                   uint64_t a4, uint64_t a5, uint64_t a6) {
+  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+  static std::atomic<int> logged{0};
+  const uint64_t desc = Slot == 57 ? a1 : a3;
+  if (Slot == 57) {
+    static const char* kParts[] = {"gfx-state-a", "gfx-state-b", "gfx-code-a", "gfx-meta-a", "gfx-code-b", "gfx-meta-b"};
+    for (int i = 0; i < 6; ++i) {
+      const uint64_t p = read_guest<uint64_t>(a1 + 8 + i * 16), size = read_guest<uint64_t>(a1 + 16 + i * 16);
+      if (p && size < (1u << 20)) capture_shader(kParts[i], p, size);
+    }
+  }
+  if (logged.fetch_add(1) < 6)
+    XBEM_INFO("d3d12", "graphics pipeline (slot {}) desc at {:#x}:{}", Slot, desc, hex_block(desc, 0x100));
+  return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS());
+}
+
 HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint8_t* desc, uint64_t, uint64_t,
                                                    const void* riid, void** out) {
   return device_create_compute_pso(self, desc, riid, out);
@@ -1393,6 +1428,8 @@ const ProbeVtable g_device_vtable = make_vtable({
     {26, fn(&device_get_custom_heap_properties)},
     {48, fn(&device_create_command_queue_x)},
     {62, fn(&device_create_compute_pso_x)},
+    {55, fn(&device_graphics_pso_method<55>)},
+    {57, fn(&device_graphics_pso_method<57>)},
     {67, fn(&device_deserialize_compute_pso_x)},
     {73, fn(&device_create_command_list_x)},
     {76, fn(&device_create_texture_x<76>)},

@@ -75,6 +75,7 @@ bool window_is_open() { return false; }
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -84,6 +85,7 @@ bool window_is_open() { return false; }
 #include <type_traits>
 
 #include "common/log.h"
+#include "gpu/gl_backend.h"
 
 namespace xbem::platform {
 namespace {
@@ -184,6 +186,7 @@ struct WindowState {
   Xlib x{};
   void* display = nullptr;
   XID window = 0;
+  XID gpu_view = 0;  // child window the GPU presents into (0: XPutImage)
   void* gc = nullptr;
   void* image = nullptr;
   int screen = 0;
@@ -215,6 +218,11 @@ void draw(WindowState& s) {
     text(s, 8, kLineHeight * static_cast<int>(i + 1), i == 0 ? 0xffffff : 0xb8c0c8, lines[i]);
 
   if (!surface.pixels) {
+    if (s.gpu_view) {
+      std::fill(s.pixels.begin(), s.pixels.end(), 0u);
+      gpu::gl_present_pixels(s.pixels.data(), kImageWidth, kImageHeight);
+      return;
+    }
     s.x.SetForeground(s.display, s.gc, 0);
     s.x.FillRectangle(s.display, s.window, s.gc, 0, kStatusHeight, kImageWidth, kImageHeight);
     return;
@@ -231,6 +239,10 @@ void draw(WindowState& s) {
     s.x.SetForeground(s.display, s.gc, 0);
     s.x.FillRectangle(s.display, s.window, s.gc, 0, kStatusHeight, kImageWidth, kImageHeight);
     text(s, 8, kStatusHeight + 20, 0xff8080, std::format("surface format {} is not shown yet", surface.format));
+    return;
+  }
+  if (s.gpu_view) {
+    gpu::gl_present_pixels(s.pixels.data(), kImageWidth, kImageHeight);
     return;
   }
   s.x.PutImage(s.display, s.window, s.gc, s.image, 0, 0, 0, kStatusHeight, w, h);
@@ -306,6 +318,19 @@ bool window_open(const std::string& title, WindowStatusProvider status, std::str
     return false;
   }
   s->x.MapWindow(s->display, s->window);
+  // The image area: a child window the GPU presents into, when OpenGL works.
+  const XID view = s->x.CreateSimpleWindow(s->display, s->window, 0, kStatusHeight, kImageWidth, kImageHeight, 0, 0,
+                                           s->x.BlackPixel(s->display, s->screen));
+  s->x.MapWindow(s->display, view);
+  s->x.Flush(s->display);
+  std::string gpu_info;
+  if (gpu::gl_start(view, kImageWidth, kImageHeight, gpu_info)) {
+    s->gpu_view = view;
+    XBEM_INFO("window", "GPU presentation: {}", gpu_info);
+  } else {
+    XBEM_INFO("window", "no GPU presentation ({}); the window draws with XPutImage", gpu_info);
+    s->x.DestroyWindow(s->display, view);
+  }
   s->x.Flush(s->display);
   g_open.store(true);
   std::thread(window_thread, s).detach();

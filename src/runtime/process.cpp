@@ -12,6 +12,7 @@
 
 #include "common/log.h"
 #include "common/strings.h"
+#include "gpu/gl_backend.h"
 #include "hle/gameinput.h"
 #include "hle/guest_types.h"
 #include "hle/d3d12_device.h"
@@ -645,6 +646,16 @@ int Process::run() {
     std::string reason;
     if (platform::window_open(std::format("xbem - {}", main->name), &window_status_lines, reason)) {
       platform::window_set_key_handler(&hle::gamepad_key);
+      for (const std::string& spec : options_.screenshots) {
+        const size_t at = spec.rfind('@');
+        if (at == std::string::npos) continue;
+        const std::string path = spec.substr(0, at);
+        const double seconds = std::atof(spec.c_str() + at + 1);
+        std::thread([path, seconds] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(seconds * 1000)));
+          gpu::gl_request_screenshot(path);
+        }).detach();
+      }
       XBEM_INFO("window", "run window opened (--no-window runs without it); its keyboard drives the gamepad");
     }
     else

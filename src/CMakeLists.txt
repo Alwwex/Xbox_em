@@ -37,6 +37,7 @@ add_library(xbem_core STATIC
   hle/audio_endpoint.cpp
   hle/xuser.cpp
   hle/texture_layout.cpp
+  gpu/gl_backend.cpp
   hle/xg.cpp
   hle/dstorage.cpp
   hle/user32.cpp

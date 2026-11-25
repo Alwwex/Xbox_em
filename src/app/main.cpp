@@ -55,6 +55,7 @@ void print_usage() {
       "      --watch-log N               writes of each watchpoint logged as they happen (default 16)\n"
       "      --log-reads TEXT            log CreateFile/SetFilePointer/ReadFile/DirectStorage on files\n"
       "                                  whose path contains TEXT (offsets, sizes, destinations, callers)\n"
+      "      --screenshot FILE@SECONDS   save the run window's image as the GPU presents it (PPM), repeatable\n"
       "      --capture-commands FILE@SECONDS[:MS]\n"
       "                                  write the command lists the title executes from SECONDS after\n"
       "                                  device creation, for MS milliseconds (default 100), decoded\n"

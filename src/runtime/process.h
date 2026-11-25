@@ -42,6 +42,7 @@ struct ProcessOptions {
   bool window = true;                 // open the run window when a display is available
   std::string log_reads;              // log file operations on files whose path contains this
   std::string press;                  // scripted gamepad presses (--press), see hle/gameinput.h
+  std::vector<std::string> screenshots;  // FILE@SECONDS: the run window's frame, read back from the GPU
   std::string capture_commands;       // FILE@SECONDS[:MS]: write the command lists executed then
   std::vector<std::string> watch;    // data watchpoints: ADDRESS[/len] or alloc:CALLER+OFFSET[/len]
   int watch_log_writes = 16;          // writes of each watchpoint logged as they happen
