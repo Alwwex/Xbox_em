@@ -1371,9 +1371,19 @@ static void test_headless_d3d12(void) {
   const uint64_t rtv_handle = start + 2 * 32;
   ((OmSetFn)VT(list)[50])(list, 1, &rtv_handle, 0, 0);
   ((DrawFn)VT(list)[12])(list, 3, 1, 0, 0);
+  /* GPU memory writes the list makes when it executes (as GTA VI's frame
+   * labels): 71 (address, 32-bit value, 0, 0) and 72 (address, 0, 0, 1) - a
+   * 64-bit timestamp. Nothing is written while recording. */
+  typedef void (*LabelFn)(void*, void*, uint64_t, uint64_t, uint32_t);
+  static volatile uint32_t label[2] = {0, 0};
+  static volatile uint64_t gpu_time = 0;
+  ((LabelFn)VT(list)[71])(list, (void*)&label[1], 0x29a5ee15, 0, 0);
+  ((LabelFn)VT(list)[72])(list, (void*)&gpu_time, 0, 0, 1);
+  CHECK(label[1] == 0 && gpu_time == 0);
   CHECK(((CloseFn)VT(list)[9])(list) == 0);
   void* const lists[1] = {list};
   ((ExecuteXFn)VT(queue)[35])(queue, 1, lists, 0);
+  CHECK(label[1] == 0x29a5ee15 && label[0] == 0 && gpu_time != 0);
   void* pc_list = 0;
   CHECK(((CreateListFn)VT(device)[12])(device, 0, 0, 0, 0, iid, &pc_list) == 0 && pc_list && pc_list != list);
   CHECK(*(uint64_t*)((uint8_t*)pc_list + 0x18) == *(uint64_t*)((uint8_t*)pc_list + 0x30));

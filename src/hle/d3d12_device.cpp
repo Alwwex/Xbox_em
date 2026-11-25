@@ -219,6 +219,7 @@ bool is_fence(void* object) {
 // ------------------------------------------------------- command queue
 
 void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists);
+void perform_list_writes(uint64_t count, uint64_t lists);
 
 // ID3D12CommandQueue. On the PC: 10 ExecuteCommandLists, 11 SetMarker,
 // 12 BeginEvent, 13 EndEvent, 14 Signal, 15 Wait, 16 GetTimestampFrequency,
@@ -240,6 +241,7 @@ uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1
   }
   if (a0 >= 1 && a0 <= 256 && a1 >= 0x10000 && a1 < 0x800000000000ull && (Slot == 10 || Slot == 12)) {
     capture_execute(self, a0, a1);
+    perform_list_writes(a0, a1);
     probe_log(self, Slot, std::format("ExecuteCommandLists({} lists) - completed instantly (headless) [by shape]", a0),
               ret);
     return 0;
@@ -260,6 +262,7 @@ uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1
 // with plane descriptions (PresentX). Both keep the probe's logging.
 void capture_marker(ProbeObject* queue, const char* what);
 void render_lists(uint64_t count, uint64_t lists);
+void perform_list_writes(uint64_t count, uint64_t lists);
 template <int Slot>
 uint64_t XBEM_GUEST_ABI queue_console_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                                              uint64_t a5, uint64_t a6) {
@@ -267,6 +270,7 @@ uint64_t XBEM_GUEST_ABI queue_console_method(ProbeObject* self, uint64_t a1, uin
   if (Slot == 35 && a1 >= 1 && a1 <= 256) {
     capture_execute(self, a1, a2);
     if (render_active()) render_lists(a1, a2);
+    perform_list_writes(a1, a2);
   }
   if (Slot == 32) {
     capture_marker(self, "PresentX (queue slot 32)");
@@ -440,9 +444,19 @@ HRESULT create_into(void* object, void** out) {
 // (SetDescriptorHeaps, PC 28) - measured from the title's calls up to 52
 // (ClearRenderTargetView); later and console-only slots are shown by number.
 
+// A GPU write into memory a list makes when it executes (console list slots
+// 71: a 32-bit value, the end-of-pipe label titles poll for GPU progress;
+// 72: a 64-bit timestamp).
+struct MemoryWrite {
+  uint64_t address;
+  uint64_t value;
+  bool timestamp;  // 8 bytes of GPU time instead of `value`
+};
+
 struct ListRecord {
   std::mutex mutex;
   std::vector<RecordedCommand> commands;
+  std::vector<MemoryWrite> writes;  // kept even when commands are not recorded
   bool closed = false;  // the next command starts a new recording (the console Reset is not slot 10)
 };
 
@@ -703,9 +717,12 @@ void record_command(ProbeObject* self, int slot, const uint64_t* args) {
   std::lock_guard lock(r->mutex);
   if (r->closed || slot == 10) {
     r->commands.clear();
+    r->writes.clear();
     r->closed = false;
   }
   if (slot == 9) r->closed = true;
+  if (slot == 71 && args[0] >= 0x10000) r->writes.push_back({args[0], static_cast<uint32_t>(args[1]), false});
+  if (slot == 72 && args[0] >= 0x10000) r->writes.push_back({args[0], 0, true});
   const bool capture = g_capture_recording.load(std::memory_order_relaxed);
   const bool render = render_active();
   if (!capture && !render) return;
@@ -772,6 +789,27 @@ void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists) {
                 r->commands.front().text);
   }
   g_capture.out.flush();
+}
+
+// The memory writes of executed lists (GPU work completes at submission).
+void perform_list_writes(uint64_t count, uint64_t lists) {
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t p = read_guest<uint64_t>(lists + i * 8);
+    if (!is_probe_object(p)) continue;
+    ListRecord* r = list_record_of(reinterpret_cast<ProbeObject*>(p));
+    if (!r) continue;
+    std::lock_guard lock(r->mutex);
+    for (const MemoryWrite& w : r->writes) {
+      if (w.timestamp) {
+        const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()).count() / 10);  // 100 MHz
+        platform::safe_write(w.address, &ticks, 8);
+      } else {
+        const uint32_t v = static_cast<uint32_t>(w.value);
+        platform::safe_write(w.address, &v, 4);
+      }
+    }
+  }
 }
 
 // Hands the commands of executed lists to the renderer.
