@@ -122,56 +122,39 @@ Fixed on the way (all with guest tests):
 - Command list slots 71 (label write: address, 32-bit value) and 72
   (timestamp write) are now performed at ExecuteCommandLists.
 
-## Current blocker: double unmap in the game's GPU page table (~210-330 s)
+## Current blocker: watchdog crash while loading the story (~240-270 s)
 
-Crash at +0xf2cb40 (write at index 0x55555555): fn 0xf2c470 processes a
-queue of page operations (dword: type = bits 29-31, virtual page = bits
-8-28, count-1 = bits 0-7; jump table at 0x14674c2bc: 0 and 2 map a physical
-page from the free list (tail 0x1471bfcd8, packed 21-bit list at
-0x1471bfcd0), 5 unmaps). Unmap uses fn 0x221ba60 (page table at
-[0x1471bfb08], entry: low 15 bits refcount, bits 20-40 physical index,
-pool size [0x1471bfac8] >> 16 = 99776 pages = the third
-XMemAllocatePhysicalPages). It returns -1 when the entry's refcount is 0
-or its "physical index" is out of the pool -> crash.
-- Type-5 unmaps are rare (4 per run), all from the deferred release
-  0x4fd22d0 -> 0x50498a0 -> 0x194110 -> 0xe88f0 (item+0x38 = op list).
-- The failing page was mapped once by a type-2 op on the main thread (344)
-  and then released by type 5; its entry had been changed in between by
-  direct writes (0x52387f4..0x52389f7, 0x555b30d, 0x221b832.., 0x93222 inc,
-  0xe8890 dec: refcount -1, at 0 it frees via 0x221b7d0).
-- Not caused by: failed DirectStorage formats (XBEM_DSTORAGE_PRETEND=1
-  still crashes), the label writes (crashed before them too, later).
-- Not deterministic (different page each run): a race is possible; the
-  page-table lock is the title's own (0x1471bfad8, wakes via
-  ReleaseSemaphore). Next: log the entry writers for the failing page in
-  one run (watch the table entry with `--watch at:0x221ba79:rdx+<vpage*8>`
-  once the failing vpage repeats), compare with the op history
-  (`--trace-at 0xf2c612` logs every op in rcx).
+The page-table crash is fixed (root cause: XG texture computer slot 10 is
+also GetResourceTiling; it returned zeros, so streamed textures got no pages
+but were freed at full size). Now the title's watchdog thread (fn
+0x2215a60, thread ~328) deliberately writes to address 0 (+0x23cf683): it
+checks a table of 64 heartbeat/time entries (0x146844a20, 0x48 bytes each,
+timestamps at +8.., threshold float at 0x146159e20, an extra condition fn
+0x1409d3e70(0x89aee1d6)) every second; some entry got too old. The main
+thread is busy creating resources at that point, not blocked. The error
+message is obfuscated in the code (built at 0x23cf62e) - not decoded (no
+decryption). Suspects:
+- Streaming reads that never complete: the file-read layer (fn 0x4ffd520)
+  hits its own int3 asserts 500+ times: +0x4ffd879 (compressed chunk read
+  partially: request size r14 < chunk size r8), +0x4ffd868 (offset not at
+  a compressed chunk's start, 24x), +0x4ffd859 (offset past the chunk
+  table, 1x). Request offsets/sizes come from texture tiling
+  (GetResourceTiling: our D3D12 standard tile shapes / packed-mip rule may
+  differ from the console's for some formats or non-square textures) and
+  from GetResourceAllocationInfo sizes (linear layout, not RDNA2 tiled).
+- Find which heartbeat entry expires: dump 0x146844a20 at the crash (the
+  entry index ebx/rdi at 0x142215c0c) and look up who writes it.
 
-Deeper (run with `--trace-at 0xf2c612,0x931e0,0xe8890,0x221b7d0,...` and
-`--trace-log 900000`, then filter by the failing page; not a race - it
-crashes the same way pinned to one core with `taskset -c 0`):
-- Timeline of a failing page: refcount +1 (0x221bad0 queueing), +1
-  (0x4f21b40), map by a type-2 op, -1 (0x4f658c0), then 0x4f8f330
-  (free of a GPU VA range: -1 per 64 KiB page) decrements it three times
-  -> 0 -> page freed (0x221b7d0) -> underflow -> the later type-5 unmap
-  fails.
-- The over-decrementing frees: `0x41db90(obj)` frees
-  align64K((word[obj+0xc] & 0xfff) * dword[obj+8]) bytes at [obj+0x18];
-  called from the buffer destroy fn 0x43c4d90 (+0x14e), which before that
-  queues type-5 unmaps per page (0x1428cb9b0 with ecx=5). In one run all 5
-  such frees were 0x160000 bytes (stride 0x580 x 1024 elements, object
-  vtable 0x1461ecdb0, constructor 0x501f390) at addresses one page apart -
-  so the allocations were much smaller than what is freed: the object's
-  count/stride differ between allocation and free, or the allocation used
-  another size. Next: find where these objects get their memory (the
-  type-2 map path, 0x1428cb9b0 with ecx=2) and what size it used; check
-  whether the 1024 / 0x580 come from data we provide (XG layout fields,
-  GetResourceAllocationInfo, a parsed file).
+## DirectStorage request layout (measured on GTA VI)
 
-New debugging aids: `--trace-log SKIP+N` (log hits after skipping SKIP),
-tracepoint memory operands nest (`[[reg+a]+b]+c`), renderer present log
-lists the top skip reasons.
+`w0` options (low byte: compression 0 none, 1 zlib, 2 and 14 unknown -
+probably BCPack/texture codecs, still failing), w1..w3 destination, w4 file,
+w5 offset, w6 size (| uncompressed << 32). Destinations:
+- plain: (pointer, 0, size);
+- options 0x20xxxx: physical memory - w1 points to the frame numbers of the
+  destination's 64 KiB pages, w2 = byte offset in it, w3 = size; bytes
+  [w2, w2+w3) of the decompressed chunk go there. The title fills the frame
+  arrays between Enqueue and Submit, so these wait for Submit.
 
 ## Renderer gaps seen on these screens
 
@@ -209,3 +192,5 @@ probably one of these.
 - 51b2f2e/728ec43: SDWA, fmaak/fmamk, readfirstlane; device slot 86.
 - 8b56880: linear strtoul (story loading no longer hangs).
 - 5b031ba: list label writes (slots 71/72).
+- a8fbec9: small resources (4 KiB). 3efa950 + latest: DirectStorage physical
+  destinations. 2aa95a8: XG GetResourceTiling (page-table crash fixed).
