@@ -572,11 +572,13 @@ class Renderer {
     return m;
   }
 
-  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry& ps, VkFormat format, bool rect) {
+  // mode: 0 triangle list, 1 RECTLIST (geometry shader), 2 triangle strip.
+  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry& ps, VkFormat format, uint32_t mode) {
+    const bool rect = mode == 1;
     // Blend: the variant's D3D12_BLEND_DESC (render target 0 at dword 3), else alpha blending.
     uint32_t blend[10] = {1, 0, 5, 6, 1, 2, 6, 1, 4, 0xf};
     if (p.blend_override) std::memcpy(blend, p.blend + 12, sizeof blend);
-    const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof blend), static_cast<uint32_t>(format), rect};
+    const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof blend), static_cast<uint32_t>(format), mode};
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
     VkPipelineShaderStageCreateInfo stages[3]{};
     uint32_t count = 0;
@@ -592,7 +594,7 @@ class Renderer {
                        ps.module, "main", nullptr};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = mode == 2 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -940,11 +942,12 @@ class Renderer {
     if (!vs->module) return skip(std::format("vs {:016x} not translated", p->vs_hash));
     if (!ps->module) return skip(std::format("ps {:016x} not translated", p->ps_hash));
     const bool rect = state_.topology == 0x11;
-    if (state_.topology != 4 && !rect) {
+    const bool strip = state_.topology == 5;
+    if (state_.topology != 4 && !rect && !strip) {
       note(std::format("topology {:#x} not supported - draws skipped", state_.topology));
       return skip(std::format("topology {:#x}", state_.topology));
     }
-    VkPipeline pipe = pipeline(*p, *vs, *ps, state_.target->image.format, rect);
+    VkPipeline pipe = pipeline(*p, *vs, *ps, state_.target->image.format, rect ? 1 : strip ? 2 : 0);
     if (!pipe) return skip("pipeline creation failed");
     // Vertex buffer table: one V# per view (base, stride, records).
     std::vector<uint8_t> vb_table(std::max<size_t>(state_.vertex_buffers.size(), 16));
