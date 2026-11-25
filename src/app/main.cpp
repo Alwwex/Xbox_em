@@ -24,6 +24,7 @@ void print_usage() {
       "  xvd <file>                      read-only XVD/XVC container header info (no decryption)\n"
       "  cpu                             check the host CPU against the Xbox Series (Zen 2) ISA\n"
       "  gpu                             the Vulkan device the renderer would use\n"
+      "  gpu-translate <shader.bin> vs|ps translate a captured RDNA2 shader to GLSL (Vulkan)\n"
       "  hle [module]                    list HLE modules / implemented functions\n"
       "  hexdump <file> <rva> [len]      bytes of a PE file at an RVA (hex), e.g. code to disassemble\n"
       "  func <file> <rva>... | -        the function an RVA is in (.pdata) and an objdump command for it;\n"
@@ -112,6 +113,7 @@ int main(int argc, char** argv) {
     if (command == "xvd") return xbem::app::cmd_xvd(rest);
     if (command == "cpu") return xbem::app::cmd_cpu(rest);
     if (command == "gpu") return xbem::app::cmd_gpu(rest);
+    if (command == "gpu-translate") return xbem::app::cmd_gpu_translate(rest);
     if (command == "hle") return xbem::app::cmd_hle(rest);
     if (command == "run") {
       XBEM_INFO("xbem", "xbem {} (commit {})", XBEM_VERSION, XBEM_GIT_COMMIT);

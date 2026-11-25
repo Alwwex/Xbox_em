@@ -16,6 +16,7 @@
 #include "common/log.h"
 #include "common/strings.h"
 #include "gpu/rdna2.h"
+#include "gpu/translate.h"
 #if defined(XBEM_HAVE_VULKAN)
 #include "gpu/vk/vk_core.h"
 #endif
@@ -402,6 +403,26 @@ int cmd_gpu(const Args&) {
   out("this xbem was built without the Vulkan renderer (no vulkan/vulkan.h at build time)\n");
   return 1;
 #endif
+}
+
+int cmd_gpu_translate(const Args& args) {
+  if (args.size() < 2 || (args[1] != "vs" && args[1] != "ps")) {
+    out("usage: xbem gpu-translate <shader.bin> vs|ps\n");
+    return 2;
+  }
+  const auto bytes = read_file(args[0]);
+  const auto shader = gpu::translate_shader(bytes.data(), bytes.size(),
+                                            args[1] == "vs" ? gpu::ShaderStage::Vertex : gpu::ShaderStage::Pixel);
+  if (!shader.ok) {
+    out("translation failed: {}\n", shader.error);
+    return 1;
+  }
+  out("{}", shader.glsl);
+  out("// {} slots, {} words:", shader.slots.size(), shader.slot_words);
+  static const char* kKinds[] = {"sgpr", "buffer", "texture", "sampler"};
+  for (const auto& s : shader.slots) out(" {}@{}:s{}", kKinds[static_cast<int>(s.kind)], s.instruction, s.sgpr);
+  out("\n");
+  return 0;
 }
 
 int cmd_cpu(const Args&) {
