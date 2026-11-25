@@ -1,5 +1,20 @@
 #include "gpu/gl_backend.h"
 
+#if defined(_WIN32)
+
+namespace xbem::gpu {
+bool gl_start(unsigned long, int, int, std::string& info) {
+  info = "not available on Windows hosts";
+  return false;
+}
+bool gl_active() { return false; }
+void gl_present_pixels(const uint32_t*, int, int) {}
+void gl_request_screenshot(const std::string&) {}
+void gl_run(std::function<void()>) {}
+}  // namespace xbem::gpu
+
+#else
+
 #include <dlfcn.h>
 #include <sys/stat.h>
 
@@ -347,3 +362,5 @@ void gl_run(std::function<void()> job) {
 }
 
 }  // namespace xbem::gpu
+
+#endif

@@ -12,6 +12,7 @@ int cmd_coverage(const Args& args);
 int cmd_package(const Args& args);
 int cmd_xvd(const Args& args);
 int cmd_cpu(const Args& args);
+int cmd_gpu(const Args& args);
 int cmd_hle(const Args& args);
 int cmd_run(const Args& args);
 int cmd_hexdump(const Args& args);

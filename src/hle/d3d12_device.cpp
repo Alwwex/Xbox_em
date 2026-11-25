@@ -538,8 +538,13 @@ std::string describe_object(uint64_t p) {
 
 std::string describe_descriptor(uint64_t handle) {
   XbemDescriptor d{};
-  if (!platform::safe_read(handle, &d, sizeof d) || d.magic != kDescriptorMagic || d.kind > kSampler)
-    return std::format("{:#x}", handle);
+  if (!platform::safe_read(handle, &d, sizeof d)) return std::format("{:#x}", handle);
+  if (d.magic != kDescriptorMagic || d.kind > kSampler) {
+    uint32_t w[8];
+    std::memcpy(w, &d, 32);
+    return std::format("{:#x} [{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]", handle, w[0], w[1], w[2], w[3],
+                       w[4], w[5], w[6], w[7]);
+  }
   if (d.kind == kCbv) return std::format("{:#x} CBV va {:#x} {} bytes", handle, d.a, d.b);
   return std::format("{:#x} {} {}", handle, kDescriptorKindNames[d.kind], d.object ? describe_object(d.object) : "");
 }
@@ -1221,43 +1226,59 @@ HRESULT XBEM_GUEST_ABI device_create_command_queue_x(ProbeObject* self, const ui
 }
 
 // 62 CreateComputePipelineState(desc, w2, w3, riid, ppv) with a PC compute desc.
-// 55 / 57: graphics pipelines (console). Being mapped: the first calls dump
-// their descriptions; 57's carries two native shader blobs (pointer, size)
-// at +0x08/+0x10 and +0x18/+0x20.
-std::string hex_block(uint64_t address, size_t size) {
-  std::vector<uint8_t> b(size);
-  if (!platform::safe_read(address, b.data(), size)) return "(unreadable)";
-  std::string out;
-  for (size_t i = 0; i < size; i += 16) {
-    out += std::format("\n      +{:03x}:", i);
-    for (size_t k = 0; k < 16 && i + k < size; k += 8) {
-      uint64_t v;
-      std::memcpy(&v, b.data() + i + k, 8);
-      out += std::format(" {:016x}", v);
-    }
-  }
+const ProbeVtable g_graphics_pso_vtable = make_vtable({});
+
+std::vector<uint8_t> copy_guest(uint64_t p, uint64_t size) {
+  std::vector<uint8_t> out;
+  if (!p || !size || size > (1u << 20)) return out;
+  out.resize(size);
+  if (!platform::safe_read(p, out.data(), size)) out.clear();
   return out;
 }
+
+// 57 CreateGraphicsPipelineStateX(desc, riid, ppv): the description's six
+// (pointer, size) parts are copied (see GPU.md). 55 (base pipeline, flags,
+// D3D12_BLEND_DESC, riid, ppv): a variant of a pipeline with another blend
+// state - the UI draws with them.
 template <int Slot>
 uint64_t XBEM_GUEST_ABI device_graphics_pso_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3,
-                                                   uint64_t a4, uint64_t a5, uint64_t a6) {
-  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
-  static std::atomic<int> logged{0};
-  const uint64_t desc = Slot == 57 ? a1 : a3;
+                                                   uint64_t a4, uint64_t a5, uint64_t) {
+  auto* pso = new GraphicsPipeline;
+  void** out = nullptr;
   if (Slot == 57) {
     static const char* kParts[] = {"gfx-state-a", "gfx-state-b", "gfx-code-a", "gfx-meta-a", "gfx-code-b", "gfx-meta-b"};
-    std::string parts;
+    std::vector<uint8_t>* dest[] = {&pso->state_a, &pso->state_b, &pso->ps_code,
+                                    &pso->ps_meta, &pso->vs_code, &pso->vs_meta};
+    pso->root_signature = read_guest<uint64_t>(a1);
     for (int i = 0; i < 6; ++i) {
       const uint64_t p = read_guest<uint64_t>(a1 + 8 + i * 16), size = read_guest<uint64_t>(a1 + 16 + i * 16);
+      *dest[i] = copy_guest(p, size);
       const uint64_t h = p && size < (1u << 20) ? capture_shader(kParts[i], p, size) : 0;
-      parts += std::format(" {}={:016x}", kParts[i], h);
+      pso->part_hashes[i] = h;
+      if (i == 2) pso->ps_hash = h;
+      if (i == 4) pso->vs_hash = h;
     }
-    static std::atomic<int> pipelines{0};
-    if (pipelines.fetch_add(1) < 400) XBEM_DEBUG("d3d12", "graphics pipeline:{}", parts);
+    out = reinterpret_cast<void**>(a3);
+  } else {
+    if (is_probe_object(a1) && reinterpret_cast<ProbeObject*>(a1)->vtable == g_graphics_pso_vtable.data())
+      *pso = *static_cast<GraphicsPipeline*>(reinterpret_cast<ProbeObject*>(a1)->state);
+    pso->blend_override = true;
+    platform::safe_read(a3, pso->blend, sizeof pso->blend);
+    out = reinterpret_cast<void**>(a5);
+    (void)a2;
+    (void)a4;
   }
-  if (logged.fetch_add(1) < 6)
-    XBEM_INFO("d3d12", "graphics pipeline (slot {}) desc at {:#x}:{}", Slot, desc, hex_block(desc, 0x100));
-  return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS());
+  const std::string name = std::format("{} (vs {:016x} ps {:016x}{})", child_name("gpso"), pso->vs_hash,
+                                       pso->ps_hash, Slot == 55 ? ", blend variant" : "");
+  void* object = make_probe_object(name, &g_graphics_pso_vtable, pso);
+  XBEM_DEBUG("d3d12", "{}: state {:016x} {:016x}, ps {:016x} meta {:016x}, vs {:016x} meta {:016x}", name,
+             pso->part_hashes[0], pso->part_hashes[1], pso->part_hashes[2], pso->part_hashes[3], pso->part_hashes[4],
+             pso->part_hashes[5]);
+  probe_log(self, Slot, std::format("Create{}GraphicsPipelineX -> {}", Slot == 55 ? "Variant" : "", name),
+            XBEM_RETURN_ADDRESS());
+  if (!out) return E_POINTER;
+  *out = object;
+  return S_OK;
 }
 
 HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint8_t* desc, uint64_t, uint64_t,

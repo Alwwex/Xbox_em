@@ -81,6 +81,17 @@ if(WIN32)
   target_compile_definitions(xbem_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# The Vulkan renderer needs only the Vulkan headers at build time (the
+# library is loaded at run time); without them xbem builds without it.
+find_path(XBEM_VULKAN_INCLUDE vulkan/vulkan.h)
+if(XBEM_VULKAN_INCLUDE AND NOT WIN32)
+  target_sources(xbem_core PRIVATE gpu/vk/vk_core.cpp)
+  target_include_directories(xbem_core PUBLIC ${XBEM_VULKAN_INCLUDE})
+  target_compile_definitions(xbem_core PUBLIC XBEM_HAVE_VULKAN=1)
+  # Vulkan structures are filled field by field after {sType}.
+  set_source_files_properties(gpu/vk/vk_core.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+endif()
+
 add_executable(xbem
   app/main.cpp
   app/commands.cpp

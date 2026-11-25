@@ -16,6 +16,9 @@
 #include "common/log.h"
 #include "common/strings.h"
 #include "gpu/rdna2.h"
+#if defined(XBEM_HAVE_VULKAN)
+#include "gpu/vk/vk_core.h"
+#endif
 #include "hle/gameinput.h"
 #include "hle/registry.h"
 #include "loader/pe_image.h"
@@ -384,6 +387,22 @@ int cmd_xvd(const Args& args) {
 }
 
 // ---------------------------------------------------------------------- cpu
+
+int cmd_gpu(const Args&) {
+#if defined(XBEM_HAVE_VULKAN)
+  gpu::vk::Core core;
+  std::string reason;
+  if (!core.init(reason)) {
+    out("Vulkan: not usable - {}\n", reason);
+    return 1;
+  }
+  out("Vulkan device: {}\n", core.device_name());
+  return 0;
+#else
+  out("this xbem was built without the Vulkan renderer (no vulkan/vulkan.h at build time)\n");
+  return 1;
+#endif
+}
 
 int cmd_cpu(const Args&) {
   out("Host CPU: {}\n\n", platform::host_cpu_brand());
