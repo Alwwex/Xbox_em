@@ -112,13 +112,13 @@ uint64_t fnv1a(const uint8_t* p, size_t n) {
 }
 
 // Saves a D3D12_SHADER_BYTECODE {pointer, size} if it looks valid.
-void capture_shader(const char* stage, uint64_t pointer, uint64_t size) {
-  if (!pointer || size < 16 || size > (64u << 20)) return;
+uint64_t capture_shader(const char* stage, uint64_t pointer, uint64_t size) {
+  if (!pointer || size < 16 || size > (64u << 20)) return 0;
   std::vector<uint8_t> bytes(size);
-  if (!platform::safe_read(pointer, bytes.data(), size)) return;
+  if (!platform::safe_read(pointer, bytes.data(), size)) return 0;
   const uint64_t hash = fnv1a(bytes.data(), bytes.size());
   std::lock_guard lock(g_shaders.mutex);
-  if (!g_shaders.seen.emplace(hash, true).second) return;
+  if (!g_shaders.seen.emplace(hash, true).second) return hash;
   ++g_shaders.count;
   const char magic[5] = {static_cast<char>(bytes[0]), static_cast<char>(bytes[1]), static_cast<char>(bytes[2]),
                          static_cast<char>(bytes[3]), 0};
@@ -127,7 +127,7 @@ void capture_shader(const char* stage, uint64_t pointer, uint64_t size) {
     if (g_shaders.count <= 3)
       XBEM_INFO("d3d12", "shader {} ({} bytes, magic '{}') - use --dump-shaders DIR to save shaders", stage, size,
                 std::isprint(static_cast<unsigned char>(magic[0])) ? magic : "?");
-    return;
+    return hash;
   }
   std::error_code ec;
   fs::create_directories(dir, ec);
@@ -136,6 +136,7 @@ void capture_shader(const char* stage, uint64_t pointer, uint64_t size) {
                                                static_cast<std::streamsize>(bytes.size()));
   if (g_shaders.count <= 20 || g_shaders.count % 100 == 0)
     XBEM_INFO("d3d12", "captured shader #{}: {} ({} bytes)", g_shaders.count, file.string(), size);
+  return hash;
 }
 
 // ------------------------------------------------------------- fence
@@ -1245,10 +1246,14 @@ uint64_t XBEM_GUEST_ABI device_graphics_pso_method(ProbeObject* self, uint64_t a
   const uint64_t desc = Slot == 57 ? a1 : a3;
   if (Slot == 57) {
     static const char* kParts[] = {"gfx-state-a", "gfx-state-b", "gfx-code-a", "gfx-meta-a", "gfx-code-b", "gfx-meta-b"};
+    std::string parts;
     for (int i = 0; i < 6; ++i) {
       const uint64_t p = read_guest<uint64_t>(a1 + 8 + i * 16), size = read_guest<uint64_t>(a1 + 16 + i * 16);
-      if (p && size < (1u << 20)) capture_shader(kParts[i], p, size);
+      const uint64_t h = p && size < (1u << 20) ? capture_shader(kParts[i], p, size) : 0;
+      parts += std::format(" {}={:016x}", kParts[i], h);
     }
+    static std::atomic<int> pipelines{0};
+    if (pipelines.fetch_add(1) < 400) XBEM_DEBUG("d3d12", "graphics pipeline:{}", parts);
   }
   if (logged.fetch_add(1) < 6)
     XBEM_INFO("d3d12", "graphics pipeline (slot {}) desc at {:#x}:{}", Slot, desc, hex_block(desc, 0x100));

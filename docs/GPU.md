@@ -13,7 +13,8 @@ layers, built in this order:
 | Shader container parsing – locate the RDNA2 program, resource bindings and input/output layout inside the console shader blobs | next (needs captured shaders) |
 | RDNA2 → SPIR-V translation – scalar/vector ALU, memory (buffer, image, LDS), control flow (exec mask, branches), exports | planned |
 | Run window (`src/platform/window.*`) – X11 window (WSLg) with status and the title's display surface (first `ALLOW_DISPLAY` texture), scaled | done (shows the surface memory; nothing renders into it yet) |
-| Vulkan backend – D3D12 objects mapped to Vulkan: queues, command buffers, descriptors, pipelines; presentation to a window | planned |
+| Host GPU access – OpenGL 4.6 through EGL on a GPU thread (`src/gpu/gl_backend.*`); on WSL2 Mesa's d3d12 driver runs it on the Windows GPU driver (checked: GeForce GTX 1080). The run window presents through it; `--screenshot` reads frames back | done |
+| Renderer – D3D12.X objects on OpenGL: pipelines, resources, descriptor tables, draws; RDNA2 → GLSL translation | next (see "Graphics pipelines" below) |
 | Console specifics – ESRAM-less unified memory, GPU virtual addresses chosen by the title, tiling/swizzle (XG), frame pacing (PresentX) | planned |
 
 Regenerating the opcode tables (needs `llvm-mc` with the AMDGPU target):
@@ -95,3 +96,49 @@ A frame of GTA VI's main loop at about 90 s (`--press A@45`): a compute pass,
 then UI meshes (30-4,500 indices, a 2048x2048 A8 font atlas) into a
 3840x2160 RGBA8 target with depth, copied by a fullscreen RECTLIST draw into
 the display texture - a loading or menu screen, about 170 commands.
+
+## Graphics pipelines (being mapped)
+
+On WSL2 there is no Vulkan driver for the NVIDIA GPU (Mesa's dzn is not
+shipped), but OpenGL 4.6 is: GLSL 4.60, ARB_gl_spirv, shader ballot and
+int64. The renderer will therefore translate RDNA2 to GLSL.
+
+Device slot 57 creates a graphics pipeline from a description of six
+(pointer, size) pairs after a root-signature-like pointer at +0x00:
+
+| Offset | Content (`--dump-shaders` name) |
+|---|---|
+| +0x08 | register state, e.g. 0x184 bytes with blend controls (`gfx-state-a`) |
+| +0x18 | more register state, 0xbc bytes (`gfx-state-b`) |
+| +0x28 | pixel shader: native RDNA2 code (`gfx-code-a`), absent for depth-only pipelines |
+| +0x38 | its metadata (`gfx-meta-a`) |
+| +0x48 | vertex shader code (`gfx-code-b`) |
+| +0x58 | its metadata (`gfx-meta-b`) |
+
+Every code blob starts with three `v_nop` carrying literals (metadata) and
+`s_inst_prefetch`. A UI vertex shader loads its vertex buffer descriptor
+from the table at user SGPRs s[0:1], adds the base vertex (s2) to the index,
+fetches position and colour (`buffer_load_dwordx3`, `tbuffer_load_format`)
+and exports pos0/param0. Its pixel shader builds a 32-bit pointer from s8
+(the high half is zero: descriptor tables live in the low 4 GiB of the GPU
+address space), loads a buffer descriptor, reads four constants through it,
+interpolates param0 (`v_interp_p1/p2`, m0 from s9) and exports packed
+half-precision colour (`exp mrt0 ... compr`).
+
+The metadata blobs hold typed entries (`0x41` user-data mappings, `0x42`,
+`0x43` a 128-bit hash). What a renderer needs next:
+
+1. The user-SGPR layout of each stage (root parameters, vertex buffer
+   table, base vertex) from the metadata; the state blobs (blend,
+   depth/stencil, rasterizer, render target formats).
+2. Descriptor tables addressed with 32-bit pointers: where the console puts
+   descriptor heaps, and a matching GPU address window for the title's
+   heaps (the emulator's are at 47-bit host addresses now).
+3. Hardware descriptors (V#, T#, S#) in descriptor memory, since shaders
+   load them directly - the emulator's own "XBDS" encoding has to become
+   real RDNA2 descriptors (or the translator has to resolve both).
+4. A scalar pre-pass: SALU/SMEM are uniform per draw, so they can run on
+   the CPU at draw time and hand the GLSL shader resolved buffers and
+   textures; the vector part becomes GLSL.
+5. Device slot 55 (pipelines from a library) and the console-only
+   command-list slots.
