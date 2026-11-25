@@ -1399,6 +1399,24 @@ uint64_t XBEM_GUEST_ABI device_graphics_pso_method(ProbeObject* self, uint64_t a
   return S_OK;
 }
 
+// 86 CreatePipelineState(D3D12_PIPELINE_STATE_STREAM_DESC*, riid, ppv): a
+// pipeline state stream {size, pointer}. Step 1: log the stream's words.
+uint64_t XBEM_GUEST_ABI device_create_pipeline_state_stream(ProbeObject* self, uint64_t desc, uint64_t riid,
+                                                            uint64_t out, uint64_t, uint64_t, uint64_t) {
+  const uint64_t size = read_guest<uint64_t>(desc), stream = read_guest<uint64_t>(desc + 8);
+  const std::vector<uint8_t> bytes = copy_guest(stream, size);
+  std::string words;
+  for (size_t i = 0; i + 8 <= bytes.size(); i += 8) {
+    uint64_t w;
+    std::memcpy(&w, bytes.data() + i, 8);
+    words += std::format("{}{:x}", i ? " " : "", w);
+  }
+  XBEM_WARN("d3d12", "pipeline stream {:#x} bytes: {}", size, words);
+  (void)riid;
+  probe_log(self, 86, std::format("CreatePipelineState(stream {:#x} bytes)", size), XBEM_RETURN_ADDRESS());
+  return create_into(make_probe_object(child_name("spso")), reinterpret_cast<void**>(out));
+}
+
 HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint8_t* desc, uint64_t, uint64_t,
                                                    const void* riid, void** out) {
   return device_create_compute_pso(self, desc, riid, out);
@@ -1580,6 +1598,7 @@ const ProbeVtable g_device_vtable = make_vtable({
     {62, fn(&device_create_compute_pso_x)},
     {55, fn(&device_graphics_pso_method<55>)},
     {57, fn(&device_graphics_pso_method<57>)},
+    {86, fn(&device_create_pipeline_state_stream)},
     {67, fn(&device_deserialize_compute_pso_x)},
     {73, fn(&device_create_command_list_x)},
     {76, fn(&device_create_texture_x<76>)},

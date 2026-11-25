@@ -1,5 +1,7 @@
 #include "gpu/translate.h"
 
+#include <array>
+
 #include <algorithm>
 #include <cstring>
 #include <format>
@@ -16,6 +18,8 @@ using rdna2::Format;
 
 constexpr uint32_t kVccLo = 106, kVccHi = 107, kM0 = 124, kNull = 125, kExecLo = 126, kExecHi = 127,
                    kLiteral = 255, kScc = 253;
+// Translator-internal operands: an SDWA source after its byte/word select.
+constexpr uint32_t kSdwaSrc0 = 1000, kSdwaSrc1 = 1001;
 
 bool is_sgpr_operand(uint32_t src) { return src <= kExecHi; }
 
@@ -51,6 +55,10 @@ bool is_scalar(Format f) {
 struct Vop {
   uint32_t dst = 0, src[3] = {}, abs = 0, neg = 0, clamp = 0, omod = 0, opsel = 0, opsel_hi = 0, sdst = 0;
   int count = 0;  // sources used by the encoding
+  // SDWA (sub-dword addressing): sources and destination select a byte or
+  // word (sel 0-3 BYTE0-3, 4-5 WORD0-1, 6 DWORD).
+  bool sdwa = false;
+  uint32_t sel[2] = {6, 6}, sext[2] = {}, dst_sel = 6, dst_unused = 0;
 };
 
 Vop vop_fields(const rdna2::Instruction& i) {
@@ -100,6 +108,26 @@ Vop vop_fields(const rdna2::Instruction& i) {
       break;
     default: break;
   }
+  if (i.extension == rdna2::Instruction::Extension::Sdwa &&
+      (i.format == Format::Vop1 || i.format == Format::Vop2 || i.format == Format::Vopc)) {
+    v.sdwa = true;
+    v.src[0] = (w1 & 0xff) + (((w1 >> 23) & 1) ? 0 : 256);
+    if (i.format != Format::Vop1 && ((w1 >> 31) & 1)) v.src[1] -= 256;  // src1 is an SGPR
+    v.sel[0] = (w1 >> 16) & 7;
+    v.sext[0] = (w1 >> 19) & 1;
+    v.neg = ((w1 >> 20) & 1) | (((w1 >> 28) & 1) << 1);
+    v.abs = ((w1 >> 21) & 1) | (((w1 >> 29) & 1) << 1);
+    v.sel[1] = (w1 >> 24) & 7;
+    v.sext[1] = (w1 >> 27) & 1;
+    if (i.format == Format::Vopc) {
+      v.sdst = ((w1 >> 15) & 1) ? (w1 >> 8) & 0x7f : kVccLo;
+    } else {
+      v.dst_sel = (w1 >> 8) & 7;
+      v.dst_unused = (w1 >> 11) & 3;
+      v.clamp = (w1 >> 13) & 1;
+      v.omod = (w1 >> 14) & 3;
+    }
+  }
   return v;
 }
 
@@ -116,8 +144,19 @@ class Translator {
       const rdna2::Instruction& insn = out_.program.instructions[k].insn;
       if (is_scalar(insn.format)) {
         if (name_of(insn) == "s_endpgm") break;
-        if (name_of(insn) == "v_readfirstlane_b32") return fail("v_readfirstlane_b32");
-        continue;  // runs on the CPU
+        if (!scalar_on_gpu(insn)) return false;
+        continue;  // runs on the CPU (unless it reads an SGPR only the GPU knows)
+      }
+      if (name_of(insn) == "v_readfirstlane_b32") {
+        // The value of the first active lane into an SGPR: the SGPR becomes a
+        // GPU-side variable (each lane uses its own value - the title's uses
+        // are uniform values that went through a VGPR).
+        const uint32_t dst = (insn.words[0] >> 17) & 0xff;
+        std::string a;
+        if (dst >= 106 || !src(insn.words[0] & 0x1ff, insn, a)) return fail("v_readfirstlane_b32 operands");
+        dyn_[dst] = true;
+        line(std::format("sd{} = {};", dst, a));
+        continue;
       }
       if (!emit(insn)) return false;
     }
@@ -148,10 +187,12 @@ class Translator {
   // A source operand as a uint expression.
   bool src(uint32_t s, const rdna2::Instruction& insn, std::string& e) {
     uint32_t c;
+    if (s == kSdwaSrc0 || s == kSdwaSrc1) return e = std::format("sdwa{}_{}", s - kSdwaSrc0, index_), true;
     if (s >= 256) return e = vreg(s - 256), true;
     if (s == kLiteral) return e = std::format("{:#x}u", insn.literal), true;
     if (inline_constant(s, c)) return e = std::format("{:#x}u", c), true;
     if (s == kVccLo) return e = "(vcc ? 1u : 0u)", true;
+    if (s < 106 && dyn_[s]) return e = std::format("sd{}", s), true;
     if (is_sgpr_operand(s) && s != kNull) {
       // A scalar value: captured per draw (exec reads come out as all lanes).
       if (s == kExecLo || s == kExecHi) return e = "0xffffffffu", true;
@@ -187,9 +228,45 @@ class Translator {
     body_ += '\n';
   }
 
+  // SDWA: the selected bytes/words of the sources go into temporaries the
+  // operation reads; a destination select merges the result into the
+  // register afterwards.
   bool emit_valu(const rdna2::Instruction& insn) {
-    const std::string_view n = name_of(insn);
     Vop v = vop_fields(insn);
+    if (!v.sdwa) return emit_valu_op(insn, v);
+    const std::string_view n = name_of(insn);
+    const bool is_float = n.find("_f32") != std::string_view::npos || n.find("_f16") != std::string_view::npos;
+    for (int k = 0; k < (insn.format == Format::Vop1 ? 1 : 2); ++k) {
+      if (is_float && v.sel[k] != 6) return fail("SDWA sub-dword float operand");
+      std::string u;
+      if (!src(v.src[k], insn, u)) return false;
+      const uint32_t sel = v.sel[k];
+      std::string e = u;
+      if (sel < 4) e = v.sext[k] ? std::format("uint(bitfieldExtract(int({}), {}, 8))", u, sel * 8)
+                                 : std::format("bitfieldExtract({}, {}, 8)", u, sel * 8);
+      else if (sel < 6) e = v.sext[k] ? std::format("uint(bitfieldExtract(int({}), {}, 16))", u, (sel - 4) * 16)
+                                      : std::format("bitfieldExtract({}, {}, 16)", u, (sel - 4) * 16);
+      else if (sel != 6) return fail("SDWA select");
+      line(std::format("uint sdwa{}_{} = {};", k, index_, e));
+      v.src[k] = kSdwaSrc0 + k;
+    }
+    if (insn.format == Format::Vopc) {
+      if (v.sdst != kVccLo) return fail("SDWA compare into an SGPR pair");
+      return emit_valu_op(insn, v);
+    }
+    if (v.dst_sel == 6) return emit_valu_op(insn, v);
+    if (v.dst_sel > 6 || v.dst_unused == 1) return fail("SDWA destination select");
+    const std::string d = vreg(v.dst);
+    line(std::format("uint sdwa_old_{} = {};", index_, d));
+    if (!emit_valu_op(insn, v)) return false;
+    const uint32_t offset = v.dst_sel < 4 ? v.dst_sel * 8 : (v.dst_sel - 4) * 16, bits = v.dst_sel < 4 ? 8 : 16;
+    line(std::format("{} = bitfieldInsert({}, {}, {}, {});", d, v.dst_unused == 2 ? std::format("sdwa_old_{}", index_) : "0u",
+                     d, offset, bits));
+    return true;
+  }
+
+  bool emit_valu_op(const rdna2::Instruction& insn, Vop v) {
+    const std::string_view n = name_of(insn);
     if (n == "v_nop") return true;
     std::string a, b, c;
     const auto f2 = [&](const char* op) -> bool {
@@ -229,6 +306,14 @@ class Translator {
       if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b)) return false;
       line(std::format("{} = {};", vreg(v.dst),
                        fresult(v, std::format("fma({}, {}, uintBitsToFloat({}))", a, b, vreg(v.dst)))));
+      return true;
+    }
+    if (n == "v_fmaak_f32" || n == "v_fmamk_f32") {
+      // fmaak: s0 * s1 + K; fmamk: s0 * K + s1 (K = the literal)
+      if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b)) return false;
+      const std::string k = std::format("uintBitsToFloat({:#x}u)", insn.literal);
+      const std::string e = n == "v_fmaak_f32" ? std::format("fma({}, {}, {})", a, b, k) : std::format("fma({}, {}, {})", a, k, b);
+      line(std::format("{} = {};", vreg(v.dst), fresult(v, e)));
       return true;
     }
     if (n == "v_add_nc_u32" || n == "v_add_u32") return u2("{} + {}");
@@ -574,6 +659,66 @@ class Translator {
     }
   }
 
+  // A scalar instruction that reads a GPU-side SGPR (see v_readfirstlane_b32)
+  // is evaluated in the shader; its destination becomes GPU-side too. One
+  // that overwrites a GPU-side SGPR from CPU-known values makes it a CPU
+  // value again.
+  bool scalar_on_gpu(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0];
+    uint32_t dst = 0, srcs[2] = {kNull, kNull};
+    int count = 0;
+    switch (insn.format) {
+      case Format::Sop1: dst = (w0 >> 16) & 0x7f, srcs[0] = w0 & 0xff, count = 1; break;
+      case Format::Sop2: dst = (w0 >> 16) & 0x7f, srcs[0] = w0 & 0xff, srcs[1] = (w0 >> 8) & 0xff, count = 2; break;
+      case Format::Sopk: dst = (w0 >> 16) & 0x7f; srcs[0] = dst; count = n == "s_movk_i32" ? 0 : 1; break;
+      case Format::Smem: {
+        const uint32_t base = (w0 & 0x3f) << 1;
+        if (base < 106 && (dyn_[base] || dyn_[base + 1])) return fail("memory load from a GPU-side address");
+        const uint32_t offset_sgpr = insn.words[1] >> 25;
+        if (offset_sgpr < 106 && dyn_[offset_sgpr] && ((w0 >> 14) & 1)) return fail("memory load at a GPU-side offset");
+        dst = (w0 >> 6) & 0x7f;
+        const uint32_t n_dwords = n.find("x16") != std::string_view::npos ? 16 : n.find("x8") != std::string_view::npos ? 8
+                                  : n.find("x4") != std::string_view::npos ? 4 : n.find("x2") != std::string_view::npos ? 2 : 1;
+        for (uint32_t k = dst; k < dst + n_dwords && k < 106; ++k) dyn_[k] = false;
+        return true;
+      }
+      default: return true;  // SOPC/SOPP: scc and control flow stay on the CPU
+    }
+    bool reads_dyn = false;
+    for (int k = 0; k < count; ++k)
+      if (srcs[k] < 106 && dyn_[srcs[k]]) reads_dyn = true;
+    if (dst >= 106) return reads_dyn ? fail("GPU-side value into a special register") : true;
+    const bool wide = n.ends_with("_b64");
+    if (!reads_dyn) {
+      dyn_[dst] = false;
+      if (wide && dst + 1 < 106) dyn_[dst + 1] = false;
+      return true;
+    }
+    if (wide) return fail("64-bit operation on a GPU-side SGPR");
+    std::string a, b;
+    if (!src(srcs[0], insn, a) || (count > 1 && !src(srcs[1], insn, b))) return false;
+    std::string e;
+    if (n == "s_mov_b32") e = a;
+    else if (n == "s_and_b32") e = std::format("{} & {}", a, b);
+    else if (n == "s_or_b32") e = std::format("{} | {}", a, b);
+    else if (n == "s_xor_b32") e = std::format("{} ^ {}", a, b);
+    else if (n == "s_andn2_b32") e = std::format("{} & ~{}", a, b);
+    else if (n == "s_add_u32" || n == "s_add_i32") e = std::format("{} + {}", a, b);
+    else if (n == "s_sub_u32" || n == "s_sub_i32") e = std::format("{} - {}", a, b);
+    else if (n == "s_mul_i32") e = std::format("{} * {}", a, b);
+    else if (n == "s_lshl_b32") e = std::format("{} << ({} & 31u)", a, b);
+    else if (n == "s_lshr_b32") e = std::format("{} >> ({} & 31u)", a, b);
+    else if (n == "s_min_u32") e = std::format("min({}, {})", a, b);
+    else if (n == "s_max_u32") e = std::format("max({}, {})", a, b);
+    else if (n == "s_addk_i32") e = std::format("{} + {:#x}u", a, static_cast<uint32_t>(static_cast<int16_t>(w0 & 0xffff)));
+    else if (n == "s_mulk_i32") e = std::format("{} * {:#x}u", a, static_cast<uint32_t>(static_cast<int16_t>(w0 & 0xffff)));
+    else return fail("scalar operation on a GPU-side SGPR");
+    dyn_[dst] = true;
+    line(std::format("sd{} = {};", dst, e));
+    return true;
+  }
+
   void finish() {
     std::string g = "#version 460\n"
                     "#extension GL_EXT_buffer_reference : require\n"
@@ -607,6 +752,10 @@ class Translator {
     g += "void main() {\n  bool vcc = false;\n";
     const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 4);
     for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  uint v{} = 0u;\n", k);
+    for (uint32_t k = 0; k < 106; ++k)
+      if (body_.find(std::format("sd{} ", k)) != std::string::npos || body_.find(std::format("sd{};", k)) != std::string::npos ||
+          body_.find(std::format("sd{})", k)) != std::string::npos || body_.find(std::format("sd{},", k)) != std::string::npos)
+        g += std::format("  uint sd{} = 0u;\n", k);
     if (out_.stage == ShaderStage::Vertex) {
       g += "  vec4 pos = vec4(0.0, 0.0, 0.0, 1.0);\n";
       g += "  v0 = uint(gl_VertexIndex); v3 = uint(gl_InstanceIndex);\n";
@@ -614,6 +763,9 @@ class Translator {
     } else {
       for (uint32_t k = 0; k < 8; ++k)
         if (out_.color_targets & (1u << k)) g += std::format("  c_{} = vec4(0.0);\n", k);
+      // Input VGPRs after the barycentrics (v0, v1): the titles' shaders seen
+      // so far enable POS_FIXED_PT next (x in the low half, y in the high half).
+      if (vgprs > 2) g += "  v2 = uint(gl_FragCoord.x) | (uint(gl_FragCoord.y) << 16);\n";
     }
     g += body_;
     if (out_.stage == ShaderStage::Vertex) g += "  gl_Position = vec4(pos.x, -pos.y, pos.z, pos.w);\n";
@@ -627,6 +779,7 @@ class Translator {
   uint32_t max_vgpr_ = 0;
   bool wrote_position_ = false;
   std::set<uint32_t> flat_inputs_;
+  std::array<bool, 106> dyn_{};  // SGPRs whose value only the GPU knows (from v_readfirstlane_b32)
 };
 
 // ------------------------------------------------------------ scalar run

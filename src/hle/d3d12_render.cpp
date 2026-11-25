@@ -266,7 +266,8 @@ class Renderer {
       for (uint64_t i = 0; i < uint64_t{w} * h; i += 97)
         if (px[i] & 0x00ffffff) ++lit, sample = px[i];
       XBEM_INFO("gpu", "present #{}: {}x{} display image ({} of {} sampled pixels lit, e.g. {:#010x}); {} draws "
-                "rendered, {} skipped so far", presents_, w, h, lit, uint64_t{w} * h / 97, sample, draws_, skipped_);
+                "rendered, {} skipped so far{}", presents_, w, h, lit, uint64_t{w} * h / 97, sample, draws_, skipped_,
+                top_skip_reasons());
       if (std::getenv("XBEM_GPU_STATS")) image_stats();
     }
   }
@@ -626,6 +627,7 @@ class Renderer {
 
   struct State {
     GraphicsPipeline* pipeline = nullptr;
+    std::string pipeline_name;  // for skip statistics
     const gpu::RootSignature* root = nullptr;
     std::map<uint32_t, RootValue> params;
     uint32_t topology = 4;
@@ -673,6 +675,8 @@ class Renderer {
       case 25: {
         GraphicsPipeline* p = graphics_pipeline_of(a[0]);
         state_.pipeline = p;
+        state_.pipeline_name = !p && is_probe_object(a[0]) ? reinterpret_cast<ProbeObject*>(a[0])->name.substr(0, 40)
+                                                            : std::format("{:#x}", a[0]);
         if (!p) note(std::format("pipeline {:#x} is not a known graphics pipeline - its draws are skipped", a[0]));
         break;
       }
@@ -840,27 +844,20 @@ class Renderer {
   void draw(uint32_t count, uint32_t instances, uint32_t start, uint32_t start_instance, bool indexed,
             int32_t base_vertex) {
     GraphicsPipeline* p = state_.pipeline;
-    if (!p || !state_.target || p->vs_code.empty() || p->ps_code.empty()) {
-      ++skipped_;
-      return;
-    }
+    if (!p) return skip(std::format("pipeline {} not from slot 57/55", state_.pipeline_name));
+    if (!state_.target) return skip("no render target");
+    if (p->vs_code.empty() || p->ps_code.empty()) return skip("pipeline without shader code");
     ShaderEntry* vs = shader(p->vs_code, p->vs_hash, gpu::ShaderStage::Vertex);
     ShaderEntry* ps = shader(p->ps_code, p->ps_hash, gpu::ShaderStage::Pixel);
-    if (!vs->module || !ps->module) {
-      ++skipped_;
-      return;
-    }
+    if (!vs->module) return skip(std::format("vs {:016x} not translated", p->vs_hash));
+    if (!ps->module) return skip(std::format("ps {:016x} not translated", p->ps_hash));
     const bool rect = state_.topology == 0x11;
     if (state_.topology != 4 && !rect) {
       note(std::format("topology {:#x} not supported - draws skipped", state_.topology));
-      ++skipped_;
-      return;
+      return skip(std::format("topology {:#x}", state_.topology));
     }
     VkPipeline pipe = pipeline(*p, *vs, *ps, state_.target->image.format, rect);
-    if (!pipe) {
-      ++skipped_;
-      return;
-    }
+    if (!pipe) return skip("pipeline creation failed");
     // Vertex buffer table: one V# per view (base, stride, records).
     std::vector<uint8_t> vb_table(std::max<size_t>(state_.vertex_buffers.size(), 16));
     for (size_t i = 0; i + 16 <= state_.vertex_buffers.size(); i += 16) {
@@ -897,8 +894,7 @@ class Renderer {
       run.resolve = [&](gpu::SlotKind kind, const uint32_t* w, uint32_t* out) { resolve(kind, w, out, tokens); };
       if (!gpu::run_scalar(*stages[k], run, words[k])) {
         note(std::format("scalar run of {:016x}: {}", k == 0 ? p->vs_hash : p->ps_hash, run.error));
-        ++skipped_;
-        return;
+        return skip(std::format("scalar run of {:016x}", k == 0 ? p->vs_hash : p->ps_hash));
       }
     }
     static const int trace = [] {
@@ -1058,6 +1054,21 @@ class Renderer {
   Buffer readback_[2];
   int readback_index_ = 0;
   uint64_t render_serial_ = 0, draws_ = 0, skipped_ = 0, presents_ = 0;
+  std::map<std::string, uint64_t> skip_reasons_;  // why draws were skipped, with counts
+
+  void skip(const std::string& reason) {
+    ++skipped_;
+    ++skip_reasons_[reason];
+  }
+
+  std::string top_skip_reasons() const {
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (const auto& [r, n] : skip_reasons_) v.emplace_back(n, r);
+    std::sort(v.rbegin(), v.rend());
+    std::string out;
+    for (size_t i = 0; i < v.size() && i < 6; ++i) out += std::format("\n    {} x {}", v[i].first, v[i].second);
+    return out;
+  }
   int traced_ = 0;
   std::vector<uint8_t> scratch_;
   bool trace_reads_ = false;
