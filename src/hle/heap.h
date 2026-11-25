@@ -26,6 +26,10 @@ bool virtual_free(void* address, uint64_t size, uint32_t type);
 bool describe_virtual_memory(uint64_t address, char* out, size_t out_size);
 // The same for blocks from XMemAlloc / XMemAllocDefault.
 bool describe_xmem_allocation(uint64_t address, char* out, size_t out_size);
+// Writes into the emulated physical page with frame number `pfn` (4 KiB
+// units, as XMemAllocatePhysicalPages hands them out) at `offset` bytes from
+// the start of its 64 KiB page. False for pages that are not allocated.
+bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size);
 // Emulated physical memory: which physical page `address` maps and where else
 // that page is mapped (never blocks); and every address the byte at `address`
 // is mapped at (a platform::ViewFinder for watchpoints).

@@ -55,6 +55,7 @@ intptr_t create_shared_memory(uint64_t) { return -1; }
 bool map_shared(uint64_t, size_t, Prot, intptr_t, uint64_t) { return false; }
 bool remap_anonymous(uint64_t, size_t, Prot) { return false; }
 bool discard_shared(intptr_t, uint64_t, size_t) { return false; }
+bool write_shared(intptr_t, uint64_t, const void*, size_t) { return false; }
 
 bool safe_write(uint64_t address, const void* data, size_t size) {
   SIZE_T done = 0;
@@ -155,6 +156,18 @@ bool remap_anonymous(uint64_t address, size_t size, Prot prot) {
 bool discard_shared(intptr_t memory, uint64_t offset, size_t size) {
   return fallocate(static_cast<int>(memory), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
                    static_cast<off_t>(size)) == 0;
+}
+
+bool write_shared(intptr_t memory, uint64_t offset, const void* data, size_t size) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  while (size) {
+    const ssize_t n = pwrite(static_cast<int>(memory), p, size, static_cast<off_t>(offset));
+    if (n <= 0) return false;
+    p += n;
+    offset += static_cast<uint64_t>(n);
+    size -= static_cast<size_t>(n);
+  }
+  return true;
 }
 
 bool safe_write(uint64_t address, const void* data, size_t size) {

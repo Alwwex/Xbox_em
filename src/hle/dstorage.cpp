@@ -34,6 +34,7 @@
 #include "hle/d3d12_device.h"
 #include "hle/d3d12_internal.h"
 #include "hle/discovery.h"
+#include "hle/heap.h"
 #include "hle/file_log.h"
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
@@ -171,6 +172,16 @@ struct QueueState {
   // requests, and requests whose source is memory (not executed yet).
   std::map<uint32_t, uint64_t> by_compression;
   uint64_t failed = 0, memory_sources = 0;
+  // Enqueued work, executed in order by Submit (as the real queue does: a
+  // title may fill memory a request refers to between Enqueue and Submit).
+  struct Pending {
+    enum Kind { Request, Status, Signal, Event } kind;
+    uint64_t words[12];  // a request (copied at Enqueue)
+    uint64_t object;     // status array / fence / event handle
+    uint64_t value;      // status index / fence value
+    uint64_t caller;
+  };
+  std::vector<Pending> pending;
 };
 
 std::string hex_qwords(const uint64_t* q, int n) {
@@ -185,6 +196,17 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   if (!request || !platform::safe_read(reinterpret_cast<uint64_t>(request), w, sizeof w)) return E_POINTER;
   const bool log = g_logged_requests.fetch_add(1) < 6;
   if (log) XBEM_INFO("dstorage", "EnqueueRequest from {}:{}", describe_code_address(caller), hex_qwords(w, 12));
+  if ((w[0] & 0xff0000) && std::getenv("XBEM_DSTORAGE_TRACE")) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 60) {
+      uint64_t at1[6] = {}, at10[6] = {}, at11[6] = {};
+      platform::safe_read(w[1], at1, sizeof at1);
+      platform::safe_read(w[10], at10, sizeof at10);
+      platform::safe_read(w[11], at11, sizeof at11);
+      XBEM_INFO("dstorage", "request{}\n  [w1]{}\n  [w10]{}\n  [w11]{}", hex_qwords(w, 12), hex_qwords(at1, 6),
+                hex_qwords(at10, 6), hex_qwords(at11, 6));
+    }
+  }
 
   // Locate the source file among the fields.
   int fi = -1;
@@ -218,15 +240,28 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       dest_size = static_cast<uint32_t>(w[3]);
     }
   }
-  // The usual layout: destination (pointer, skip, size) before the file.
-  // `skip` is 0 for whole chunks; a chunk read in pieces is decompressed and
-  // bytes [skip, skip + size) of its output are delivered (measured on
-  // GTA VI's .ttpf streaming: the pieces' skip + size add up to the chunk).
+  // The usual layout: destination (base, offset, size) before the file. The
+  // source chunk covers the region starting at `base`; a request delivers
+  // bytes [offset, offset + size) of the decompressed chunk to base + offset
+  // (GTA VI's .ttpf streaming fills a region page by page this way: one base,
+  // offsets 0, 0x1000, 0x2000, ... each from a 16 KiB chunk).
   uint64_t skip = 0;
-  if (!dest && fi == 4 && w[1] >= 0x10000 && w[1] < 0x800000000000ull && w[3] && w[3] < (1ull << 32)) {
-    dest = reinterpret_cast<uint8_t*>(w[1]);
-    dest_size = w[3];
+  // Options 0x20xxxx: the destination is physical memory - word 1 points to
+  // the frame numbers of its 64 KiB pages (one 8-byte entry per page, as
+  // XMemAllocatePhysicalPages hands them out), word 2 is the byte offset in
+  // that destination and word 3 the size. The source chunk covers the
+  // destination from its start: bytes [offset, offset + size) of the
+  // decompressed chunk are delivered. (GTA VI streams its .ttpf data so;
+  // treating word 1 as plain memory overwrote the title's page arrays.)
+  const bool physical = (w[0] & 0x200000) && fi == 4 && w[1] >= 0x10000 && w[3] && w[3] < (1ull << 32);
+  if (physical) {
     skip = w[2] < (1ull << 32) ? w[2] : 0;
+    dest = reinterpret_cast<uint8_t*>(w[1]);  // the frame number array
+    dest_size = w[3];
+  } else if (!dest && fi == 4 && w[1] >= 0x10000 && w[1] < 0x800000000000ull && w[3] && w[3] < (1ull << 32)) {
+    skip = w[2] < (1ull << 32) ? w[2] : 0;
+    dest = reinterpret_cast<uint8_t*>(w[1] + skip);
+    dest_size = w[3];
   }
   for (int i = 1; i < fi && !dest_size; ++i) {
     if (!dest && w[i] >= 0x10000 && w[i] < 0x800000000000ull) {
@@ -260,6 +295,45 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   std::lock_guard lock(q->mutex);
   ++q->requests;
   q->bytes_read += source_size;
+  // Writes [from, from + n) of the destination's bytes into its physical pages.
+  const auto to_physical = [&](const uint8_t* data, uint64_t from, uint64_t n) {
+    bool ok = true;
+    while (n) {
+      const uint64_t page = from >> 16, in_page = from & 0xffff, chunk = std::min<uint64_t>(n, 0x10000 - in_page);
+      uint64_t pfn = 0;
+      ok &= platform::safe_read(w[1] + page * 8, &pfn, 8) && write_physical_page(pfn, in_page, data, chunk);
+      data += chunk;
+      from += chunk;
+      n -= chunk;
+    }
+    return ok;
+  };
+  if (physical) {
+    std::vector<uint8_t> whole;
+    size_t produced = 0;
+    InflateResult r = InflateResult::Ok;
+    if (compression == 0) {
+      whole = buffer;
+      produced = whole.size();
+    } else {
+      whole.resize(skip + dest_size);
+      r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
+      if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+    }
+    if (r == InflateResult::Ok) {
+      // An uncompressed source shorter than the window holds just the window.
+      const uint64_t start = produced >= skip + dest_size ? skip : 0;
+      const uint64_t n = std::min<uint64_t>(dest_size, produced > start ? produced - start : 0);
+      if (!to_physical(whole.data() + start, skip, n)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+          XBEM_WARN("dstorage", "{}: physical destination with unknown frames:{}", file->guest_path, hex_qwords(w, 12));
+      }
+      q->bytes_out += n;
+      return S_OK;
+    }
+    // An undecodable format: reported (and failed) below.
+  }
   if (compression == 0) {
     std::memcpy(dest, buffer.data(), std::min<uint64_t>(source_size, dest_size));
     q->bytes_out += std::min<uint64_t>(source_size, dest_size);
@@ -267,7 +341,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   }
   size_t produced = 0;
   InflateResult r;
-  if (skip) {
+  if (physical) {
+    std::vector<uint8_t> scratch(skip + dest_size);
+    r = inflate_auto(buffer.data(), buffer.size(), scratch.data(), scratch.size(), produced);
+  } else if (skip) {
     std::vector<uint8_t> whole(skip + dest_size);
     r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
     if (r == InflateResult::OutputFull) r = InflateResult::Ok;  // the rest of the chunk is not wanted
@@ -291,7 +368,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     }
     // Experiment switch: report undecodable formats as delivered (zeros).
     if (std::getenv("XBEM_DSTORAGE_PRETEND") && compression != 1) {
-      std::memset(dest, 0, dest_size);
+      if (!physical) std::memset(dest, 0, dest_size);
       return S_OK;
     }
     return HRESULT(0x80070017);  // HRESULT_FROM_WIN32(ERROR_CRC): corrupt data
@@ -359,20 +436,17 @@ void log_file_coverage() {
   }
 }
 
-HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* request) {
-  auto* q = static_cast<QueueState*>(self->state);
-  const HRESULT hr = execute_request(q, request, XBEM_RETURN_ADDRESS());
+void run_request(QueueState* q, const uint8_t* request, uint64_t caller) {
+  const HRESULT hr = execute_request(q, request, caller);
   if (hr < 0) {
     std::lock_guard lock(q->mutex);
     if (q->first_error >= 0) q->first_error = hr;
     if (hr == E_NOTIMPL) ++q->memory_sources;
     else ++q->failed;
   }
-  return S_OK;  // EnqueueRequest itself returns void on the PC; errors surface through status arrays
 }
 
-void XBEM_GUEST_ABI queue_enqueue_status(ProbeObject* self, ProbeObject* array, uint32_t index) {
-  auto* q = static_cast<QueueState*>(self->state);
+void run_status(QueueState* q, ProbeObject* array, uint32_t index) {
   if (!is_status_array(reinterpret_cast<uint64_t>(array))) return;
   auto* s = static_cast<StatusState*>(array->state);
   HRESULT hr;
@@ -388,24 +462,76 @@ void XBEM_GUEST_ABI queue_enqueue_status(ProbeObject* self, ProbeObject* array, 
   }
 }
 
-void XBEM_GUEST_ABI queue_enqueue_signal(ProbeObject*, void* fence, uint64_t value) {
-  signal_d3d12_fence(fence, value);
+void enqueue(QueueState* q, QueueState::Pending p) {
+  std::lock_guard lock(q->mutex);
+  q->pending.push_back(p);
+}
+
+HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* request) {
+  auto* q = static_cast<QueueState*>(self->state);
+  QueueState::Pending p{QueueState::Pending::Request, {}, 0, 0, XBEM_RETURN_ADDRESS()};
+  if (!request || !platform::safe_read(reinterpret_cast<uint64_t>(request), p.words, sizeof p.words)) return S_OK;
+  enqueue(q, p);
+  return S_OK;  // EnqueueRequest itself returns void on the PC; errors surface through status arrays
+}
+
+void XBEM_GUEST_ABI queue_enqueue_status(ProbeObject* self, ProbeObject* array, uint32_t index) {
+  auto* q = static_cast<QueueState*>(self->state);
+  if (!is_status_array(reinterpret_cast<uint64_t>(array))) return;
+  {
+    // The entry is incomplete until the queue gets there.
+    auto* s = static_cast<StatusState*>(array->state);
+    std::lock_guard lock(s->mutex);
+    if (index < s->complete.size()) s->complete[index] = 0;
+  }
+  enqueue(q, {QueueState::Pending::Status, {}, reinterpret_cast<uint64_t>(array), index, 0});
+}
+
+void XBEM_GUEST_ABI queue_enqueue_signal(ProbeObject* self, void* fence, uint64_t value) {
+  enqueue(static_cast<QueueState*>(self->state),
+          {QueueState::Pending::Signal, {}, reinterpret_cast<uint64_t>(fence), value, 0});
 }
 
 // 12 EnqueueSetEvent(HANDLE) in the PC interface: the event is set when the
-// requests before it complete - which they already have. A handle that is no
-// event (the console slot meaning something else) is only logged.
+// requests before it complete (at Submit). A handle that is no event (the
+// console slot meaning something else) is only logged.
 HRESULT XBEM_GUEST_ABI queue_enqueue_set_event(ProbeObject* self, uint64_t handle) {
   auto event = proc().handles().get_as<rt::EventObject>(handle);
-  if (event) event->set();
+  if (event) enqueue(static_cast<QueueState*>(self->state), {QueueState::Pending::Event, {}, handle, 0, 0});
   probe_log(self, 12,
-            std::format("EnqueueSetEvent({:#x}) -> {}", handle, event ? "set (requests complete)" : "not an event"),
+            std::format("EnqueueSetEvent({:#x}) -> {}", handle, event ? "set when submitted work completes" : "not an event"),
             XBEM_RETURN_ADDRESS());
   return S_OK;
 }
 
+// Runs everything enqueued so far, in order.
+void drain(QueueState* q) {
+  std::vector<QueueState::Pending> work;
+  {
+    std::lock_guard lock(q->mutex);
+    work.swap(q->pending);
+  }
+  for (const QueueState::Pending& p : work) {
+    switch (p.kind) {
+      case QueueState::Pending::Request:
+        run_request(q, reinterpret_cast<const uint8_t*>(p.words), p.caller);
+        break;
+      case QueueState::Pending::Status:
+        run_status(q, reinterpret_cast<ProbeObject*>(p.object), static_cast<uint32_t>(p.value));
+        break;
+      case QueueState::Pending::Signal:
+        signal_d3d12_fence(reinterpret_cast<void*>(p.object), p.value);
+        break;
+      case QueueState::Pending::Event:
+        if (auto event = proc().handles().get_as<rt::EventObject>(p.object)) event->set();
+        break;
+    }
+  }
+}
+
 void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
   auto* q = static_cast<QueueState*>(self->state);
+  drain(q);
   static std::atomic<int> logged{0};
   const int n = logged.fetch_add(1);
   if (n < 64 || (n & (n - 1)) == 0 || n % 256 == 0) {

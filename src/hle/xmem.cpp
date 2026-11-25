@@ -256,6 +256,17 @@ struct PhysicalMemory {
 
 PhysicalMemory g_phys;
 
+}  // namespace
+
+bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size) {
+  std::lock_guard lock(g_phys.mutex);
+  if (g_phys.handle < 0 || !g_phys.valid(pfn) || !g_phys.state(pfn).allocated || offset + size > kPhysPageSize)
+    return false;
+  return platform::write_shared(g_phys.handle, page_of_pfn(pfn) * kPhysPageSize + offset, data, size);
+}
+
+namespace {
+
 // The first 16 events of a kind are logged, then every power of two.
 bool log_event(uint64_t n) { return n <= 16 || (n & (n - 1)) == 0; }
 
