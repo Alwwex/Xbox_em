@@ -585,6 +585,154 @@ static void test_sandbox(void) {
   CHECK(*(uint32_t*)hint == 1 && hint[12] == 1 && hint[13] == 0 && hint[15] == 0);
 }
 
+/* XAsync, XTaskQueue, XThread ({073b7dcb-...}) and XUser ({01acd177-...})
+ * through the runtime binding, in the order the title's runtime library
+ * uses their slots. */
+typedef struct XAsyncBlock_ {
+  void* queue;
+  void* context;
+  void (*callback)(struct XAsyncBlock_*);
+  uint8_t internal[32];
+} XAsyncBlock_;
+typedef struct {
+  XAsyncBlock_* async;
+  size_t buffer_size;
+  void* buffer;
+  void* context;
+} XAsyncProviderData_;
+
+static void* g_xasync;
+static volatile int g_provider_ops[5];
+static volatile int g_completed;
+static volatile int g_queue_callbacks;
+
+typedef HRESULT (*AsyncScheduleFn)(void*, XAsyncBlock_*, uint32_t);
+typedef void (*AsyncCompleteFn)(void*, XAsyncBlock_*, HRESULT, size_t);
+
+static HRESULT test_provider(uint32_t op, const XAsyncProviderData_* data) {
+  if (op < 5) g_provider_ops[op]++;
+  switch (op) {
+    case 0: /* Begin */
+      return ((AsyncScheduleFn)VT(g_xasync)[9])(g_xasync, data->async, 0);
+    case 1: /* DoWork */
+      ((AsyncCompleteFn)VT(g_xasync)[10])(g_xasync, data->async, 0, 4);
+      return 0;
+    case 2: /* GetResult */
+      if (data->buffer_size < 4) return (HRESULT)0x80070057;
+      *(uint32_t*)data->buffer = 0x1234;
+      return 0;
+    default:
+      return 0;
+  }
+}
+
+static void test_completion(XAsyncBlock_* block) { g_completed = 1 + (int)(intptr_t)block->context; }
+static HRESULT test_failing_work(XAsyncBlock_* block) {
+  (void)block;
+  return (HRESULT)0x80004005;
+}
+static void test_queue_callback(void* context, BOOL canceled) {
+  if (!canceled) g_queue_callbacks += (int)(intptr_t)context;
+}
+
+static void wait_for(volatile int* value, int expected) {
+  for (int i = 0; i < 200 && *value != expected; ++i) Sleep(5);
+}
+
+static void test_gdk_async_user(void) {
+  static const uint8_t xasync_clsid[16] = {0xcb, 0x7d, 0x3b, 0x07, 0xcf, 0x1f, 0x30, 0x40,
+                                           0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28};
+  static const uint8_t xuser_clsid[16] = {0x77, 0xd1, 0xac, 0x01, 0xf9, 0x91, 0x63, 0x47,
+                                          0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0};
+  static const uint8_t xuser2_iid[16] = {0xc0, 0xfa, 0xf4, 0xce, 0x76, 0x76, 0x94, 0x4a,
+                                         0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74};
+  typedef HRESULT (*CreateFn)(void*, uint32_t, uint32_t, void**);
+  typedef HRESULT (*BeginFn)(void*, XAsyncBlock_*, void*, const void*, const char*, void*);
+  typedef HRESULT (*StatusFn)(void*, XAsyncBlock_*, BOOL);
+  typedef HRESULT (*SizeFn)(void*, XAsyncBlock_*, size_t*);
+  typedef HRESULT (*ResultFn)(void*, XAsyncBlock_*, const void*, size_t, void*, size_t*);
+  typedef HRESULT (*RunFn)(void*, XAsyncBlock_*, void*);
+  typedef HRESULT (*SubmitFn)(void*, void*, uint32_t, void*, void*);
+  typedef BOOL (*DispatchFn)(void*, void*, uint32_t, uint32_t);
+  typedef void (*CloseFn)(void*, void*);
+  typedef BOOL (*BoolFn)(void*);
+  typedef void (*VoidFn)(void*);
+
+  CHECK(QueryApiImpl(xasync_clsid, xasync_clsid, &g_xasync) == 0 && g_xasync);
+  void* xa = g_xasync;
+  ((VoidFn)VT(xa)[29])(xa); /* XThreadAssertNotTimeSensitive */
+  CHECK(!((BoolFn)VT(xa)[27])(xa));
+
+  /* A provider-driven operation on a thread-pool queue */
+  void* queue = 0;
+  CHECK(((CreateFn)VT(xa)[12])(xa, 1, 1, &queue) == 0 && queue);
+  XAsyncBlock_ block = {queue, (void*)41, test_completion, {0}};
+  CHECK(((BeginFn)VT(xa)[7])(xa, &block, 0, (const void*)test_provider, "test", (void*)test_provider) == 0);
+  CHECK(((StatusFn)VT(xa)[3])(xa, &block, 1) == 0);
+  size_t size = 0, used = 0;
+  CHECK(((SizeFn)VT(xa)[4])(xa, &block, &size) == 0 && size == 4);
+  uint32_t value = 0;
+  CHECK(((ResultFn)VT(xa)[11])(xa, &block, (const void*)test_provider, 2, &value, &used) == (HRESULT)0x8007007A);
+  CHECK(((ResultFn)VT(xa)[11])(xa, &block, (const void*)test_provider, 4, &value, &used) == 0);
+  CHECK(value == 0x1234 && used == 4);
+  wait_for(&g_completed, 42);
+  CHECK(g_completed == 42);
+  CHECK(g_provider_ops[0] == 1 && g_provider_ops[1] == 1 && g_provider_ops[2] == 1 && g_provider_ops[4] == 1);
+
+  /* XAsyncRun: the work's result is the operation's status */
+  XAsyncBlock_ run = {queue, 0, 0, {0}};
+  CHECK(((RunFn)VT(xa)[6])(xa, &run, (void*)test_failing_work) == 0);
+  CHECK(((StatusFn)VT(xa)[3])(xa, &run, 1) == (HRESULT)0x80004005);
+
+  /* A manual queue runs callbacks only when dispatched */
+  void* manual = 0;
+  CHECK(((CreateFn)VT(xa)[12])(xa, 0, 0, &manual) == 0 && manual);
+  CHECK(((SubmitFn)VT(xa)[18])(xa, manual, 0, (void*)5, (void*)test_queue_callback) == 0);
+  CHECK(g_queue_callbacks == 0);
+  CHECK(((DispatchFn)VT(xa)[16])(xa, manual, 0, 0) && g_queue_callbacks == 5);
+  CHECK(!((DispatchFn)VT(xa)[16])(xa, manual, 0, 0));
+  ((CloseFn)VT(xa)[17])(xa, manual);
+
+  /* XUserAddAsync returns the signed-in default user */
+  typedef HRESULT (*AddFn)(void*, uint32_t, XAsyncBlock_*);
+  typedef HRESULT (*HandleOutFn)(void*, XAsyncBlock_*, void**);
+  typedef HRESULT (*U64OutFn)(void*, void*, uint64_t*);
+  typedef HRESULT (*U32OutFn)(void*, void*, uint32_t*);
+  typedef HRESULT (*FindFn)(void*, uint64_t, void**);
+  typedef HRESULT (*TagFn)(void*, void*, uint32_t, size_t, char*, size_t*);
+  typedef HRESULT (*TokenFn)(void*, void*, uint32_t, const char*, const char*, size_t, const void*, size_t,
+                             const void*, XAsyncBlock_*);
+  void* xu = 0;
+  CHECK(QueryApiImpl(xuser_clsid, xuser_clsid, &xu) == 0 && xu);
+  g_completed = 0;
+  XAsyncBlock_ add = {0, (void*)6, test_completion, {0}};
+  CHECK(((AddFn)VT(xu)[7])(xu, 1, &add) == 0);
+  CHECK(((StatusFn)VT(xa)[3])(xa, &add, 1) == 0);
+  void* user = 0;
+  CHECK(((HandleOutFn)VT(xu)[8])(xu, &add, &user) == 0 && user);
+  wait_for(&g_completed, 7);
+  CHECK(g_completed == 7);
+  uint64_t xuid = 0, local_id = 0;
+  uint32_t state = 9;
+  CHECK(((U64OutFn)VT(xu)[11])(xu, user, &xuid) == 0 && xuid != 0);
+  CHECK(((U64OutFn)VT(xu)[9])(xu, user, &local_id) == 0);
+  void* found = 0;
+  CHECK(((FindFn)VT(xu)[10])(xu, local_id, &found) == 0 && found == user);
+  CHECK(((FindFn)VT(xu)[12])(xu, xuid + 1, &found) < 0);
+  CHECK(((U32OutFn)VT(xu)[14])(xu, user, &state) == 0 && state == 0); /* SignedIn */
+  void* xu2 = 0;
+  char tag[16] = {0};
+  CHECK(QueryApiImpl(xuser_clsid, xuser2_iid, &xu2) == 0 && xu2);
+  CHECK(((TagFn)VT(xu2)[3])(xu2, user, 0, sizeof tag, tag, &used) == 0 && used == 5 && tag[0] == 'x' && tag[4] == 0);
+  CHECK(((TagFn)VT(xu2)[3])(xu2, user, 0, 2, tag, &used) < 0);
+  /* Xbox Live tokens fail: the console is offline */
+  XAsyncBlock_ token = {0, 0, 0, {0}};
+  CHECK(((TokenFn)VT(xu)[23])(xu, user, 0, "GET", "https://example.invalid/", 0, 0, 0, 0, &token) == 0);
+  CHECK(((StatusFn)VT(xa)[3])(xa, &token, 1) < 0);
+  ((CloseFn)VT(xu)[4])(xu, found);
+  ((CloseFn)VT(xu)[4])(xu, user);
+}
+
 /* Core Audio as the title's audio start-up uses it: one render device, its
  * mix format, a Spatial Audio stream whose event the emulator signals every
  * 10 ms, and static objects with 480-frame buffers. */
@@ -1077,6 +1225,7 @@ DWORD guest_main(void* peb) {
   test_gameinput();
   test_audio();
   test_sandbox();
+  test_gdk_async_user();
   test_audio_endpoint();
   test_locale();
   test_time();

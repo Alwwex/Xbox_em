@@ -356,7 +356,7 @@ void arm_tracepoints(ModuleLoader& loader, const std::vector<std::string>& specs
     if (!condition.empty()) label += " if " + condition;
     const uint8_t first = *reinterpret_cast<const uint8_t*>(address);
     if (!platform::add_tracepoint(address, label.c_str(), options)) {
-      XBEM_WARN("trace", "--trace-at {}: cannot patch the code (or more than 64 tracepoints)", spec);
+      XBEM_WARN("trace", "--trace-at {}: cannot patch the code (or more than 128 tracepoints)", spec);
       continue;
     }
     XBEM_INFO("trace", "tracepoint at {} (first byte {:02x})", label, first);

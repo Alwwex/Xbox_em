@@ -448,7 +448,7 @@ struct Tracepoint {
   TraceHit ring[kRing];
 };
 
-constexpr int kMaxTracepoints = 64;
+constexpr int kMaxTracepoints = 128;
 constexpr uint64_t kTraceDisarmAfter = 1000000;  // a hot loop would make the title crawl
 constexpr greg_t kTrapFlag = 0x100;
 Tracepoint g_tracepoints[kMaxTracepoints];

@@ -1,7 +1,8 @@
 // HLE of the GDK game runtime (XGameRuntime): runtime init, XSystem device
-// information, XPackage identity and the XTaskQueue work-dispatch system that
-// all GDK async APIs are built on. Services that need Xbox network/user
-// infrastructure (XUser, XGameSave, XStore, ...) report E_NOTIMPL for now.
+// information, XPackage identity, the XTaskQueue work-dispatch system and the
+// XAsync operations all GDK async APIs are built on, and the binding of API
+// families through QueryApiImpl (XUser lives in xuser.cpp). Services that
+// need Xbox network infrastructure (XGameSave, XStore, ...) are not bound yet.
 //
 // Note: how a title binds to these functions (exported names vs. a function
 // table obtained at XGameRuntimeInitialize) must be verified against a real
@@ -18,10 +19,14 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
+#include <functional>
 
 #include "hle/discovery.h"
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
+#include "hle/xasync.h"
+#include "runtime/objects.h"
 #include "platform/memory.h"
 
 namespace xbem::hle {
@@ -36,6 +41,7 @@ enum : uint32_t { kPortWork = 0, kPortCompletion = 1 };
 
 using TaskCallback = void(XBEM_GUEST_ABI*)(void* context, bool canceled);
 using TerminatedCallback = void(XBEM_GUEST_ABI*)(void* context);
+using MonitorCallback = void(XBEM_GUEST_ABI*)(void* context, uint64_t queue, uint32_t port);
 
 class TaskQueue {
  public:
@@ -49,6 +55,9 @@ class TaskQueue {
     std::deque<Item> items;
     bool worker_started = false;
   };
+  struct Monitor {
+    uint64_t token, context, callback, handle;
+  };
 
   TaskQueue(DispatchMode work, DispatchMode completion) {
     ports[kPortWork].mode = work;
@@ -58,6 +67,7 @@ class TaskQueue {
   std::mutex mutex;
   std::condition_variable cv;
   Port ports[2];
+  std::vector<Monitor> monitors;
   bool terminated = false;
 
   // Pops an item that is due, waiting up to `timeout_ms`. Caller holds no lock.
@@ -83,33 +93,53 @@ class TaskQueue {
   }
 };
 
-// XTaskQueueHandle values point at one of these; duplicating a handle creates a new ref.
-struct QueueRef {
-  uint64_t magic = 0x5154425845ull;  // "EXBTQ"
+constexpr uint64_t kQueueMagic = 0x5154425845ull;      // "EXBTQ"
+constexpr uint64_t kPortMagic = 0x5054425845ull;       // "EXBTP"
+
+// One port of a queue: where the items submitted to a queue handle's port go.
+struct PortTarget {
   std::shared_ptr<TaskQueue> queue;
+  uint32_t port = 0;
+};
+
+// XTaskQueueHandle values point at one of these; duplicating a handle creates
+// a new ref. A composite queue (XTaskQueueCreateComposite) routes its two
+// ports to ports of other queues.
+struct QueueRef {
+  uint64_t magic = kQueueMagic;
+  PortTarget ports[2];
+};
+
+// XTaskQueuePortHandle values.
+struct PortRef {
+  uint64_t magic = kPortMagic;
+  PortTarget target;
 };
 
 std::mutex g_queue_mutex;
 QueueRef* g_process_queue = nullptr;
 
-TaskQueue* queue_from(uint64_t handle) {
+QueueRef* new_queue_ref(const std::shared_ptr<TaskQueue>& q) {
+  return new QueueRef{kQueueMagic, {{q, kPortWork}, {q, kPortCompletion}}};
+}
+
+// The queue handle `handle` names; 0 is the process task queue.
+QueueRef* queue_ref(uint64_t handle) {
   if (!handle) {
     std::lock_guard lock(g_queue_mutex);
     if (!g_process_queue)
-      g_process_queue = new QueueRef{0x5154425845ull,
-                                     std::make_shared<TaskQueue>(DispatchMode::ThreadPool, DispatchMode::ThreadPool)};
-    return g_process_queue->queue.get();
+      g_process_queue = new_queue_ref(std::make_shared<TaskQueue>(DispatchMode::ThreadPool, DispatchMode::ThreadPool));
+    return g_process_queue;
   }
   auto* ref = reinterpret_cast<QueueRef*>(handle);
-  return ref->magic == 0x5154425845ull ? ref->queue.get() : nullptr;
+  uint64_t magic = 0;
+  platform::safe_read(handle, &magic, sizeof magic);
+  return magic == kQueueMagic ? ref : nullptr;
 }
 
-std::shared_ptr<TaskQueue> shared_queue(uint64_t handle) {
-  if (!handle) {
-    queue_from(0);
-    return g_process_queue->queue;
-  }
-  return reinterpret_cast<QueueRef*>(handle)->queue;
+TaskQueue* queue_from(uint64_t handle) {
+  QueueRef* ref = queue_ref(handle);
+  return ref ? ref->ports[kPortWork].queue.get() : nullptr;
 }
 
 struct WorkerArgs {
@@ -143,45 +173,71 @@ void ensure_worker(const std::shared_ptr<TaskQueue>& q, uint32_t port) {
 HRESULT XBEM_GUEST_ABI hle_XTaskQueueCreate(uint32_t work_mode, uint32_t completion_mode, uint64_t* out) {
   if (!out || work_mode > 3 || completion_mode > 3) return E_INVALIDARG;
   auto q = std::make_shared<TaskQueue>(static_cast<DispatchMode>(work_mode), static_cast<DispatchMode>(completion_mode));
-  *out = reinterpret_cast<uint64_t>(new QueueRef{0x5154425845ull, std::move(q)});
+  *out = reinterpret_cast<uint64_t>(new_queue_ref(q));
+  return S_OK;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XTaskQueueGetPort(uint64_t handle, uint32_t port, uint64_t* out) {
+  QueueRef* ref = queue_ref(handle);
+  if (!ref || port > 1 || !out) return E_INVALIDARG;
+  static std::mutex lock;
+  static std::map<std::pair<TaskQueue*, uint32_t>, PortRef*> handles;  // port handles live as long as the process
+  std::lock_guard guard(lock);
+  PortRef*& p = handles[{ref->ports[port].queue.get(), ref->ports[port].port}];
+  if (!p) p = new PortRef{kPortMagic, ref->ports[port]};
+  *out = reinterpret_cast<uint64_t>(p);
+  return S_OK;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XTaskQueueCreateComposite(uint64_t work_port, uint64_t completion_port, uint64_t* out) {
+  auto* w = reinterpret_cast<PortRef*>(work_port);
+  auto* c = reinterpret_cast<PortRef*>(completion_port);
+  if (!w || !c || !out || w->magic != kPortMagic || c->magic != kPortMagic) return E_INVALIDARG;
+  *out = reinterpret_cast<uint64_t>(new QueueRef{kQueueMagic, {w->target, c->target}});
   return S_OK;
 }
 
 HRESULT XBEM_GUEST_ABI hle_XTaskQueueDuplicateHandle(uint64_t handle, uint64_t* out) {
-  if (!out || !queue_from(handle)) return E_INVALIDARG;
-  *out = reinterpret_cast<uint64_t>(new QueueRef{0x5154425845ull, shared_queue(handle)});
+  QueueRef* ref = queue_ref(handle);
+  if (!out || !ref) return E_INVALIDARG;
+  *out = reinterpret_cast<uint64_t>(new QueueRef{kQueueMagic, {ref->ports[0], ref->ports[1]}});
   return S_OK;
 }
 
 void XBEM_GUEST_ABI hle_XTaskQueueCloseHandle(uint64_t handle) {
-  if (!handle) return;
-  auto* ref = reinterpret_cast<QueueRef*>(handle);
-  if (ref->magic != 0x5154425845ull || ref == g_process_queue) return;
+  QueueRef* ref = handle ? queue_ref(handle) : nullptr;
+  if (!ref || ref == g_process_queue) return;
   ref->magic = 0;
   delete ref;
 }
 
 HRESULT submit(uint64_t handle, uint32_t port, uint32_t delay_ms, void* context, uint64_t callback) {
   if (port > 1 || !callback) return E_INVALIDARG;
-  auto q = shared_queue(handle);
-  if (!q) return E_INVALIDARG;
+  QueueRef* ref = queue_ref(handle);
+  if (!ref) return E_INVALIDARG;
+  const PortTarget target = ref->ports[port];
+  auto& q = target.queue;
   DispatchMode mode;
+  std::vector<TaskQueue::Monitor> monitors;
   {
     std::lock_guard lock(q->mutex);
     if (q->terminated) return static_cast<HRESULT>(0x80070015);  // E_ABORT-like: queue terminated
-    mode = q->ports[port].mode;
+    mode = q->ports[target.port].mode;
     if (!(mode == DispatchMode::Immediate && delay_ms == 0)) {
-      q->ports[port].items.push_back(
+      q->ports[target.port].items.push_back(
           {callback, reinterpret_cast<uint64_t>(context),
            std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms)});
     }
+    monitors = q->monitors;
   }
   if (mode == DispatchMode::Immediate && delay_ms == 0) {
     reinterpret_cast<TaskCallback>(callback)(context, false);
     return S_OK;
   }
   q->cv.notify_all();
-  if (mode != DispatchMode::Manual) ensure_worker(q, port);
+  if (mode != DispatchMode::Manual) ensure_worker(q, target.port);
+  for (const auto& m : monitors)
+    reinterpret_cast<MonitorCallback>(m.callback)(reinterpret_cast<void*>(m.context), m.handle, target.port);
   return S_OK;
 }
 
@@ -195,44 +251,338 @@ HRESULT XBEM_GUEST_ABI hle_XTaskQueueSubmitDelayedCallback(uint64_t queue, uint3
 }
 
 bool XBEM_GUEST_ABI hle_XTaskQueueDispatch(uint64_t queue, uint32_t port, uint32_t timeout_ms) {
-  TaskQueue* q = queue_from(queue);
-  if (!q || port > 1) return false;
+  QueueRef* ref = queue_ref(queue);
+  if (!ref || port > 1) return false;
   TaskQueue::Item item;
-  if (!q->pop(port, timeout_ms, item)) return false;
+  if (!ref->ports[port].queue->pop(ref->ports[port].port, timeout_ms, item)) return false;
   reinterpret_cast<TaskCallback>(item.callback)(reinterpret_cast<void*>(item.context), false);
   return true;
 }
 
 bool XBEM_GUEST_ABI hle_XTaskQueueIsEmpty(uint64_t queue, uint32_t port) {
-  TaskQueue* q = queue_from(queue);
-  if (!q || port > 1) return true;
+  QueueRef* ref = queue_ref(queue);
+  if (!ref || port > 1) return true;
+  auto& q = ref->ports[port].queue;
   std::lock_guard lock(q->mutex);
-  return q->ports[port].items.empty();
+  return q->ports[ref->ports[port].port].items.empty();
 }
 
 HRESULT XBEM_GUEST_ABI hle_XTaskQueueTerminate(uint64_t queue, bool, void* context, uint64_t callback) {
-  TaskQueue* q = queue_from(queue);
-  if (!q) return E_INVALIDARG;
-  {
-    std::lock_guard lock(q->mutex);
-    q->terminated = true;
+  QueueRef* ref = queue_ref(queue);
+  if (!ref) return E_INVALIDARG;
+  for (auto& target : ref->ports) {
+    {
+      std::lock_guard lock(target.queue->mutex);
+      target.queue->terminated = true;
+    }
+    target.queue->cv.notify_all();
   }
-  q->cv.notify_all();
   if (callback) reinterpret_cast<TerminatedCallback>(callback)(context);
   return S_OK;
 }
 
+std::atomic<uint64_t> g_next_token{1};
+
+// XTaskQueueRegisterWaiter: a host thread waits for the kernel object and
+// submits the callback when it is signaled (once, as the GDK does).
+struct Waiter {
+  std::atomic<bool> cancelled{false};
+};
+std::mutex g_waiter_mutex;
+std::map<uint64_t, std::shared_ptr<Waiter>> g_waiters;
+
+HRESULT XBEM_GUEST_ABI hle_XTaskQueueRegisterWaiter(uint64_t queue, uint32_t port, uint64_t wait_handle, void* context,
+                                                    uint64_t callback, uint64_t* token) {
+  if (!queue_ref(queue) || port > 1 || !callback || !token) return E_INVALIDARG;
+  auto object = proc().handles().get(wait_handle);
+  if (!object) return E_INVALIDARG;
+  auto waiter = std::make_shared<Waiter>();
+  const uint64_t t = g_next_token++;
+  {
+    std::lock_guard lock(g_waiter_mutex);
+    g_waiters[t] = waiter;
+  }
+  std::thread([=] {
+    const std::shared_ptr<rt::KernelObject> objects[] = {object};
+    while (!waiter->cancelled) {
+      if (rt::wait_for_objects(objects, false, 100, 0) == 0) {
+        if (!waiter->cancelled) submit(queue, port, 0, context, callback);
+        break;
+      }
+    }
+  }).detach();
+  *token = t;
+  return S_OK;
+}
+
+void XBEM_GUEST_ABI hle_XTaskQueueUnregisterWaiter(uint64_t, uint64_t token) {
+  std::lock_guard lock(g_waiter_mutex);
+  auto it = g_waiters.find(token);
+  if (it == g_waiters.end()) return;
+  it->second->cancelled = true;
+  g_waiters.erase(it);
+}
+
+HRESULT XBEM_GUEST_ABI hle_XTaskQueueRegisterMonitor(uint64_t queue, void* context, uint64_t callback, uint64_t* token) {
+  QueueRef* ref = queue_ref(queue);
+  if (!ref || !callback || !token) return E_INVALIDARG;
+  const uint64_t t = g_next_token++;
+  for (auto* q : {ref->ports[0].queue.get(), ref->ports[1].queue.get()}) {
+    std::lock_guard lock(q->mutex);
+    q->monitors.push_back({t, reinterpret_cast<uint64_t>(context), callback, queue});
+    if (ref->ports[0].queue == ref->ports[1].queue) break;
+  }
+  *token = t;
+  return S_OK;
+}
+
+void XBEM_GUEST_ABI hle_XTaskQueueUnregisterMonitor(uint64_t queue, uint64_t token) {
+  QueueRef* ref = queue_ref(queue);
+  if (!ref) return;
+  for (auto& target : ref->ports) {
+    std::lock_guard lock(target.queue->mutex);
+    std::erase_if(target.queue->monitors, [&](const TaskQueue::Monitor& m) { return m.token == token; });
+  }
+}
+
 bool XBEM_GUEST_ABI hle_XTaskQueueGetCurrentProcessTaskQueue(uint64_t* out) {
   if (!out) return false;
-  queue_from(0);
-  return hle_XTaskQueueDuplicateHandle(reinterpret_cast<uint64_t>(g_process_queue), out) == S_OK;
+  return hle_XTaskQueueDuplicateHandle(reinterpret_cast<uint64_t>(queue_ref(0)), out) == S_OK;
 }
 
 void XBEM_GUEST_ABI hle_XTaskQueueSetCurrentProcessTaskQueue(uint64_t queue) {
-  if (!queue_from(queue)) return;
+  QueueRef* ref = queue_ref(queue);
+  if (!ref) return;
+  auto* copy = new QueueRef{kQueueMagic, {ref->ports[0], ref->ports[1]}};
   std::lock_guard lock(g_queue_mutex);
-  g_process_queue = new QueueRef{0x5154425845ull, shared_queue(queue)};
+  g_process_queue = copy;
 }
+
+// ------------------------------------------------------------------ XAsync
+//
+// XAsyncBlock { queue, context, callback, internal[32] }: the runtime keeps
+// each block's state keyed by its address. A guest provider is called with
+// XAsyncOp Begin (from XAsyncBegin), DoWork (on the work port after
+// XAsyncSchedule), GetResult, Cancel and Cleanup; the completion callback
+// runs on the completion port.
+
+struct XAsyncBlock {
+  uint64_t queue;
+  uint64_t context;
+  uint64_t callback;
+  uint8_t internal[32];
+};
+static_assert(sizeof(XAsyncBlock) == 56);
+
+struct XAsyncProviderData {
+  uint64_t async;
+  size_t buffer_size;
+  void* buffer;
+  uint64_t context;
+};
+
+enum XAsyncOp : uint32_t { kOpBegin = 0, kOpDoWork = 1, kOpGetResult = 2, kOpCancel = 3, kOpCleanup = 4 };
+
+using XAsyncProvider = HRESULT(XBEM_GUEST_ABI*)(uint32_t op, const XAsyncProviderData* data);
+using XAsyncWork = HRESULT(XBEM_GUEST_ABI*)(uint64_t async);
+using XAsyncCompletion = void(XBEM_GUEST_ABI*)(uint64_t async);
+
+constexpr HRESULT E_ABORT = static_cast<HRESULT>(0x80004004);
+constexpr HRESULT E_NOT_SUFFICIENT_BUFFER = static_cast<HRESULT>(0x8007007A);
+
+struct AsyncState {
+  uint64_t block = 0;
+  uint64_t identity = 0;
+  uint64_t provider = 0;  // guest XAsyncProvider, or 0
+  uint64_t work = 0;      // guest XAsyncWork (XAsyncRun), or 0
+  uint64_t context = 0;
+  std::function<void(void*)> host_write;  // host operations: writes the result
+  std::mutex mutex;
+  std::condition_variable cv;
+  HRESULT status = kEPending;
+  size_t required = 0;
+  bool cleaned = false;
+};
+
+std::mutex g_async_mutex;
+std::map<uint64_t, std::shared_ptr<AsyncState>> g_async;
+
+std::shared_ptr<AsyncState> async_state(uint64_t block) {
+  std::lock_guard lock(g_async_mutex);
+  auto it = g_async.find(block);
+  return it == g_async.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<AsyncState> async_begin_state(uint64_t block, uint64_t identity) {
+  auto state = std::make_shared<AsyncState>();
+  state->block = block;
+  state->identity = identity;
+  std::lock_guard lock(g_async_mutex);
+  g_async[block] = state;  // a block is reused once its previous operation completed
+  return state;
+}
+
+HRESULT call_provider(AsyncState& s, uint32_t op, size_t size = 0, void* buffer = nullptr) {
+  if (!s.provider) return S_OK;
+  XAsyncProviderData data{s.block, size, buffer, s.context};
+  return reinterpret_cast<XAsyncProvider>(s.provider)(op, &data);
+}
+
+void cleanup(AsyncState& s) {
+  {
+    std::lock_guard lock(s.mutex);
+    if (s.cleaned) return;
+    s.cleaned = true;
+  }
+  call_provider(s, kOpCleanup);
+}
+
+// XAsyncComplete: the first completion wins.
+void complete(const std::shared_ptr<AsyncState>& s, HRESULT result, size_t required) {
+  {
+    std::lock_guard lock(s->mutex);
+    if (s->status != kEPending) return;
+    s->status = result;
+    s->required = result < 0 ? 0 : required;
+  }
+  s->cv.notify_all();
+  if (result < 0 || required == 0) cleanup(*s);
+  XAsyncBlock block{};
+  platform::safe_read(s->block, &block, sizeof block);
+  if (block.callback) submit(block.queue, kPortCompletion, 0, reinterpret_cast<void*>(s->block), block.callback);
+}
+
+// The work-port callback XAsyncSchedule submits (context = the block).
+void XBEM_GUEST_ABI async_do_work(void* context, bool canceled) {
+  auto s = async_state(reinterpret_cast<uint64_t>(context));
+  if (!s) return;
+  HRESULT hr;
+  if (canceled)
+    hr = E_ABORT;
+  else if (s->work)
+    hr = reinterpret_cast<XAsyncWork>(s->work)(s->block);
+  else
+    hr = call_provider(*s, kOpDoWork);
+  if (hr != kEPending) complete(s, hr, 0);
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncBegin(uint64_t async, uint64_t context, uint64_t identity, const char*,
+                                       uint64_t provider) {
+  if (!async || !provider) return E_INVALIDARG;
+  auto s = async_begin_state(async, identity);
+  s->provider = provider;
+  s->context = context;
+  const HRESULT hr = call_provider(*s, kOpBegin);
+  if (hr < 0) {
+    {
+      std::lock_guard lock(s->mutex);
+      s->status = hr;
+    }
+    cleanup(*s);
+  }
+  return hr;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncSchedule(uint64_t async, uint32_t delay_ms) {
+  auto s = async_state(async);
+  if (!s) return E_INVALIDARG;
+  XAsyncBlock block{};
+  platform::safe_read(async, &block, sizeof block);
+  return submit(block.queue, kPortWork, delay_ms, reinterpret_cast<void*>(async),
+                reinterpret_cast<uint64_t>(&async_do_work));
+}
+
+void XBEM_GUEST_ABI hle_XAsyncComplete(uint64_t async, HRESULT result, size_t required) {
+  if (auto s = async_state(async)) complete(s, result, required);
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncRun(uint64_t async, uint64_t work) {
+  if (!async || !work) return E_INVALIDARG;
+  auto s = async_begin_state(async, 0);
+  s->work = work;
+  return hle_XAsyncSchedule(async, 0);
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncGetStatus(uint64_t async, bool wait) {
+  auto s = async_state(async);
+  if (!s) return E_INVALIDARG;
+  std::unique_lock lock(s->mutex);
+  if (wait) s->cv.wait(lock, [&] { return s->status != kEPending; });
+  return s->status;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncGetResultSize(uint64_t async, size_t* size) {
+  auto s = async_state(async);
+  if (!s || !size) return E_INVALIDARG;
+  std::lock_guard lock(s->mutex);
+  if (s->status < 0 || s->status == kEPending) return s->status;
+  *size = s->required;
+  return S_OK;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncCancel(uint64_t async) {
+  auto s = async_state(async);
+  if (!s) return E_INVALIDARG;
+  {
+    std::lock_guard lock(s->mutex);
+    if (s->status != kEPending) return S_OK;
+  }
+  call_provider(*s, kOpCancel);
+  complete(s, E_ABORT, 0);
+  return S_OK;
+}
+
+HRESULT XBEM_GUEST_ABI hle_XAsyncGetResult(uint64_t async, uint64_t identity, size_t size, void* buffer,
+                                           size_t* used) {
+  auto s = async_state(async);
+  if (!s) return E_INVALIDARG;
+  size_t required;
+  {
+    std::lock_guard lock(s->mutex);
+    if (s->status < 0 || s->status == kEPending) return s->status;
+    if (identity && s->identity && identity != s->identity) return E_INVALIDARG;
+    required = s->required;
+  }
+  if (required == 0) {
+    if (used) *used = 0;
+    return S_OK;
+  }
+  if (!buffer || size < required) return E_NOT_SUFFICIENT_BUFFER;
+  HRESULT hr = S_OK;
+  if (s->host_write)
+    s->host_write(buffer);
+  else
+    hr = call_provider(*s, kOpGetResult, size, buffer);
+  if (used) *used = required;
+  cleanup(*s);
+  return hr;
+}
+
+}  // namespace
+
+HRESULT xasync_run_host(uint64_t block, const void* identity, HRESULT status, size_t size,
+                        std::function<void(void*)> write) {
+  if (!block) return E_INVALIDARG;
+  auto s = async_begin_state(block, reinterpret_cast<uint64_t>(identity));
+  s->host_write = std::move(write);
+  complete(s, status, size);
+  return S_OK;
+}
+
+HRESULT xasync_result(uint64_t block, const void* identity, size_t size, void* buffer, size_t* used) {
+  return hle_XAsyncGetResult(block, reinterpret_cast<uint64_t>(identity), size, buffer, used);
+}
+
+HRESULT xasync_status(uint64_t block, bool wait) { return hle_XAsyncGetStatus(block, wait); }
+
+namespace {
+
+// ------------------------------------------------------------------ XThread
+
+bool XBEM_GUEST_ABI hle_XThreadIsTimeSensitive() { return false; }
+HRESULT XBEM_GUEST_ABI hle_XThreadSetTimeSensitive(bool) { return S_OK; }
+void XBEM_GUEST_ABI hle_XThreadAssertNotTimeSensitive() {}
+
 
 // --------------------------------------------------------------- runtime
 
@@ -392,26 +742,65 @@ HRESULT XBEM_GUEST_ABI xnetworking_connectivity_hint(ProbeObject*, ConnectivityH
 constexpr uint8_t kXNetworkingClsid[16] = {0x07, 0x69, 0xe5, 0x37, 0x10, 0x2f, 0xe8, 0x41,
                                            0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a};
 
-// Slots of a GDK family the emulator does not know yet: E_NOTIMPL, as the
-// functions failed before the family was bound (not a probe's S_OK, which
-// would leave outputs unwritten while reporting success).
-HRESULT XBEM_GUEST_ABI gdk_not_implemented(ProbeObject* self) {
-  static std::atomic<int> logged{0};
-  if (logged.fetch_add(1) < 32)
-    XBEM_WARN("xgameruntime", "{}: unknown slot called from {} -> E_NOTIMPL", self->name,
-              describe_code_address(XBEM_RETURN_ADDRESS()));
-  return E_NOTIMPL;
+// The XAsync / XTaskQueue / XThread family {073b7dcb-1fcf-4030-94be-e3c9eb623428}
+// (clsid = iid). Its slots follow the public headers: XAsync.h (3-6),
+// XAsyncProvider.h (7-11), XTaskQueue.h (12-26, with DuplicateHandle moved
+// before Dispatch and Terminate after the waiters), XThread.h (27-29).
+// Measured: slot 12 is XTaskQueueCreate(ThreadPool, ThreadPool, &queue);
+// 16 returns a bool from (queue, port, timeout); 17 takes one handle; 22 is
+// (queue, bool wait, context, callback); 29 takes nothing and runs before
+// most GDK calls of every family (XThreadAssertNotTimeSensitive).
+template <auto F>
+struct Slot;
+template <class R, class... A, R(XBEM_GUEST_ABI* F)(A...)>
+struct Slot<F> {
+  static R XBEM_GUEST_ABI call(ProbeObject*, A... args) { return F(args...); }
+};
+template <auto F>
+void* slot() {
+  return reinterpret_cast<void*>(&Slot<F>::call);
 }
 
-ProbeVtable gdk_vtable(std::initializer_list<std::pair<int, void*>> slots) {
-  ProbeVtable v = default_probe_vtable();
-  for (int i = 3; i < 96; ++i) v[i] = reinterpret_cast<void*>(&gdk_not_implemented);
-  for (const auto& [slot, f] : slots) v[slot] = f;
+constexpr uint8_t kXAsyncClsid[16] = {0xcb, 0x7d, 0x3b, 0x07, 0xcf, 0x1f, 0x30, 0x40,
+                                      0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28};
+
+const ProbeVtable& xasync_vtable() {
+  static const ProbeVtable v = gdk_vtable({
+      {3, slot<&hle_XAsyncGetStatus>()},
+      {4, slot<&hle_XAsyncGetResultSize>()},
+      {5, slot<&hle_XAsyncCancel>()},
+      {6, slot<&hle_XAsyncRun>()},
+      {7, slot<&hle_XAsyncBegin>()},
+      {9, slot<&hle_XAsyncSchedule>()},
+      {10, slot<&hle_XAsyncComplete>()},
+      {11, slot<&hle_XAsyncGetResult>()},
+      {12, slot<&hle_XTaskQueueCreate>()},
+      {13, slot<&hle_XTaskQueueGetPort>()},
+      {14, slot<&hle_XTaskQueueCreateComposite>()},
+      {15, slot<&hle_XTaskQueueDuplicateHandle>()},
+      {16, slot<&hle_XTaskQueueDispatch>()},
+      {17, slot<&hle_XTaskQueueCloseHandle>()},
+      {18, slot<&hle_XTaskQueueSubmitCallback>()},
+      {19, slot<&hle_XTaskQueueSubmitDelayedCallback>()},
+      {20, slot<&hle_XTaskQueueRegisterWaiter>()},
+      {21, slot<&hle_XTaskQueueUnregisterWaiter>()},
+      {22, slot<&hle_XTaskQueueTerminate>()},
+      {23, slot<&hle_XTaskQueueRegisterMonitor>()},
+      {24, slot<&hle_XTaskQueueUnregisterMonitor>()},
+      {25, slot<&hle_XTaskQueueGetCurrentProcessTaskQueue>()},
+      {26, slot<&hle_XTaskQueueSetCurrentProcessTaskQueue>()},
+      {27, slot<&hle_XThreadIsTimeSensitive>()},
+      {28, slot<&hle_XThreadSetTimeSensitive>()},
+      {29, slot<&hle_XThreadAssertNotTimeSensitive>()},
+  });
   return v;
 }
 
-// The object implementing `clsid`, or null.
-void* api_implementation(const uint8_t clsid[16]) {
+constexpr uint8_t kXUserClsid[16] = {0x77, 0xd1, 0xac, 0x01, 0xf9, 0x91, 0x63, 0x47,
+                                     0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0};
+
+// The object implementing (`clsid`, `iid`), or null.
+void* api_implementation(const uint8_t clsid[16], const uint8_t iid[16]) {
   if (std::memcmp(clsid, kXSystemClsid, 16) == 0) {
     static const ProbeVtable vtable = gdk_vtable({{3, reinterpret_cast<void*>(&xsystem_console_id)},
                                                   {4, reinterpret_cast<void*>(&xsystem_sandbox_id)},
@@ -424,6 +813,11 @@ void* api_implementation(const uint8_t clsid[16]) {
     static void* object = make_probe_object("xgameruntime.XNetworking", &vtable);
     return object;
   }
+  if (std::memcmp(clsid, kXAsyncClsid, 16) == 0 && std::memcmp(iid, kXAsyncClsid, 16) == 0) {
+    static void* object = make_probe_object("xgameruntime.XAsync", &xasync_vtable());
+    return object;
+  }
+  if (std::memcmp(clsid, kXUserClsid, 16) == 0) return xuser_api(iid);
   return nullptr;
 }
 
@@ -442,7 +836,7 @@ HRESULT XBEM_GUEST_ABI hle_QueryApiImpl(uint64_t a, uint64_t b, uint64_t c, uint
     std::lock_guard guard(lock);
     n = ++calls[{guid_to_string(clsid), guid_to_string(iid)}];
   }
-  void* object = api_implementation(clsid);
+  void* object = api_implementation(clsid, iid);
   if (n <= 3 || std::has_single_bit(n))
     XBEM_WARN("xgameruntime", "QueryApiImpl({}, {}, {}) from {} -> {} (call {} for this pair)", describe_arg(a),
               describe_arg(b), describe_arg(c), describe_code_address(XBEM_RETURN_ADDRESS()),
@@ -463,10 +857,28 @@ HRESULT XBEM_GUEST_ABI hle_XErrorReport(uint64_t a, uint64_t b, uint64_t c, uint
 
 }  // namespace
 
+// Slots of a GDK family the emulator does not know yet: E_NOTIMPL, as the
+// functions failed before the family was bound (not a probe's S_OK, which
+// would leave outputs unwritten while reporting success).
+static HRESULT XBEM_GUEST_ABI gdk_not_implemented(ProbeObject* self) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 32)
+    XBEM_WARN("xgameruntime", "{}: unknown slot called from {} -> E_NOTIMPL", self->name,
+              describe_code_address(XBEM_RETURN_ADDRESS()));
+  return E_NOTIMPL;
+}
+
+ProbeVtable gdk_vtable(std::initializer_list<std::pair<int, void*>> slots) {
+  ProbeVtable v = default_probe_vtable();
+  for (int i = 3; i < 96; ++i) v[i] = reinterpret_cast<void*>(&gdk_not_implemented);
+  for (const auto& [slot, f] : slots) v[slot] = f;
+  return v;
+}
+
 ModuleDef make_xgameruntime_module() {
   ModuleDef m;
   m.name = "xgameruntime.dll";
-  m.description = "GDK game runtime: XSystem, XPackage, XTaskQueue (XUser/XGameSave/XStore stubbed)";
+  m.description = "GDK game runtime: XSystem, XPackage, XTaskQueue, XAsync, XUser (XGameSave/XStore not bound)";
   m.exports = {
       XBEM_HLE(XGameRuntimeInitialize), XBEM_HLE(XGameRuntimeInitializeWithOptions),
       XBEM_HLE(XGameRuntimeUninitialize), XBEM_HLE(XGameRuntimeIsFeatureAvailable), XBEM_HLE(XTaskQueueCreate),
