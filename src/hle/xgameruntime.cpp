@@ -796,6 +796,49 @@ const ProbeVtable& xasync_vtable() {
   return v;
 }
 
+// XPackage {af406016-e850-4aa8-a88d-2f3dcb9dac7e} / {0b9d556e-...}: 3
+// GetCurrentProcessPackageIdentifier(size, buffer) (the title passes 33
+// bytes), 4 IsPackagedProcess(), 5 CreateInstallationMonitor(id, count,
+// selectors, interval, queue, &monitor), 6 CloseInstallationMonitorHandle,
+// 7 GetInstallationProgress(monitor, &progress), 8 UpdateInstallationMonitor,
+// 9/10 (Un)RegisterInstallationProgressChanged, 39 EnumeratePackages(kind,
+// scope, context, callback) - measured shapes. The game is fully installed
+// and no other packages (DLC) are.
+HRESULT XBEM_GUEST_ABI xpackage_identifier(ProbeObject*, size_t size, char* buffer) {
+  return hle_XPackageGetCurrentProcessPackageIdentifier(size, buffer);
+}
+bool XBEM_GUEST_ABI xpackage_is_packaged(ProbeObject*) { return true; }
+HRESULT XBEM_GUEST_ABI xpackage_enumerate(ProbeObject*, uint32_t kind, uint32_t scope, void*, uint64_t callback) {
+  XBEM_DEBUG("xgameruntime", "XPackageEnumeratePackages(kind {}, scope {}, callback {:#x}) -> none", kind, scope,
+             callback);
+  return S_OK;
+}
+
+struct InstallationProgress {
+  uint64_t total_bytes, installed_bytes, launch_bytes;
+  bool launchable, completed;
+};
+uint8_t g_installation_monitor;  // the one monitor handle (its address)
+
+HRESULT XBEM_GUEST_ABI xpackage_create_monitor(ProbeObject*, const char*, uint32_t, const void*, uint32_t, uint64_t,
+                                               void** monitor) {
+  if (!monitor) return E_INVALIDARG;
+  *monitor = &g_installation_monitor;
+  return S_OK;
+}
+void XBEM_GUEST_ABI xpackage_nothing(ProbeObject*, uint64_t) {}
+void XBEM_GUEST_ABI xpackage_progress(ProbeObject*, void*, InstallationProgress* progress) {
+  if (progress) *progress = {1ull << 30, 1ull << 30, 1ull << 30, true, true};
+}
+HRESULT XBEM_GUEST_ABI xpackage_register_progress(ProbeObject*, void*, void*, uint64_t, uint64_t* token) {
+  if (token) *token = 1;
+  return S_OK;
+}
+void XBEM_GUEST_ABI xpackage_unregister_progress(ProbeObject*, void*, uint64_t, bool) {}
+
+constexpr uint8_t kXPackageClsid[16] = {0x16, 0x60, 0x40, 0xaf, 0x50, 0xe8, 0xa8, 0x4a,
+                                        0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e};
+
 constexpr uint8_t kXUserClsid[16] = {0x77, 0xd1, 0xac, 0x01, 0xf9, 0x91, 0x63, 0x47,
                                      0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0};
 
@@ -818,6 +861,19 @@ void* api_implementation(const uint8_t clsid[16], const uint8_t iid[16]) {
     return object;
   }
   if (std::memcmp(clsid, kXUserClsid, 16) == 0) return xuser_api(iid);
+  if (std::memcmp(clsid, kXPackageClsid, 16) == 0) {
+    static const ProbeVtable vtable = gdk_vtable({{3, reinterpret_cast<void*>(&xpackage_identifier)},
+                                                  {4, reinterpret_cast<void*>(&xpackage_is_packaged)},
+                                                  {5, reinterpret_cast<void*>(&xpackage_create_monitor)},
+                                                  {6, reinterpret_cast<void*>(&xpackage_nothing)},
+                                                  {7, reinterpret_cast<void*>(&xpackage_progress)},
+                                                  {8, reinterpret_cast<void*>(&xpackage_nothing)},
+                                                  {9, reinterpret_cast<void*>(&xpackage_register_progress)},
+                                                  {10, reinterpret_cast<void*>(&xpackage_unregister_progress)},
+                                                  {39, reinterpret_cast<void*>(&xpackage_enumerate)}});
+    static void* object = make_probe_object("xgameruntime.XPackage", &vtable);
+    return object;
+  }
   return nullptr;
 }
 

@@ -632,6 +632,28 @@ static void test_sandbox(void) {
   CHECK(QueryApiImpl(xnet_clsid, xnet_iid, &xnet) == 0 && xnet);
   CHECK(((HintFn)VT(xnet)[15])(xnet, hint) == 0);
   CHECK(*(uint32_t*)hint == 1 && hint[12] == 1 && hint[13] == 0 && hint[15] == 0);
+
+  /* XPackage: packaged, fully installed, no other packages */
+  static const uint8_t xpkg_clsid[16] = {0x16, 0x60, 0x40, 0xaf, 0x50, 0xe8, 0xa8, 0x4a,
+                                         0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e};
+  static const uint8_t xpkg_iid[16] = {0x6e, 0x55, 0x9d, 0x0b, 0x70, 0xab, 0xf3, 0x43,
+                                       0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40};
+  typedef _Bool (*IsPackagedFn)(void*);
+  typedef HRESULT (*PkgIdFn)(void*, size_t, char*);
+  typedef HRESULT (*MonitorFn)(void*, const char*, uint32_t, const void*, uint32_t, void*, void**);
+  typedef void (*ProgressFn)(void*, void*, uint64_t*);
+  typedef HRESULT (*EnumFn)(void*, uint32_t, uint32_t, void*, void*);
+  void* xpkg = 0;
+  char pkg_id[33];
+  CHECK(QueryApiImpl(xpkg_clsid, xpkg_iid, &xpkg) == 0 && xpkg);
+  CHECK(((IsPackagedFn)VT(xpkg)[4])(xpkg));
+  CHECK(((PkgIdFn)VT(xpkg)[3])(xpkg, sizeof pkg_id, pkg_id) == 0 && pkg_id[0]);
+  void* monitor = 0;
+  CHECK(((MonitorFn)VT(xpkg)[5])(xpkg, pkg_id, 0, 0, 1000, 0, &monitor) == 0 && monitor);
+  uint64_t progress[4] = {0};
+  ((ProgressFn)VT(xpkg)[7])(xpkg, monitor, progress);
+  CHECK(progress[0] && progress[1] == progress[0] && ((uint8_t*)progress)[24] == 1 && ((uint8_t*)progress)[25] == 1);
+  CHECK(((EnumFn)VT(xpkg)[39])(xpkg, 1, 0, 0, (void*)test_sandbox) == 0);
 }
 
 /* XAsync, XTaskQueue, XThread ({073b7dcb-...}) and XUser ({01acd177-...})

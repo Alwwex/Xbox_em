@@ -180,6 +180,10 @@ is the `mov rax,[rax+N]` before the guarded call). Bound:
   RegisterForChangeEvent, ...); its second interface `{cef4fac0-...}` has
   the newer XUserGetGamertag(user, component, ...) in slot 3. One signed-in
   offline user; the title adds it with AddDefaultUserSilently at start-up.
+- XPackage `{af406016-...}`: 3 GetCurrentProcessPackageIdentifier, 4
+  IsPackagedProcess (true: the title then monitors its installation), 5-10
+  the installation monitor (fully installed), 39 EnumeratePackages (no
+  DLC).
 - XSystem `{e349bd1a-...}` (3 GetConsoleId, 4 GetXboxLiveSandboxId - the
   title asserts unless it is RETAIL, CERT, CERT.DEBUG or RKTR.*, 5
   GetAppSpecificDeviceId) and XNetworking `{37e56907-...}` (15
@@ -189,8 +193,7 @@ Unbound (E_NOINTERFACE; unknown slots of bound families fail with
 E_NOTIMPL): XStore `{0dd112ac-...}` (75 slots in XStore.h order: 3
 CreateContext(user, &ctx), 5 QueryAssociatedProductsAsync, 9/10
 QueryEntitledProducts{Async,Result} - called once the main loop runs),
-`{af406016-...}` (probably XPackage: 4 takes no arguments, 39 is
-(1, 0, context, callback) like XPackageEnumeratePackages), `{3e241977-...}`,
+`{3e241977-...}`,
 `{973a344e-...}`, `{03f0fe74-...}`, `{f4faf4d4-...}`, `{704c3f58-...}`.
 
 XG_RESOURCE_LAYOUT (what the title reads, `src/hle/xg.cpp`): a 0x18-byte
