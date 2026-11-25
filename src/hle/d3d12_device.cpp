@@ -28,6 +28,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 #include "gpu/root_signature.h"
 #include "hle/d3d12_device.h"
@@ -211,6 +213,8 @@ bool is_fence(void* object) {
 
 // ------------------------------------------------------- command queue
 
+void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists);
+
 // ID3D12CommandQueue. On the PC: 10 ExecuteCommandLists, 11 SetMarker,
 // 12 BeginEvent, 13 EndEvent, 14 Signal, 15 Wait, 16 GetTimestampFrequency,
 // 17 GetClockCalibration, 18 GetDesc. The console queue is shifted (a real
@@ -230,6 +234,7 @@ uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1
     return S_OK;
   }
   if (a0 >= 1 && a0 <= 256 && a1 >= 0x10000 && a1 < 0x800000000000ull && (Slot == 10 || Slot == 12)) {
+    capture_execute(self, a0, a1);
     probe_log(self, Slot, std::format("ExecuteCommandLists({} lists) - completed instantly (headless) [by shape]", a0),
               ret);
     return 0;
@@ -245,9 +250,25 @@ uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1
   return S_OK;
 }
 
+// Console-only queue slots (measured): 35 ExecuteCommandListsX(count, lists,
+// ...) - the title's command lists go through it; 32 is called once per frame
+// with plane descriptions (PresentX). Both keep the probe's logging.
+void capture_marker(ProbeObject* queue, const char* what);
+template <int Slot>
+uint64_t XBEM_GUEST_ABI queue_console_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                             uint64_t a5, uint64_t a6) {
+  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+  if (Slot == 35 && a1 >= 1 && a1 <= 256) capture_execute(self, a1, a2);
+  if (Slot == 32) capture_marker(self, "PresentX (queue slot 32)");
+  return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS(), false);
+}
+
 template <int... Slots>
 ProbeVtable make_queue_vtable(std::integer_sequence<int, Slots...>) {
-  return make_vtable({{Slots + 10, fn(&queue_method<Slots + 10>)}...});
+  ProbeVtable v = make_vtable({{Slots + 10, fn(&queue_method<Slots + 10>)}...});
+  v[32] = fn(&queue_console_method<32>);
+  v[35] = fn(&queue_console_method<35>);
+  return v;
 }
 const ProbeVtable g_queue_vtable = make_queue_vtable(std::make_integer_sequence<int, 11>{});
 
@@ -404,6 +425,381 @@ HRESULT create_into(void* object, void** out) {
   return S_OK;
 }
 
+// ------------------------------------------------------ command capture
+//
+// Every command-list call is decoded while a capture is armed
+// (`--capture-commands FILE@SECONDS[:MS]`), and the lists a queue executes in
+// the window are written to FILE: what the title draws, with the resources
+// behind its descriptors, before anything is rendered. Slots follow the PC
+// ID3D12GraphicsCommandList order up to 26 and are shifted by 4 from 32
+// (SetDescriptorHeaps, PC 28) - measured from the title's calls up to 52
+// (ClearRenderTargetView); later and console-only slots are shown by number.
+
+struct RecordedCommand {
+  int slot;
+  uint64_t args[6];
+  std::string text;
+};
+struct ListRecord {
+  std::mutex mutex;
+  std::vector<RecordedCommand> commands;
+  bool closed = false;  // the next command starts a new recording (the console Reset is not slot 10)
+};
+
+struct CaptureWindow {
+  std::mutex mutex;
+  std::filesystem::path path;
+  std::ofstream out;
+  std::chrono::steady_clock::time_point origin, start, end;
+  bool configured = false, finished = false;
+  uint64_t executes = 0, commands = 0;
+};
+CaptureWindow g_capture;
+std::atomic<bool> g_capture_recording{false};
+
+// Parses the option once (at device creation); the time counts from then.
+void capture_configure() {
+  std::lock_guard lock(g_capture.mutex);
+  if (g_capture.configured) return;
+  g_capture.configured = true;
+  g_capture.origin = std::chrono::steady_clock::now();
+  const std::string& spec = proc().options().capture_commands;
+  const size_t at = spec.rfind('@');
+  if (spec.empty() || at == std::string::npos) return;
+  try {
+    const std::string when = spec.substr(at + 1);
+    const size_t colon = when.find(':');
+    const double seconds = std::stod(when.substr(0, colon));
+    const double ms = colon == std::string::npos ? 100.0 : std::stod(when.substr(colon + 1));
+    g_capture.path = spec.substr(0, at);
+    g_capture.start = g_capture.origin + std::chrono::milliseconds(static_cast<int64_t>(seconds * 1000));
+    g_capture.end = g_capture.start + std::chrono::milliseconds(static_cast<int64_t>(ms));
+    XBEM_INFO("d3d12", "command capture: lists executed {}..{} ms after device creation -> {}",
+              static_cast<int64_t>(seconds * 1000), static_cast<int64_t>(seconds * 1000 + ms),
+              g_capture.path.string());
+    // Recording starts a second early: lists are recorded before they run.
+    if (g_capture.start - std::chrono::seconds(1) <= g_capture.origin) g_capture_recording.store(true);
+    std::thread([] {
+      std::this_thread::sleep_until(g_capture.start - std::chrono::seconds(1));
+      g_capture_recording.store(true);
+      std::this_thread::sleep_until(g_capture.end + std::chrono::milliseconds(50));
+      g_capture_recording.store(false);
+      std::lock_guard lock(g_capture.mutex);
+      if (g_capture.out.is_open()) {
+        g_capture.out << std::format("# end: {} ExecuteCommandLists, {} commands\n", g_capture.executes,
+                                     g_capture.commands);
+        g_capture.out.close();
+      }
+      g_capture.finished = true;
+      XBEM_INFO("d3d12", "command capture written: {} ({} ExecuteCommandLists, {} commands)", g_capture.path.string(),
+                g_capture.executes, g_capture.commands);
+    }).detach();
+  } catch (const std::exception&) {
+    XBEM_WARN("d3d12", "--capture-commands {}: expected FILE@SECONDS[:MS]", spec);
+  }
+}
+
+// Descriptors. On the console a descriptor is 32 bytes of memory the device
+// writes and titles copy themselves (heaps live in title memory and GPU
+// handles are the same addresses). The emulator writes its own encoding into
+// those bytes, so copies made by the title or by CopyDescriptors carry the
+// view along and a descriptor table can be decoded wherever it ends up.
+struct XbemDescriptor {
+  uint32_t magic;  // "XBDS"
+  uint8_t kind;    // DescriptorKind
+  uint8_t pad[3];
+  uint64_t object;  // the resource (a probe object), or 0
+  uint64_t a, b;    // CBV: address and size; views: the view description's first bytes
+};
+static_assert(sizeof(XbemDescriptor) == 32);
+constexpr uint32_t kDescriptorMagic = 0x53444258;
+enum DescriptorKind : uint8_t { kCbv = 1, kSrv, kUav, kRtv, kDsv, kSampler };
+const char* const kDescriptorKindNames[] = {"?", "CBV", "SRV", "UAV", "RTV", "DSV", "sampler"};
+
+std::string describe_resource(uint64_t p);
+
+void write_descriptor(uint64_t handle, DescriptorKind kind, uint64_t object, uint64_t a = 0, uint64_t b = 0) {
+  const XbemDescriptor d{kDescriptorMagic, kind, {}, object, a, b};
+  platform::safe_write(handle, &d, sizeof d);
+}
+template <class T>
+T read_guest(uint64_t address) {
+  T value{};
+  platform::safe_read(address, &value, sizeof value);
+  return value;
+}
+
+std::string describe_object(uint64_t p) {
+  if (!p) return "null";
+  if (!is_probe_object(p)) return std::format("{:#x}", p);
+  return describe_resource(p);
+}
+
+std::string describe_descriptor(uint64_t handle) {
+  XbemDescriptor d{};
+  if (!platform::safe_read(handle, &d, sizeof d) || d.magic != kDescriptorMagic || d.kind > kSampler)
+    return std::format("{:#x}", handle);
+  if (d.kind == kCbv) return std::format("{:#x} CBV va {:#x} {} bytes", handle, d.a, d.b);
+  return std::format("{:#x} {} {}", handle, kDescriptorKindNames[d.kind], d.object ? describe_object(d.object) : "");
+}
+
+// A descriptor table: the first descriptors from `handle` (up to 4).
+std::string describe_table(uint64_t handle) {
+  std::string s = describe_descriptor(handle);
+  for (int i = 1; i < 4; ++i) {
+    XbemDescriptor d{};
+    if (!platform::safe_read(handle + i * kDescriptorSize, &d, sizeof d) || d.magic != kDescriptorMagic) break;
+    s += " | " + describe_descriptor(handle + i * kDescriptorSize).substr(std::format("{:#x} ", handle + i * kDescriptorSize).size());
+  }
+  return s;
+}
+
+std::string decode_command(int slot, const uint64_t* a) {
+  const auto u32 = [&](int i) { return static_cast<uint32_t>(a[i]); };
+  switch (slot) {
+    case 9: return "Close";
+    case 10: return std::format("Reset(allocator, pso {})", describe_object(a[1]));
+    case 12: return std::format("DrawInstanced({} vertices, {} instances, start {} / {})", u32(0), u32(1), u32(2), u32(3));
+    case 13:
+      return std::format("DrawIndexedInstanced({} indices, {} instances, start {}, base vertex {}, start instance {})",
+                         u32(0), u32(1), u32(2), static_cast<int32_t>(a[3]), u32(4));
+    case 14: return std::format("Dispatch({}, {}, {})", u32(0), u32(1), u32(2));
+    case 15:
+      return std::format("CopyBufferRegion({} +{:#x} <- {} +{:#x}, {:#x} bytes)", describe_object(a[0]), a[1],
+                         describe_object(a[2]), a[3], a[4]);
+    case 16:
+      return std::format("CopyTextureRegion(dst {} at {},{},{} <- src {})", describe_object(read_guest<uint64_t>(a[0])),
+                         u32(1), u32(2), u32(3), describe_object(read_guest<uint64_t>(a[4])));
+    case 17: return std::format("CopyResource({} <- {})", describe_object(a[0]), describe_object(a[1]));
+    case 20: return std::format("IASetPrimitiveTopology({:#x})", u32(0));
+    case 21: {
+      std::string s = std::format("RSSetViewports({}", u32(0));
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(0), 4); ++i) {
+        float v[6];
+        platform::safe_read(a[1] + i * 24, v, sizeof v);
+        s += std::format(", [{} {} {}x{} z {}..{}]", v[0], v[1], v[2], v[3], v[4], v[5]);
+      }
+      return s + ")";
+    }
+    case 22: {
+      std::string s = std::format("RSSetScissorRects({}", u32(0));
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(0), 4); ++i) {
+        int32_t r[4];
+        platform::safe_read(a[1] + i * 16, r, sizeof r);
+        s += std::format(", [{},{} - {},{}]", r[0], r[1], r[2], r[3]);
+      }
+      return s + ")";
+    }
+    case 23: {
+      float f[4] = {};
+      platform::safe_read(a[0], f, sizeof f);
+      return std::format("OMSetBlendFactor({} {} {} {})", f[0], f[1], f[2], f[3]);
+    }
+    case 24: return std::format("OMSetStencilRef({})", u32(0));
+    case 25: return std::format("SetPipelineState({})", describe_object(a[0]));
+    case 26: return std::format("ResourceBarrier({} barriers)", u32(0));
+    case 32: {
+      std::string s = std::format("SetDescriptorHeaps({}", u32(0));
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(0), 4); ++i)
+        s += ", " + describe_object(read_guest<uint64_t>(a[1] + i * 8));
+      return s + ")";
+    }
+    case 33: return std::format("SetComputeRootSignature({})", describe_object(a[0]));
+    case 34: return std::format("SetGraphicsRootSignature({})", describe_object(a[0]));
+    case 35: return std::format("SetComputeRootDescriptorTable({}, {})", u32(0), describe_table(a[1]));
+    case 36: return std::format("SetGraphicsRootDescriptorTable({}, {})", u32(0), describe_table(a[1]));
+    case 37: return std::format("SetComputeRoot32BitConstant({}, {:#x}, {})", u32(0), u32(1), u32(2));
+    case 38: return std::format("SetGraphicsRoot32BitConstant({}, {:#x}, {})", u32(0), u32(1), u32(2));
+    case 39:
+    case 40: {
+      std::string s = std::format("Set{}Root32BitConstants({}, {} values at {}:", slot == 39 ? "Compute" : "Graphics",
+                                  u32(0), u32(1), u32(3));
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(1), 16); ++i)
+        s += std::format(" {:#x}", read_guest<uint32_t>(a[2] + i * 4));
+      return s + ")";
+    }
+    case 41: return std::format("SetComputeRootConstantBufferView({}, va {:#x})", u32(0), a[1]);
+    case 42: return std::format("SetGraphicsRootConstantBufferView({}, va {:#x})", u32(0), a[1]);
+    case 43: return std::format("SetComputeRootShaderResourceView({}, va {:#x})", u32(0), a[1]);
+    case 44: return std::format("SetGraphicsRootShaderResourceView({}, va {:#x})", u32(0), a[1]);
+    case 45: return std::format("SetComputeRootUnorderedAccessView({}, va {:#x})", u32(0), a[1]);
+    case 46: return std::format("SetGraphicsRootUnorderedAccessView({}, va {:#x})", u32(0), a[1]);
+    case 47: {
+      if (!a[0]) return "IASetIndexBuffer(null)";
+      const uint64_t va = read_guest<uint64_t>(a[0]);
+      return std::format("IASetIndexBuffer(va {:#x}, {} bytes, format {})", va, read_guest<uint32_t>(a[0] + 8),
+                         read_guest<uint32_t>(a[0] + 12));
+    }
+    case 48: {
+      std::string s = std::format("IASetVertexBuffers(slot {}, {}", u32(0), u32(1));
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(1), 4) && a[2]; ++i)
+        s += std::format(", [va {:#x} {} bytes stride {}]", read_guest<uint64_t>(a[2] + i * 16),
+                         read_guest<uint32_t>(a[2] + i * 16 + 8), read_guest<uint32_t>(a[2] + i * 16 + 12));
+      return s + ")";
+    }
+    case 50: {
+      std::string s = std::format("OMSetRenderTargets({}", u32(0));
+      const bool contiguous = static_cast<uint8_t>(a[2]) != 0;
+      for (uint32_t i = 0; i < std::min<uint32_t>(u32(0), 8) && a[1]; ++i) {
+        const uint64_t h = contiguous ? read_guest<uint64_t>(a[1]) + i * kDescriptorSize : read_guest<uint64_t>(a[1] + i * 8);
+        s += ", rtv " + describe_descriptor(h);
+      }
+      if (a[3]) s += ", dsv " + describe_descriptor(read_guest<uint64_t>(a[3]));
+      return s + ")";
+    }
+    case 51: return std::format("ClearDepthStencilView({}, flags {:#x})", describe_descriptor(a[0]), u32(1));
+    case 52: {
+      float c[4] = {};
+      platform::safe_read(a[1], c, sizeof c);
+      return std::format("ClearRenderTargetView({}, [{} {} {} {}])", describe_descriptor(a[0]), c[0], c[1], c[2], c[3]);
+    }
+    default:
+      return std::format("method{}({:#x}, {:#x}, {:#x}, {:#x})", slot, a[0], a[1], a[2], a[3]);
+  }
+}
+
+ListRecord* list_record_of(ProbeObject* self) { return static_cast<ListRecord*>(self->state); }
+
+void record_command(ProbeObject* self, int slot, const uint64_t* args) {
+  ListRecord* r = list_record_of(self);
+  if (!r) return;
+  std::lock_guard lock(r->mutex);
+  if (r->closed || slot == 10) {
+    r->commands.clear();
+    r->closed = false;
+  }
+  if (slot == 9) r->closed = true;
+  if (!g_capture_recording.load(std::memory_order_relaxed)) return;
+  RecordedCommand c{slot, {}, decode_command(slot, args)};
+  std::memcpy(c.args, args, sizeof c.args);
+  r->commands.push_back(std::move(c));
+}
+
+// Writes the lists of one ExecuteCommandLists call when it falls in the window.
+void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists);
+
+template <int Slot>
+uint64_t XBEM_GUEST_ABI list_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                    uint64_t a5, uint64_t a6) {
+  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+  if (self && self->magic == kProbeMagic) record_command(self, Slot, args);
+  return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS(), false);
+}
+
+std::string describe_resource(uint64_t p) {
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  if (o->vtable != g_resource_vtable.data()) return o->name;
+  const auto* r = static_cast<ResourceState*>(o->state);
+  uint32_t dimension, height, format;
+  uint64_t width;
+  uint16_t depth, mips;
+  std::memcpy(&dimension, r->desc, 4);
+  std::memcpy(&width, r->desc + 16, 8);
+  std::memcpy(&height, r->desc + 24, 4);
+  std::memcpy(&depth, r->desc + 28, 2);
+  std::memcpy(&mips, r->desc + 30, 2);
+  std::memcpy(&format, r->desc + 32, 4);
+  if (dimension == 1) return std::format("{} (buffer {:#x} bytes at {:#x})", o->name, width, r->gpu_va);
+  return std::format("{} ({}D {}x{}x{}, {} mips, format {}, at {:#x})", o->name, dimension - 1, width, height, depth,
+                     mips, format, r->gpu_va);
+}
+
+void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists) {
+  if (!g_capture_recording.load(std::memory_order_relaxed)) return;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard lock(g_capture.mutex);
+  if (g_capture.finished || now < g_capture.start || now > g_capture.end) return;
+  if (!g_capture.out.is_open()) {
+    g_capture.out.open(g_capture.path);
+    g_capture.out << "# xbem command capture: lists as the title recorded them, in execution order\n";
+  }
+  ++g_capture.executes;
+  g_capture.out << std::format(
+      "== {} ExecuteCommandLists({}) at +{} ms\n", queue->name, count,
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_capture.origin).count());
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t p = read_guest<uint64_t>(lists + i * 8);
+    if (!is_probe_object(p)) continue;
+    auto* list = reinterpret_cast<ProbeObject*>(p);
+    ListRecord* r = list_record_of(list);
+    if (!r) continue;
+    std::lock_guard list_lock(r->mutex);
+    g_capture.out << std::format("-- {}: {} commands\n", list->name, r->commands.size());
+    for (const RecordedCommand& c : r->commands) g_capture.out << "   " << c.text << "\n";
+    g_capture.commands += r->commands.size();
+    if (g_capture.executes == 1 && !r->commands.empty())
+      XBEM_INFO("d3d12", "command capture: {} ExecuteCommandLists - {} first: {}", queue->name, list->name,
+                r->commands.front().text);
+  }
+  g_capture.out.flush();
+}
+
+void capture_marker(ProbeObject* queue, const char* what) {
+  if (!g_capture_recording.load(std::memory_order_relaxed)) return;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard lock(g_capture.mutex);
+  if (g_capture.finished || now < g_capture.start || now > g_capture.end || !g_capture.out.is_open()) return;
+  g_capture.out << std::format(
+      "== {} {} at +{} ms\n", queue->name, what,
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_capture.origin).count());
+}
+
+// Device descriptor creation (PC order, measured shapes): 17 CBV(desc, handle),
+// 18 SRV(resource, desc, handle), 19 UAV(resource, counter, desc, handle),
+// 20 RTV(resource, desc, handle), 21 DSV(resource, desc, handle), 22
+// Sampler(desc, handle), 23 CopyDescriptors, 24 CopyDescriptorsSimple(count,
+// dst, src, type).
+template <int Slot>
+uint64_t XBEM_GUEST_ABI device_descriptor_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                                 uint64_t a5, uint64_t a6) {
+  const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
+  const auto view = [](uint64_t desc) {  // a view description's first 16 bytes (format, dimension, ...)
+    uint64_t v[2] = {};
+    if (desc) platform::safe_read(desc, v, sizeof v);
+    return std::pair{v[0], v[1]};
+  };
+  switch (Slot) {
+    case 17: {
+      uint64_t cbv[2] = {};
+      if (a1) platform::safe_read(a1, cbv, sizeof cbv);
+      write_descriptor(a2, kCbv, 0, cbv[0], static_cast<uint32_t>(cbv[1]));
+      break;
+    }
+    case 18: { auto [x, y] = view(a2); write_descriptor(a3, kSrv, a1, x, y); break; }
+    case 19: { auto [x, y] = view(a3); write_descriptor(a4, kUav, a1, x, y); break; }
+    case 20: { auto [x, y] = view(a2); write_descriptor(a3, kRtv, a1, x, y); break; }
+    case 21: { auto [x, y] = view(a2); write_descriptor(a3, kDsv, a1, x, y); break; }
+    case 22: write_descriptor(a2, kSampler, 0); break;
+    case 24:  // CopyDescriptorsSimple(count, dst, src, type): the bytes move, as on the console
+      if (a1 && a1 <= (1u << 20)) {
+        std::vector<uint8_t> bytes(a1 * kDescriptorSize);
+        if (platform::safe_read(a3, bytes.data(), bytes.size())) platform::safe_write(a2, bytes.data(), bytes.size());
+      }
+      break;
+    case 23: {  // CopyDescriptors(dst ranges, dst starts, dst sizes, src ranges, src starts, src sizes, type)
+      std::vector<uint8_t> all;
+      for (uint64_t r = 0; r < a4 && r < 4096; ++r) {
+        const uint64_t start = read_guest<uint64_t>(a5 + r * 8);
+        const uint32_t n = a6 ? read_guest<uint32_t>(a6 + r * 4) : 1;
+        std::vector<uint8_t> bytes(uint64_t{n} * kDescriptorSize);
+        if (n <= (1u << 20) && platform::safe_read(start, bytes.data(), bytes.size()))
+          all.insert(all.end(), bytes.begin(), bytes.end());
+      }
+      size_t at = 0;
+      for (uint64_t r = 0; r < a1 && r < 4096 && at < all.size(); ++r) {
+        const uint64_t start = read_guest<uint64_t>(a2 + r * 8);
+        const uint64_t n = std::min<uint64_t>(a3 ? read_guest<uint32_t>(a3 + r * 4) : 1, (all.size() - at) / kDescriptorSize);
+        platform::safe_write(start, all.data() + at, n * kDescriptorSize);
+        at += n * kDescriptorSize;
+      }
+      break;
+    }
+    default: break;
+  }
+  return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS(), false);
+}
+
+
 // Command lists. The title records commands partly itself: while a list's
 // write cursor (+0x18) is below its limits (+0x28 for dispatches, +0x30 for
 // other commands) it writes PM4 packets through the cursor instead of calling
@@ -422,28 +818,43 @@ std::atomic<uint64_t> g_command_lists{0}, g_draws{0}, g_dispatches{0};
 // 13 DrawIndexedInstanced(indices, instances, start index, base vertex, start
 // instance), 14 Dispatch(x, y, z): the PC order, confirmed by the title's
 // calls (a fullscreen pass draws 3 vertices, 1 instance).
-void XBEM_GUEST_ABI list_draw_instanced(ProbeObject* self, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+void XBEM_GUEST_ABI list_draw_instanced(ProbeObject* self, uint32_t vertices, uint32_t instances, uint32_t sv,
+                                        uint32_t si) {
   g_draws.fetch_add(1);
+  const uint64_t args[6] = {vertices, instances, sv, si};
+  record_command(self, 12, args);
   probe_log(self, 12, std::format("DrawInstanced({} vertices, {} instances)", vertices, instances),
             XBEM_RETURN_ADDRESS());
 }
-void XBEM_GUEST_ABI list_draw_indexed_instanced(ProbeObject* self, uint32_t indices, uint32_t instances, uint32_t,
-                                                int32_t, uint32_t) {
+void XBEM_GUEST_ABI list_draw_indexed_instanced(ProbeObject* self, uint32_t indices, uint32_t instances, uint32_t si,
+                                                int32_t bv, uint32_t sinst) {
   g_draws.fetch_add(1);
+  const uint64_t args[6] = {indices, instances, si, static_cast<uint64_t>(static_cast<uint32_t>(bv)), sinst};
+  record_command(self, 13, args);
   probe_log(self, 13, std::format("DrawIndexedInstanced({} indices, {} instances)", indices, instances),
             XBEM_RETURN_ADDRESS());
 }
 void XBEM_GUEST_ABI list_dispatch(ProbeObject* self, uint32_t x, uint32_t y, uint32_t z) {
   g_dispatches.fetch_add(1);
+  const uint64_t args[6] = {x, y, z};
+  record_command(self, 14, args);
   probe_log(self, 14, std::format("Dispatch({}, {}, {})", x, y, z), XBEM_RETURN_ADDRESS());
 }
-const ProbeVtable g_command_list_vtable = make_vtable({{12, fn(&list_draw_instanced)},
-                                                       {13, fn(&list_draw_indexed_instanced)},
-                                                       {14, fn(&list_dispatch)}});
+template <int... Slots>
+ProbeVtable make_command_list_vtable(std::integer_sequence<int, Slots...>) {
+  ProbeVtable v = make_vtable({{Slots + 9, fn(&list_method<Slots + 9>)}...});
+  v[12] = fn(&list_draw_instanced);
+  v[13] = fn(&list_draw_indexed_instanced);
+  v[14] = fn(&list_dispatch);
+  return v;
+}
+// Slots 9-159 are recorded (0-8: IUnknown, private data, name, device).
+const ProbeVtable g_command_list_vtable = make_command_list_vtable(std::make_integer_sequence<int, 151>{});
 
 void* new_command_list() {
   g_command_lists.fetch_add(1);
-  auto* list = static_cast<ProbeObject*>(make_probe_object(child_name("command_list"), &g_command_list_vtable));
+  auto* list =
+      static_cast<ProbeObject*>(make_probe_object(child_name("command_list"), &g_command_list_vtable, new ListRecord));
   const uint64_t sink = reinterpret_cast<uint64_t>(g_inline_command_sink);
   for (const size_t off : {kListCursor, kListDispatchLimit, kListLimit})
     std::memcpy(reinterpret_cast<uint8_t*>(list) + off, &sink, 8);
@@ -962,6 +1373,14 @@ const ProbeVtable g_device_vtable = make_vtable({
     {13, fn(&device_check_feature_support)},
     {14, fn(&device_create_descriptor_heap)},
     {15, fn(&device_get_descriptor_increment)},
+    {17, fn(&device_descriptor_method<17>)},
+    {18, fn(&device_descriptor_method<18>)},
+    {19, fn(&device_descriptor_method<19>)},
+    {20, fn(&device_descriptor_method<20>)},
+    {21, fn(&device_descriptor_method<21>)},
+    {22, fn(&device_descriptor_method<22>)},
+    {23, fn(&device_descriptor_method<23>)},
+    {24, fn(&device_descriptor_method<24>)},
     {27, fn(&device_create_committed_resource)},
     {28, fn(&device_create_heap)},
     {29, fn(&device_create_placed_resource)},
@@ -992,6 +1411,7 @@ D3d12Counters d3d12_counters() {
 }
 
 void* create_headless_d3d12_device(const void* iid) {
+  capture_configure();
   if (iid) {
     std::array<uint8_t, 16> id{};
     if (platform::safe_read(reinterpret_cast<uint64_t>(iid), id.data(), 16)) {

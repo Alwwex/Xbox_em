@@ -45,7 +45,7 @@ std::string hex_dump(uint64_t address, size_t length) {
   return out;
 }
 
-uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t ret);
+uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t ret, bool hand_out = true);
 
 template <int Slot>
 uint64_t XBEM_GUEST_ABI probe_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -110,7 +110,7 @@ bool zeroed_stack_out_pointer(uint64_t p) {
 
 std::atomic<int> g_foreign_calls{0};
 
-uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t ret) {
+uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t ret, bool hand_out) {
   if (!self || self->magic != kProbeMagic) {
     // A probe vtable reached with a `this` that is not the object (e.g. an
     // interface pointer at an offset inside it): log, do not touch it.
@@ -140,7 +140,7 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
   // An (interface ID in a loaded image, output pointer) pair: hand out a new probe.
   std::string created;
   // Scanned from the last argument: (riid, ppv) usually ends the list.
-  for (int i = 4; i >= 0; --i) {
+  for (int i = 4; i >= 0 && hand_out; --i) {
     if (!in_read_only_image_data(args[i]) || args[i + 1] < 0x10000 || args[i + 1] >= 0x800000000000ull) continue;
     uint8_t iid[16];
     if (!platform::safe_read(args[i], iid, 16)) continue;
@@ -156,7 +156,7 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
   // Only the last argument that points into the stack is considered (unused
   // argument registers hold leftovers, input structures come first and may
   // start with zero, so they must not be overwritten).
-  if (created.empty()) {
+  if (created.empty() && hand_out) {
     for (int i = 3; i >= 0; --i) {
       if (!in_current_stack(args[i])) continue;
       if (zeroed_stack_out_pointer(args[i])) {
@@ -186,6 +186,11 @@ uint64_t probe_call(ProbeObject* self, int slot, const uint64_t* args, uint64_t 
 }  // namespace
 
 const ProbeVtable& default_probe_vtable() { return probe_vtable(); }
+
+uint64_t probe_dispatch(ProbeObject* self, int slot, const uint64_t* args, uint64_t return_address,
+                        bool hand_out_objects) {
+  return probe_call(self, slot, args, return_address, hand_out_objects);
+}
 
 bool is_interface_id_pointer(uint64_t address) { return in_read_only_image_data(address); }
 

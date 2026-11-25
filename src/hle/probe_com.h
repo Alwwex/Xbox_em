@@ -71,6 +71,13 @@ bool in_current_guest_stack(uint64_t address);
 // Prints the calling thread's recent probe-object calls (crash reports, dumps).
 void print_probe_history(void (*write)(const char*));
 
+// What an untyped probe slot does with a call (logging, and objects handed
+// out by shape unless `hand_out_objects` is false - methods known to return
+// no interface must not have one written into the caller's variables), for
+// typed methods that only observe a call.
+uint64_t probe_dispatch(ProbeObject* self, int slot, const uint64_t* args, uint64_t return_address,
+                        bool hand_out_objects = true);
+
 // Logs a call of a typed method the way probe slots do (first few calls per slot).
 void probe_log(ProbeObject* self, int slot, const std::string& text, uint64_t return_address);
 

@@ -789,6 +789,8 @@ int cmd_run(const Args& args) {
       }
     } else if (a == "--log-reads") {
       opt.log_reads = value();
+    } else if (a == "--capture-commands") {
+      opt.capture_commands = value();
     } else if (a == "--press") {
       opt.press += (opt.press.empty() ? "" : ",") + value();
       hle::parse_gamepad_script(opt.press);  // reports mistakes before the run

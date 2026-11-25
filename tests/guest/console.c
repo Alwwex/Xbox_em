@@ -1256,6 +1256,20 @@ static void test_headless_d3d12(void) {
   CHECK(((CreateCommitted3Fn)VT(device)[127])(device, heap_props, 0x8, tex, 2, 0, 0, 0, 0, resource_iid,
                                               &back_buffer) == 0 && back_buffer);
   CHECK(((GpuVaFn)VT(back_buffer)[11])(back_buffer) != 0);
+
+  /* Descriptors are memory: CreateRenderTargetView (20) / CreateShaderResourceView
+   * (18) write the emulator's 32-byte encoding ("XBDS", kind, resource) at the
+   * handle; copies by the title and CopyDescriptorsSimple (24) carry it. */
+  typedef void (*CreateViewFn)(void*, void*, const void*, uint64_t);
+  typedef void (*CopySimpleFn)(void*, uint32_t, uint64_t, uint64_t, uint32_t);
+  ((CreateViewFn)VT(device)[20])(device, back_buffer, 0, start + 2 * 32);
+  ((CreateViewFn)VT(device)[18])(device, buffer, 0, start + 3 * 32);
+  const uint32_t* rtv = (const uint32_t*)(uintptr_t)(start + 2 * 32);
+  CHECK(rtv[0] == 0x53444258 && ((const uint8_t*)rtv)[4] == 4 && *(void* const*)(rtv + 2) == back_buffer);
+  ((CopySimpleFn)VT(device)[24])(device, 2, start + 10 * 32, start + 2 * 32, 0);
+  const uint32_t* copied = (const uint32_t*)(uintptr_t)(start + 11 * 32);
+  CHECK(memcmp((const void*)(uintptr_t)(start + 10 * 32), rtv, 32) == 0);
+  CHECK(copied[0] == 0x53444258 && ((const uint8_t*)copied)[4] == 2 && *(void* const*)(copied + 2) == buffer);
   /* 76: CreateCommittedResource's seven arguments */
   void* texture76 = 0;
   CHECK(((CreateCommittedFn)VT(device)[76])(device, heap_props, 0, tex, 0, 0, resource_iid, &texture76) == 0 &&
@@ -1326,6 +1340,19 @@ static void test_headless_d3d12(void) {
   lb[0x140] = 1;
   lb[0x141] = 1;
   CHECK(((TopologyFn)VT(list)[20])(list, 0x11) == 0); /* IASetPrimitiveTopology(RECTLIST) */
+  /* Recorded and decoded for --capture-commands (the test runs with a
+   * capture of its whole run): a render target, a draw, Close, then the
+   * console's ExecuteCommandListsX (queue slot 35) and PresentX (32). */
+  typedef void (*OmSetFn)(void*, uint32_t, const uint64_t*, int, const uint64_t*);
+  typedef void (*DrawFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+  typedef HRESULT (*CloseFn)(void*);
+  typedef uint64_t (*ExecuteXFn)(void*, uint64_t, void* const*, uint64_t);
+  const uint64_t rtv_handle = start + 2 * 32;
+  ((OmSetFn)VT(list)[50])(list, 1, &rtv_handle, 0, 0);
+  ((DrawFn)VT(list)[12])(list, 3, 1, 0, 0);
+  CHECK(((CloseFn)VT(list)[9])(list) == 0);
+  void* const lists[1] = {list};
+  ((ExecuteXFn)VT(queue)[35])(queue, 1, lists, 0);
   void* pc_list = 0;
   CHECK(((CreateListFn)VT(device)[12])(device, 0, 0, 0, 0, iid, &pc_list) == 0 && pc_list && pc_list != list);
   CHECK(*(uint64_t*)((uint8_t*)pc_list + 0x18) == *(uint64_t*)((uint8_t*)pc_list + 0x30));

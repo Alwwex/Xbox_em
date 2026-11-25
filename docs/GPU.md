@@ -69,3 +69,29 @@ IASetPrimitiveTopology, 21 RSSetViewports, 22 RSSetScissorRects, 23
 OMSetBlendFactor, 24 OMSetStencilRef, 25 SetPipelineState). Topology values
 are AMD primitive types where the console adds its own: `0x11` is RECTLIST
 (fullscreen passes draw 3 vertices with it); TRILIST is 4 either way.
+
+Slots 32-52 follow the PC order shifted by 4 (measured from the title's
+calls and their argument shapes): 32 SetDescriptorHeaps, 33/34
+Set{Compute,Graphics}RootSignature, 35/36 ...RootDescriptorTable, 37-40
+...Root32BitConstant(s), 41-46 root CBV/SRV/UAV, 47 IASetIndexBuffer, 48
+IASetVertexBuffers, 50 OMSetRenderTargets, 51 ClearDepthStencilView, 52
+ClearRenderTargetView. Slot 9 is Close; the console list is not reset
+through slot 10 (a recording ends at Close). Later slots (70-75, 126, 131,
+139, 142, 146, ...) are console-only and shown by number.
+
+The console queue executes lists through slot 35 (ExecuteCommandListsX(count,
+lists, ...)) and presents through slot 32 once per frame.
+
+`--capture-commands FILE@SECONDS[:MS]` writes, decoded, every list the
+title executes in that window (seconds after device creation): pipelines,
+root signatures, render targets and descriptor tables with the resources
+behind them. Descriptors are 32 bytes of title memory on the console;
+the emulator's CreateXxxView methods write their own encoding there
+("XBDS", kind, resource), so the copies titles make carry the view.
+Not every descriptor is decoded yet: device slots 61 and 70 (console view
+creation) still leave theirs unwritten.
+
+A frame of GTA VI's main loop at about 90 s (`--press A@45`): a compute pass,
+then UI meshes (30-4,500 indices, a 2048x2048 A8 font atlas) into a
+3840x2160 RGBA8 target with depth, copied by a fullscreen RECTLIST draw into
+the display texture - a loading or menu screen, about 170 commands.
