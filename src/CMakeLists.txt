@@ -39,6 +39,7 @@ add_library(xbem_core STATIC
   hle/texture_layout.cpp
   gpu/gl_backend.cpp
   gpu/translate.cpp
+  hle/d3d12_render.cpp
   hle/xg.cpp
   hle/dstorage.cpp
   hle/user32.cpp
@@ -90,7 +91,7 @@ if(XBEM_VULKAN_INCLUDE AND NOT WIN32)
   target_include_directories(xbem_core PUBLIC ${XBEM_VULKAN_INCLUDE})
   target_compile_definitions(xbem_core PUBLIC XBEM_HAVE_VULKAN=1)
   # Vulkan structures are filled field by field after {sType}.
-  set_source_files_properties(gpu/vk/vk_core.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+  set_source_files_properties(gpu/vk/vk_core.cpp hle/d3d12_render.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 endif()
 
 add_executable(xbem

@@ -580,7 +580,7 @@ class Translator {
                     "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n"
                     "#extension GL_EXT_nonuniform_qualifier : require\n"
                     "layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };\n"
-                    "layout(push_constant) uniform Push { uint64_t data; } pc;\n"
+                    "%PUSH%"
                     "layout(set = 0, binding = 0) uniform texture2D textures[];\n"
                     "layout(set = 0, binding = 1) uniform sampler samplers[];\n"
                     "uint D(uint i) { return Words(pc.data).w[i]; }\n"
@@ -590,6 +590,12 @@ class Translator {
                     "  if (sh == 0u) return w0;\n"
                     "  return (w0 >> sh) | (Words(al).w[1] << (32u - sh));\n"
                     "}\n";
+    // Push constants: the vertex stage's per-draw words at offset 0, the pixel stage's at 8.
+    const size_t push = g.find("%PUSH%");
+    g.replace(push, 6,
+              out_.stage == ShaderStage::Vertex
+                  ? "layout(push_constant) uniform Push { uint64_t data; } pc;\n"
+                  : "layout(push_constant) uniform Push { layout(offset = 8) uint64_t data; } pc;\n");
     if (out_.stage == ShaderStage::Vertex) {
       for (uint32_t k = 0; k < out_.outputs; ++k) g += std::format("layout(location = {}) out vec4 o_{};\n", k, k);
     } else {

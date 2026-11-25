@@ -26,6 +26,7 @@
 #include <fstream>
 #include <format>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <thread>
@@ -33,6 +34,7 @@
 
 #include "gpu/root_signature.h"
 #include "hle/d3d12_device.h"
+#include "hle/d3d12_internal.h"
 #include "hle/discovery.h"
 #include "hle/heap.h"
 #include "hle/hle_util.h"
@@ -42,6 +44,8 @@
 #include "platform/window.h"
 
 namespace xbem::hle {
+using namespace d3d12;
+
 namespace {
 
 using namespace win;
@@ -255,12 +259,19 @@ uint64_t XBEM_GUEST_ABI queue_method(ProbeObject* self, uint64_t a0, uint64_t a1
 // ...) - the title's command lists go through it; 32 is called once per frame
 // with plane descriptions (PresentX). Both keep the probe's logging.
 void capture_marker(ProbeObject* queue, const char* what);
+void render_lists(uint64_t count, uint64_t lists);
 template <int Slot>
 uint64_t XBEM_GUEST_ABI queue_console_method(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                                              uint64_t a5, uint64_t a6) {
   const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
-  if (Slot == 35 && a1 >= 1 && a1 <= 256) capture_execute(self, a1, a2);
-  if (Slot == 32) capture_marker(self, "PresentX (queue slot 32)");
+  if (Slot == 35 && a1 >= 1 && a1 <= 256) {
+    capture_execute(self, a1, a2);
+    if (render_active()) render_lists(a1, a2);
+  }
+  if (Slot == 32) {
+    capture_marker(self, "PresentX (queue slot 32)");
+    if (render_active()) render_present();
+  }
   return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS(), false);
 }
 
@@ -275,13 +286,6 @@ const ProbeVtable g_queue_vtable = make_queue_vtable(std::make_integer_sequence<
 
 // ------------------------------------------------------------ resource
 
-struct ResourceState {
-  uint8_t desc[56] = {};  // D3D12_RESOURCE_DESC
-  uint64_t gpu_va = 0;
-  uint64_t size = 0;
-  void* cpu = nullptr;
-  std::mutex mutex;
-};
 
 // Bytes of a D3D12_RESOURCE_DESC in the emulator's linear texture layout
 // (hle/texture_layout.h). Tiled console layouts pad more, which the title's
@@ -370,7 +374,6 @@ struct DescriptorHeapState {
   uint64_t cpu = 0;
   uint64_t gpu = 0;
 };
-constexpr uint32_t kDescriptorSize = 32;
 
 // ID3D12DescriptorHeap: 8 GetDesc (hidden return), 9 GetCPUDescriptorHandleForHeapStart,
 // 10 GetGPUDescriptorHandleForHeapStart. The console's D3D12.X returns the
@@ -387,6 +390,9 @@ uint64_t XBEM_GUEST_ABI heap_get_cpu_start(ProbeObject* self) {
 uint64_t XBEM_GUEST_ABI heap_get_gpu_start(ProbeObject* self) {
   return static_cast<DescriptorHeapState*>(self->state)->gpu;
 }
+std::mutex g_display_mutex;
+std::set<const ResourceState*> g_display_resources;
+
 const ProbeVtable g_heap_vtable = make_vtable({{8, fn(&heap_get_desc)},
                                                {9, fn(&heap_get_cpu_start)},
                                                {10, fn(&heap_get_gpu_start)}});
@@ -411,9 +417,7 @@ const void* XBEM_GUEST_ABI deserializer_get_desc(ProbeObject* self) {
 const ProbeVtable g_deserializer_vtable = make_vtable({{3, fn(&deserializer_get_desc)}});
 
 // ID3D12RootSignature: the parsed signature, kept for pipeline creation.
-struct RootSignatureState {
-  gpu::RootSignature rs;
-};
+const ProbeVtable g_root_signature_vtable = make_vtable({});
 
 // -------------------------------------------------------------- device
 
@@ -436,11 +440,6 @@ HRESULT create_into(void* object, void** out) {
 // (SetDescriptorHeaps, PC 28) - measured from the title's calls up to 52
 // (ClearRenderTargetView); later and console-only slots are shown by number.
 
-struct RecordedCommand {
-  int slot;
-  uint64_t args[6];
-  std::string text;
-};
 struct ListRecord {
   std::mutex mutex;
   std::vector<RecordedCommand> commands;
@@ -505,16 +504,6 @@ void capture_configure() {
 // handles are the same addresses). The emulator writes its own encoding into
 // those bytes, so copies made by the title or by CopyDescriptors carry the
 // view along and a descriptor table can be decoded wherever it ends up.
-struct XbemDescriptor {
-  uint32_t magic;  // "XBDS"
-  uint8_t kind;    // DescriptorKind
-  uint8_t pad[3];
-  uint64_t object;  // the resource (a probe object), or 0
-  uint64_t a, b;    // CBV: address and size; views: the view description's first bytes
-};
-static_assert(sizeof(XbemDescriptor) == 32);
-constexpr uint32_t kDescriptorMagic = 0x53444258;
-enum DescriptorKind : uint8_t { kCbv = 1, kSrv, kUav, kRtv, kDsv, kSampler };
 const char* const kDescriptorKindNames[] = {"?", "CBV", "SRV", "UAV", "RTV", "DSV", "sampler"};
 
 std::string describe_resource(uint64_t p);
@@ -666,6 +655,48 @@ std::string decode_command(int slot, const uint64_t* a) {
 
 ListRecord* list_record_of(ProbeObject* self) { return static_cast<ListRecord*>(self->state); }
 
+// What the renderer needs from a call's pointer arguments, copied while
+// they are valid (they often point at the caller's stack).
+void snapshot_command(RecordedCommand& c) {
+  const uint64_t* a = c.args;
+  const auto copy = [&](uint64_t address, size_t size) {
+    const size_t at = c.blob.size();
+    c.blob.resize(at + size);
+    if (!address || !platform::safe_read(address, c.blob.data() + at, size)) std::memset(c.blob.data() + at, 0, size);
+  };
+  const auto u32 = [&](int i) { return static_cast<uint32_t>(a[i]); };
+  switch (c.slot) {
+    case 21: copy(a[1], std::min<uint32_t>(u32(0), 16) * 24); break;  // viewports
+    case 22: copy(a[1], std::min<uint32_t>(u32(0), 16) * 16); break;  // scissor rects
+    case 23: copy(a[0], 16); break;                                   // blend factor
+    case 39:
+    case 40: copy(a[2], std::min<uint32_t>(u32(1), 64) * 4); break;    // root constants
+    case 47: copy(a[0], 16); break;                                   // index buffer view
+    case 48: copy(a[2], std::min<uint32_t>(u32(1), 32) * 16); break;  // vertex buffer views
+    case 32: copy(a[1], std::min<uint32_t>(u32(0), 4) * 8); break;    // descriptor heaps
+    case 50: {  // render target descriptors (32 bytes each), then the DSV's
+      const uint32_t n = std::min<uint32_t>(u32(0), 8);
+      const bool contiguous = static_cast<uint8_t>(a[2]) != 0;
+      for (uint32_t i = 0; i < n && a[1]; ++i) {
+        uint64_t handle = 0;
+        platform::safe_read(contiguous ? a[1] : a[1] + i * 8, &handle, 8);
+        if (contiguous) handle += i * kDescriptorSize;
+        copy(handle, kDescriptorSize);
+      }
+      uint64_t dsv = 0;
+      if (a[3]) platform::safe_read(a[3], &dsv, 8);
+      copy(dsv, kDescriptorSize);
+      break;
+    }
+    case 51: copy(a[0], kDescriptorSize); break;
+    case 52:
+      copy(a[0], kDescriptorSize);
+      copy(a[1], 16);
+      break;
+    default: break;
+  }
+}
+
 void record_command(ProbeObject* self, int slot, const uint64_t* args) {
   ListRecord* r = list_record_of(self);
   if (!r) return;
@@ -675,9 +706,12 @@ void record_command(ProbeObject* self, int slot, const uint64_t* args) {
     r->closed = false;
   }
   if (slot == 9) r->closed = true;
-  if (!g_capture_recording.load(std::memory_order_relaxed)) return;
-  RecordedCommand c{slot, {}, decode_command(slot, args)};
+  const bool capture = g_capture_recording.load(std::memory_order_relaxed);
+  const bool render = render_active();
+  if (!capture && !render) return;
+  RecordedCommand c{slot, {}, capture ? decode_command(slot, args) : std::string(), {}};
   std::memcpy(c.args, args, sizeof c.args);
+  if (render) snapshot_command(c);
   r->commands.push_back(std::move(c));
 }
 
@@ -740,6 +774,22 @@ void capture_execute(ProbeObject* queue, uint64_t count, uint64_t lists) {
   g_capture.out.flush();
 }
 
+// Hands the commands of executed lists to the renderer.
+void render_lists(uint64_t count, uint64_t lists) {
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t p = read_guest<uint64_t>(lists + i * 8);
+    if (!is_probe_object(p)) continue;
+    ListRecord* r = list_record_of(reinterpret_cast<ProbeObject*>(p));
+    if (!r) continue;
+    std::vector<RecordedCommand> commands;
+    {
+      std::lock_guard lock(r->mutex);
+      commands = r->commands;
+    }
+    render_execute(commands);
+  }
+}
+
 void capture_marker(ProbeObject* queue, const char* what) {
   if (!g_capture_recording.load(std::memory_order_relaxed)) return;
   const auto now = std::chrono::steady_clock::now();
@@ -748,6 +798,22 @@ void capture_marker(ProbeObject* queue, const char* what) {
   g_capture.out << std::format(
       "== {} {} at +{} ms\n", queue->name, what,
       std::chrono::duration_cast<std::chrono::milliseconds>(now - g_capture.origin).count());
+}
+
+// A resource object for memory at `address` described by the
+// D3D12_RESOURCE_DESC at `desc` (views created by address, slot 70); one per
+// address and description.
+void* resource_at(uint64_t address, uint64_t desc) {
+  static std::mutex lock;
+  static std::map<std::pair<uint64_t, uint64_t>, void*> resources;
+  uint8_t d[56] = {};
+  platform::safe_read(desc, d, sizeof d);
+  uint64_t h = 1469598103934665603ull;
+  for (uint8_t b : d) h = (h ^ b) * 1099511628211ull;
+  std::lock_guard guard(lock);
+  void*& r = resources[{address, h}];
+  if (!r) r = new_resource(child_name("view_resource"), reinterpret_cast<const uint8_t*>(desc), address);
+  return r;
 }
 
 // Device descriptor creation (PC order, measured shapes): 17 CBV(desc, handle),
@@ -765,20 +831,32 @@ uint64_t XBEM_GUEST_ABI device_descriptor_method(ProbeObject* self, uint64_t a1,
     return std::pair{v[0], v[1]};
   };
   switch (Slot) {
-    case 17: {
+    case 17: {  // a real RDNA2 buffer descriptor (V#), as the title writes them itself
       uint64_t cbv[2] = {};
       if (a1) platform::safe_read(a1, cbv, sizeof cbv);
-      write_descriptor(a2, kCbv, 0, cbv[0], static_cast<uint32_t>(cbv[1]));
+      const uint32_t v[8] = {static_cast<uint32_t>(cbv[0]), static_cast<uint32_t>(cbv[0] >> 32) & 0xffff,
+                             static_cast<uint32_t>(cbv[1]), 0x0002403c, 0, 0, 0, 0};
+      platform::safe_write(a2, v, sizeof v);
       break;
     }
     case 18: { auto [x, y] = view(a2); write_descriptor(a3, kSrv, a1, x, y); break; }
     case 19: { auto [x, y] = view(a3); write_descriptor(a4, kUav, a1, x, y); break; }
     case 20: { auto [x, y] = view(a2); write_descriptor(a3, kRtv, a1, x, y); break; }
     case 21: { auto [x, y] = view(a2); write_descriptor(a3, kDsv, a1, x, y); break; }
-    case 22: write_descriptor(a2, kSampler, 0); break;
+    case 22: {  // an S# (16 bytes): address modes and filters of the D3D12_SAMPLER_DESC
+      uint32_t d[4] = {};
+      if (a1) platform::safe_read(a1, d, sizeof d);
+      static const uint32_t kClamp[] = {2, 0, 1, 2, 6, 3};  // D3D12 address mode -> SQ_TEX_CLAMP
+      const auto clamp = [&](uint32_t m) { return m < 6 ? kClamp[m] : 2u; };
+      const uint32_t filter = d[0];
+      const uint32_t mag = (filter & 0x4) ? 1 : 0, min = (filter & 0x10) ? 1 : 0;
+      const uint32_t s[4] = {clamp(d[1]) | (clamp(d[2]) << 3) | (clamp(d[3]) << 6), 0, (mag << 20) | (min << 22), 0};
+      platform::safe_write(a2, s, sizeof s);
+      break;
+    }
     case 24:  // CopyDescriptorsSimple(count, dst, src, type): the bytes move, as on the console
       if (a1 && a1 <= (1u << 20)) {
-        std::vector<uint8_t> bytes(a1 * kDescriptorSize);
+        std::vector<uint8_t> bytes(a1 * (a4 == 1 ? kSamplerDescriptorSize : kDescriptorSize));
         if (platform::safe_read(a3, bytes.data(), bytes.size())) platform::safe_write(a2, bytes.data(), bytes.size());
       }
       break;
@@ -798,6 +876,42 @@ uint64_t XBEM_GUEST_ABI device_descriptor_method(ProbeObject* self, uint64_t a1,
         platform::safe_write(start, all.data() + at, n * kDescriptorSize);
         at += n * kDescriptorSize;
       }
+      break;
+    }
+    case 70: {  // CreateShaderResourceViewX(resource desc, view desc + GPU address at +0x28, handle)
+      uint8_t view[48] = {};
+      platform::safe_read(a2, view, sizeof view);
+      uint32_t format, dimension;
+      uint64_t address;
+      std::memcpy(&format, view, 4);
+      std::memcpy(&dimension, view + 4, 4);
+      std::memcpy(&address, view + 0x28, 8);
+      if (dimension == 1) {  // buffer: a V# over the viewed elements
+        uint64_t first;
+        uint32_t count, stride, flags;
+        std::memcpy(&first, view + 0x10, 8);
+        std::memcpy(&count, view + 0x18, 4);
+        std::memcpy(&stride, view + 0x1c, 4);
+        std::memcpy(&flags, view + 0x20, 4);
+        const uint32_t element = stride ? stride : std::max<uint32_t>(format_info(format).bytes, (flags & 1) ? 4 : 1);
+        const uint64_t base = address + first * element;
+        const uint32_t v[8] = {static_cast<uint32_t>(base),
+                               (static_cast<uint32_t>(base >> 32) & 0xffff) | ((stride & 0x3fff) << 16),
+                               stride ? count : count * element, 0x0002403c, 0, 0, 0, 0};
+        platform::safe_write(a3, v, sizeof v);
+      } else {  // a texture at an address: the emulator's descriptor naming a resource for it
+        write_descriptor(a3, kSrv, reinterpret_cast<uint64_t>(resource_at(address, a1)), 0, 0);
+      }
+      break;
+    }
+    case 61: {  // CreateSamplerX(desc, handle, ...): filter and address modes as D3D12_SAMPLER_DESC
+      uint32_t d[4] = {};
+      platform::safe_read(a1, d, sizeof d);
+      static const uint32_t kClamp[] = {2, 0, 1, 2, 6, 3};
+      const auto clamp = [&](uint32_t m) { return m < 6 ? kClamp[m] : 2u; };
+      const uint32_t mag = (d[0] & 0x4) ? 1 : 0, min = (d[0] & 0x10) ? 1 : 0;
+      const uint32_t sharp[4] = {clamp(d[1]) | (clamp(d[2]) << 3) | (clamp(d[3]) << 6), 0, (mag << 20) | (min << 22), 0};
+      platform::safe_write(a2, sharp, sizeof sharp);
       break;
     }
     default: break;
@@ -1080,7 +1194,11 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   return create_into(make_probe_object(child_name("descriptor_heap"), &g_heap_vtable, state), out);
 }
 
-UINT XBEM_GUEST_ABI device_get_descriptor_increment(ProbeObject*, uint32_t) { return kDescriptorSize; }
+// 15 GetDescriptorHandleIncrementSize(type): samplers are 16-byte S#s (the
+// title's shaders index sampler heaps by 16), every other view 32 bytes.
+UINT XBEM_GUEST_ABI device_get_descriptor_increment(ProbeObject*, uint32_t type) {
+  return type == 1 ? kSamplerDescriptorSize : kDescriptorSize;
+}
 
 // 27 CreateCommittedResource(heapProps, flags, desc, state, clear, riid, ppv)
 HRESULT XBEM_GUEST_ABI device_create_committed_resource(ProbeObject* self, const void*, uint32_t, const uint8_t* desc,
@@ -1153,7 +1271,7 @@ HRESULT XBEM_GUEST_ABI device_create_root_signature(ProbeObject* self, uint32_t,
                : std::format("CreateRootSignature({} bytes): not parsed ({}) - kept as an opaque signature", size,
                              error),
             XBEM_RETURN_ADDRESS());
-  return create_into(make_probe_object(child_name("root_signature"), nullptr, state), out);
+  return create_into(make_probe_object(child_name("root_signature"), &g_root_signature_vtable, state), out);
 }
 
 // 25 GetResourceAllocationInfo(visibleMask, numDescs, descs) -> {SizeInBytes, Alignment},
@@ -1335,7 +1453,11 @@ HRESULT XBEM_GUEST_ABI device_create_texture_x(ProbeObject* self, const void* he
   // The first 2D texture with D3D12_HEAP_FLAG_ALLOW_DISPLAY (0x8) is a back
   // buffer: the run window shows it.
   static std::atomic<bool> have_display_surface{false};
-  if (resource && (heap_flags & 0x8) && d[0] == 3 && !have_display_surface.exchange(true)) {
+  if (resource && (heap_flags & 0x8) && d[0] == 3) {
+    std::lock_guard lock(g_display_mutex);
+    g_display_resources.insert(static_cast<ResourceState*>(static_cast<ProbeObject*>(resource)->state));
+  }
+  if (resource && (heap_flags & 0x8) && d[0] == 3 && !render_active() && !have_display_surface.exchange(true)) {
     const auto* r = static_cast<ResourceState*>(static_cast<ProbeObject*>(resource)->state);
     const FormatInfo fi = format_info(f);
     const uint64_t pitch = (w * fi.bytes + 255) & ~255ull;
@@ -1442,6 +1564,8 @@ const ProbeVtable g_device_vtable = make_vtable({
     {22, fn(&device_descriptor_method<22>)},
     {23, fn(&device_descriptor_method<23>)},
     {24, fn(&device_descriptor_method<24>)},
+    {61, fn(&device_descriptor_method<61>)},
+    {70, fn(&device_descriptor_method<70>)},
     {27, fn(&device_create_committed_resource)},
     {28, fn(&device_create_heap)},
     {29, fn(&device_create_placed_resource)},
@@ -1469,12 +1593,48 @@ const ProbeVtable g_device_vtable = make_vtable({
 
 }  // namespace
 
+namespace d3d12 {
+bool descriptor_heap_of(uint64_t p, uint64_t& start, uint32_t& type) {
+  if (!is_probe_object(p)) return false;
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  if (o->vtable != g_heap_vtable.data()) return false;
+  const auto* h = static_cast<DescriptorHeapState*>(o->state);
+  start = h->gpu;
+  std::memcpy(&type, h->desc, 4);
+  return true;
+}
+bool is_display_resource(const ResourceState* r) {
+  std::lock_guard lock(g_display_mutex);
+  return g_display_resources.count(r) != 0;
+}
+bool is_probe_object(uint64_t p) {
+  uint64_t magic = 0;
+  return p >= 0x10000 && (p & 7) == 0 && platform::safe_read(p + 8, &magic, 8) && magic == kProbeMagic;
+}
+ResourceState* resource_of(uint64_t p) {
+  if (!is_probe_object(p)) return nullptr;
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  return o->vtable == g_resource_vtable.data() ? static_cast<ResourceState*>(o->state) : nullptr;
+}
+GraphicsPipeline* graphics_pipeline_of(uint64_t p) {
+  if (!is_probe_object(p)) return nullptr;
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  return o->vtable == g_graphics_pso_vtable.data() ? static_cast<GraphicsPipeline*>(o->state) : nullptr;
+}
+const gpu::RootSignature* root_signature_of(uint64_t p) {
+  if (!is_probe_object(p)) return nullptr;
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  return o->vtable == g_root_signature_vtable.data() ? &static_cast<RootSignatureState*>(o->state)->rs : nullptr;
+}
+}  // namespace d3d12
+
 D3d12Counters d3d12_counters() {
   return {g_frame_token.load() - 1, g_command_lists.load(), g_draws.load(), g_dispatches.load()};
 }
 
 void* create_headless_d3d12_device(const void* iid) {
   capture_configure();
+  render_start();
   if (iid) {
     std::array<uint8_t, 16> id{};
     if (platform::safe_read(reinterpret_cast<uint64_t>(iid), id.data(), 16)) {
