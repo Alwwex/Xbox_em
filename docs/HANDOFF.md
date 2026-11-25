@@ -161,6 +161,19 @@ decryption). Suspects:
   notification we never deliver. Next: find what calls 0x1d4b3c0 and why it
   stops; check 0x2217cc0/0x2217d50 callers (likely a system/PLM event pump).
 
+### Also seen once the loading gets past the watchdog (timing dependent)
+
+- SIGSEGV at +0x4eec964 (thread ~368, called from 0x248c6b0 / 0x390a4f,
+  command list building): a vector load from an address no allocation
+  covers (computed from a physical-page region 0x...fd1f0000+0x1b00000).
+- Then an unhandled C++ exception (0xe06d7363) thrown in
+  XboxBvhBuilder.dll (frames +0xca0d, +0xd4a5, +0xe786, +0x216e1, called
+  from game +0xfe4ff2): the raytracing acceleration-structure builder. The
+  emulator implements no DXR (prebuild info, BVH memory, its compute PSOs
+  are probe objects). Next: log what XboxBvhBuilder asks the device for
+  (GetRaytracingAccelerationStructurePrebuildInfo and friends) and answer
+  plausibly, or make the builder's work a no-op.
+
 ## DirectStorage request layout (measured on GTA VI)
 
 `w0` options (low byte: compression 0 none, 1 zlib, 2 and 14 unknown -
