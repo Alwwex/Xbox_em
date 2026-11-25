@@ -1248,6 +1248,11 @@ static void test_headless_d3d12(void) {
   *(uint16_t*)(tex + 30) = 0;
   *(uint32_t*)(tex + 32) = 71; /* BC1_UNORM */
   CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, tex) == info && info[0] == 0x10000);
+  /* The same texture asking for 4 KiB alignment (a small resource, as GTA VI
+   * asks for its small textures): size in 4 KiB units, 4 KiB alignment. */
+  *(uint64_t*)(tex + 8) = 0x1000;
+  CHECK(((AllocInfoFn)VT(device)[25])(info, device, 1, 1, tex) == info && info[0] == 0xD000 && info[1] == 0x1000);
+  *(uint64_t*)(tex + 8) = 0;
   uint8_t got[56] = {0};
   CHECK(((GetDescFn)VT(buffer)[10])(got, buffer) == got && got[0] == 1 && *(uint64_t*)(got + 16) == 4096);
   uint8_t got_pc[56] = {0};

@@ -1341,8 +1341,19 @@ void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a
     uint32_t samples;
     std::memcpy(&samples, d + 36, 4);
     if (samples > 1) align = std::max<uint64_t>(align, 4ull << 20);  // MSAA: 4 MiB placement alignment
-    alignment = std::max<uint64_t>(alignment, align);
-    size = ((size + alignment - 1) & ~(alignment - 1)) + ((resource_size(d) + 0xFFFF) & ~0xFFFFull);
+    // Small resources (D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT): a texture
+    // that asks for 4 KiB alignment, is not a render target or depth buffer
+    // and fits in 64 KiB gets 4 KiB alignment and a size in 4 KiB units.
+    const uint64_t bytes = resource_size(d);
+    const bool small = count == 1 && align == 0x1000 && d[0] != 1 && samples <= 1 && !(d[48] & 0x3) &&
+                       ((bytes + 0xFFF) & ~0xFFFull) <= 0x10000;
+    if (small) {
+      alignment = 0x1000;
+      size = (bytes + 0xFFF) & ~0xFFFull;
+    } else {
+      alignment = std::max<uint64_t>(alignment, align);
+      size = ((size + alignment - 1) & ~(alignment - 1)) + ((bytes + 0xFFFF) & ~0xFFFFull);
+    }
     if (i < 2) {
       uint64_t w;
       uint32_t h, f;
@@ -1352,8 +1363,10 @@ void* XBEM_GUEST_ABI device_get_resource_allocation_info(uint64_t a0, uint64_t a
       std::memcpy(&a, d + 28, 2);
       std::memcpy(&mip, d + 30, 2);
       std::memcpy(&f, d + 32, 4);
-      what += std::format(" [dim {} {}x{}x{} mips {} format {} samples {} flags {:#x}]", d[0], w, h, a, mip, f,
-                          samples, d[48]);
+      uint64_t asked;
+      std::memcpy(&asked, d + 8, 8);
+      what += std::format(" [dim {} {}x{}x{} mips {} format {} samples {} flags {:#x} align {:#x} layout {:#x}]", d[0], w, h,
+                          a, mip, f, samples, d[48], asked, d[44]);
     }
   }
   const uint64_t result[2] = {ok ? size : ~0ull, ok ? alignment : 0};
