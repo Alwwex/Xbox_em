@@ -142,8 +142,24 @@ decryption). Suspects:
   (GetResourceTiling: our D3D12 standard tile shapes / packed-mip rule may
   differ from the console's for some formats or non-square textures) and
   from GetResourceAllocationInfo sizes (linear layout, not RDNA2 tiled).
-- Find which heartbeat entry expires: dump 0x146844a20 at the crash (the
-  entry index ebx/rdi at 0x142215c0c) and look up who writes it.
+- Watchdog logic (fn 0x2215a60, one tick per Sleep(1000)): timed
+  operations are registered by fn 0xb5b6b0 and ended by 0xb5b6f0 (counter
+  [0x1471b6334], entries in 0x146844a20). A tick that sees an operation
+  running checks its age (threshold float [0x146159e20]) and syncs r15 with
+  the heartbeat time [0x1471b6338]. After that, every tick without a running
+  operation counts down from 30; at 0 it crashes (the path taken here,
+  0x2215c76 -> 0x2215c16). The heartbeat only moves on events 0x24/0x25
+  delivered to callback 0x1422159c0 by the event dispatcher 0x2217b80
+  (callers 0x2217cc0, 0x2217d50, 0x2218180, 0x22185a0, 0x59dcbd0) - never
+  called in our runs - or when a Sleep(1000) tick takes longer than
+  [0x146159bd4] seconds. Only 25 operations are registered in a whole run
+  (callers 0x1d4b3c0 +0x8e/+0xb9/+0xe1 via 0xb59e40, and a few others), so
+  after the first long one during loading the countdown runs out.
+  Either the title normally registers operations much more often (a
+  per-frame path that does not run during our loading - frames drop from 60
+  to 20 per second at that time), or the events come from a system
+  notification we never deliver. Next: find what calls 0x1d4b3c0 and why it
+  stops; check 0x2217cc0/0x2217d50 callers (likely a system/PLM event pump).
 
 ## DirectStorage request layout (measured on GTA VI)
 
