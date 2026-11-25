@@ -12,6 +12,7 @@ typedef uint16_t wchar;
 IMP int __stdio_common_vsprintf(uint64_t options, char* buf, size_t n, const char* fmt, void* locale, va_list ap);
 IMP int __stdio_common_vswprintf(uint64_t options, wchar* buf, size_t n, const wchar* fmt, void* locale, va_list ap);
 IMP int __stdio_common_vsscanf(uint64_t options, const char* in, size_t n, const char* fmt, void* locale, va_list ap);
+IMP int __stdio_common_vswscanf(uint64_t options, const wchar* in, size_t n, const wchar* fmt, void* locale, va_list ap);
 IMP void* fopen(const char*, const char*);
 IMP int fclose(void*);
 IMP size_t fwrite(const void*, size_t, size_t, void*);
@@ -102,6 +103,14 @@ static int scan(const char* in, const char* f, ...) {
   return r;
 }
 
+static int wscan(const wchar* in, const wchar* f, ...) {
+  va_list ap;
+  va_start(ap, f);
+  int r = __stdio_common_vswscanf(0, in, (size_t)-1, f, 0, ap);
+  va_end(ap);
+  return r;
+}
+
 static int cmp_desc(const void* a, const void* b) { return *(const int*)b - *(const int*)a; }
 static int cmp_asc(const void* a, const void* b) { return *(const int*)a - *(const int*)b; }
 
@@ -140,6 +149,14 @@ DWORD guest_main(void* peb) {
   unsigned hex = 0;
   CHECK(scan("ff", "%x", &hex) == 1 && hex == 255);
   CHECK(scan("", "%d", &i) == -1);
+  /* %n: characters consumed so far, not counted (GTA VI parses "~0~" icon
+   * tokens in text this way and advances by the count) */
+  int consumed = -1;
+  CHECK(scan("  12ab", "%d%n", &i, &consumed) == 1 && i == 12 && consumed == 4);
+  wchar open_c = 0, close_c = 0;
+  consumed = -1;
+  CHECK(wscan(W("~7~ to run"), W("%lc%d%lc%n"), &open_c, &i, &close_c, &consumed) == 3);
+  CHECK(open_c == '~' && i == 7 && close_c == '~' && consumed == 3);
 
   /* ---- conversions with Windows integer sizes ---- */
   *_errno() = 0;

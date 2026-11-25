@@ -64,12 +64,17 @@ void set_backtrace_printer(BacktracePrinter printer);
 //
 // Options: a condition limits logging and recording to hits where a register
 // equals (or differs from) a value; memory ranges are dumped with each logged
-// hit, at register + offset or at [register + offset] + offset.
+// hit, at register + offset or at [register + offset] + offset (up to four
+// brackets deep: [[register + offset] + offset] + offset).
 struct TraceMemory {
   int reg = -1;           // unwind-code register number (0 RAX .. 15 R15); -1 = unused
   bool indirect = false;  // address = [reg + inner] + outer, otherwise reg + outer
   int64_t inner = 0;
   int64_t outer = 0;
+  // Deeper levels, "[[reg + inner] + deeper[0]] + outer" and so on: after
+  // the first load, each of `levels` more pointers is loaded at pointer + deeper[i].
+  int levels = 0;
+  int64_t deeper[3] = {};
   uint32_t length = 64;   // at most 1024
   char text[48] = {};     // as written, for the log
 };
@@ -87,7 +92,8 @@ struct TracepointOptions {
   TraceMemory arm_at;
 };
 bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions& options = TracepointOptions{});
-void set_tracepoint_log_hits(int hits);
+// Logs matched hits skip+1 .. skip+hits of each tracepoint as they happen.
+void set_tracepoint_log_hits(int hits, uint64_t skip = 0);
 
 // Data watchpoints (run --watch). The page holding [address, address +
 // length) becomes read-only; a write into the range is logged (writing

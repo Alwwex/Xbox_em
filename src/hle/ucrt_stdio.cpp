@@ -288,6 +288,7 @@ bool is_space(C c) {
 template <class C>
 int scan_impl(const C* in, const C* f, ArgReader& args, bool secure) {
   constexpr bool kWideFn = sizeof(C) == 2;
+  const C* const start = in;
   int assigned = 0;
   bool any_conversion = false;
   while (*f) {
@@ -337,7 +338,15 @@ int scan_impl(const C* in, const C* f, ArgReader& args, bool secure) {
     if (!conv) break;
     if (conv != 'c' && conv != 'C' && conv != '[' && conv != 'n') while (is_space(*in)) ++in;
     if (conv == 'n') {
-      if (!suppress) *args.next_ptr<int32_t>() = 0;  // position tracking omitted
+      // Characters consumed so far (not counted as an assignment).
+      if (!suppress) {
+        const int64_t consumed = in - start;
+        void* target = args.next_ptr<void>();
+        if (is_64bit(len)) std::memcpy(target, &consumed, 8);
+        else if (len == Len::hh) *static_cast<int8_t*>(target) = static_cast<int8_t>(consumed);
+        else if (len == Len::h) *static_cast<int16_t*>(target) = static_cast<int16_t>(consumed);
+        else *static_cast<int32_t*>(target) = static_cast<int32_t>(consumed);
+      }
       continue;
     }
     if (!*in) return any_conversion ? assigned : -1;

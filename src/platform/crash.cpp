@@ -517,6 +517,7 @@ Tracepoint g_tracepoints[kMaxTracepoints];
 std::atomic<int> g_tracepoint_count{0};
 std::atomic<uint64_t> g_trace_seq{0};
 int g_trace_log_hits = 8;
+uint64_t g_trace_skip_hits = 0;  // matched hits before logging starts
 thread_local int t_trace_step = -1;  // tracepoint this thread is single-stepping over
 
 void put_code_byte(uint64_t address, uint8_t value) { *reinterpret_cast<volatile uint8_t*>(address) = value; }
@@ -550,6 +551,8 @@ bool operand_address(const TraceMemory& m, const uint64_t* gpr, uint64_t& addres
   if (!m.indirect) return true;
   uint64_t pointer = 0;
   if (!safe_read(gpr[m.reg] + static_cast<uint64_t>(m.inner), &pointer, 8)) return false;
+  for (int i = 0; i < m.levels; ++i)
+    if (!safe_read(pointer + static_cast<uint64_t>(m.deeper[i]), &pointer, 8)) return false;
   address = pointer + static_cast<uint64_t>(m.outer);
   return true;
 }
@@ -610,11 +613,11 @@ void record_hit(Tracepoint& t, const greg_t* g) {
   safe_read(h.gpr[4], &h.ret, 8);
   h.seq = g_trace_seq.fetch_add(1) + 1;
   if (o.arm_watch >= 0 && !t.armed_watch.exchange(true)) arm_watch_from_hit(t, h, n);
-  if (!o.quiet && m <= static_cast<uint64_t>(g_trace_log_hits)) {
+  if (!o.quiet && m > g_trace_skip_hits && m - g_trace_skip_hits <= static_cast<uint64_t>(g_trace_log_hits)) {
     lock_print();
     char head[300];
     std::snprintf(head, sizeof head, "[trace] %s hit %llu%s\n", t.label, static_cast<unsigned long long>(n),
-                  m == static_cast<uint64_t>(g_trace_log_hits) ? " (later hits are counted, not logged)" : "");
+                  m - g_trace_skip_hits == static_cast<uint64_t>(g_trace_log_hits) ? " (later hits are counted, not logged)" : "");
     write_str(head);
     write_hit(t, h, "  ");
     write_memory_dumps(t, h.gpr);
@@ -1243,7 +1246,10 @@ bool add_tracepoint(uint64_t address, const char* label, const TracepointOptions
   return true;
 }
 
-void set_tracepoint_log_hits(int hits) { g_trace_log_hits = hits < 0 ? 0 : hits; }
+void set_tracepoint_log_hits(int hits, uint64_t skip) {
+  g_trace_log_hits = hits < 0 ? 0 : hits;
+  g_trace_skip_hits = skip;
+}
 
 bool add_watchpoint(uint64_t address, uint32_t length, const char* label) {
   const int i = g_watchpoint_count.load();

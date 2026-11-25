@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <fstream>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <map>
@@ -288,6 +289,11 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       platform::safe_read(w[1], at_w1, sizeof at_w1);
       XBEM_WARN("dstorage", "  memory at word 1:{}", hex_qwords(at_w1, 6));
     }
+    // Experiment switch: report undecodable formats as delivered (zeros).
+    if (std::getenv("XBEM_DSTORAGE_PRETEND") && compression != 1) {
+      std::memset(dest, 0, dest_size);
+      return S_OK;
+    }
     return HRESULT(0x80070017);  // HRESULT_FROM_WIN32(ERROR_CRC): corrupt data
   }
   return S_OK;
@@ -402,7 +408,7 @@ void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
   auto* q = static_cast<QueueState*>(self->state);
   static std::atomic<int> logged{0};
   const int n = logged.fetch_add(1);
-  if (n < 64 || (n & (n - 1)) == 0) {
+  if (n < 64 || (n & (n - 1)) == 0 || n % 256 == 0) {
     std::lock_guard lock(q->mutex);
     std::string formats;
     for (const auto& [format, count] : q->by_compression) formats += std::format(" {}:{}", format, count);

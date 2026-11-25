@@ -819,7 +819,15 @@ int cmd_run(const Args& args) {
         start = comma + 1;
       }
     } else if (a == "--trace-log") {
-      opt.trace_log_hits = std::stoi(value());
+      // N, or SKIP+N: log N hits after skipping SKIP
+      const std::string v = value();
+      const size_t plus = v.find('+');
+      if (plus != std::string::npos) {
+        opt.trace_skip_hits = std::stoull(v.substr(0, plus));
+        opt.trace_log_hits = std::stoi(v.substr(plus + 1));
+      } else {
+        opt.trace_log_hits = std::stoi(v);
+      }
     } else if (a == "--watch") {
       const std::string& list = value();
       for (size_t start = 0; start <= list.size();) {

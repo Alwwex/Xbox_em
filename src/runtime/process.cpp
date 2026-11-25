@@ -281,12 +281,23 @@ bool parse_trace_memory(const std::string& text, platform::TraceMemory& m, std::
     body = body.substr(0, slash);
   }
   if (!body.empty() && body[0] == '[') {
-    const size_t close = body.find(']');
-    if (close == std::string_view::npos || !parse_reg_offset(body.substr(1, close - 1), m.reg, m.inner) ||
-        !parse_offset(body.substr(close + 1), m.outer)) {
-      error = "bad memory operand " + text + " (expected [reg+off]+off/len)";
+    // Brackets nest: "[[reg+a]+b]+c" loads [reg+a], then [that+b], then adds c.
+    size_t depth = 0;
+    while (depth < body.size() && body[depth] == '[') ++depth;
+    const int levels = static_cast<int>(depth) - 1;
+    size_t close = body.find(']');
+    bool ok = levels <= 3 && close != std::string_view::npos &&
+              parse_reg_offset(body.substr(depth, close - depth), m.reg, m.inner);
+    for (int i = 0; ok && i < levels; ++i) {
+      const size_t next = body.find(']', close + 1);
+      ok = next != std::string_view::npos && parse_offset(body.substr(close + 1, next - close - 1), m.deeper[i]);
+      close = next;
+    }
+    if (!ok || !parse_offset(body.substr(close + 1), m.outer)) {
+      error = "bad memory operand " + text + " (expected [reg+off]+off/len, brackets up to 4 deep)";
       return false;
     }
+    m.levels = levels;
     m.indirect = true;
     return true;
   }
@@ -627,7 +638,7 @@ int Process::run() {
   platform::set_continue_after_breakpoint(options_.continue_after_breakpoint);
   platform::set_thread_context_printer(&print_thread_context);
   platform::set_backtrace_printer(&print_unwind_backtrace);
-  platform::set_tracepoint_log_hits(options_.trace_log_hits);
+  platform::set_tracepoint_log_hits(options_.trace_log_hits, options_.trace_skip_hits);
   arm_tracepoints(*loader_, options_.trace_at);
   platform::set_watchpoint_log_writes(options_.watch_log_writes);
   arm_watchpoints(*loader_, options_.watch);
