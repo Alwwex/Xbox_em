@@ -98,8 +98,11 @@ InflateResult codes(State& s, const Huffman& lencode, const Huffman& distcode) {
       const size_t dist = kDistBase[dsym] + bits(s, kDistExtra[dsym]);
       if (s.truncated) return InflateResult::Truncated;
       if (dist > s.out_pos) return InflateResult::BadData;
-      if (s.out_capacity - s.out_pos < len) return InflateResult::OutputFull;
-      for (size_t i = 0; i < len; ++i, ++s.out_pos) s.out[s.out_pos] = s.out[s.out_pos - dist];
+      // A match that does not fit still fills the buffer (callers that want
+      // only the beginning of a stream use what was produced).
+      const size_t room = s.out_capacity - s.out_pos, n = len < room ? len : room;
+      for (size_t i = 0; i < n; ++i, ++s.out_pos) s.out[s.out_pos] = s.out[s.out_pos - dist];
+      if (n < len) return InflateResult::OutputFull;
     }
   }
 }
@@ -113,7 +116,12 @@ InflateResult stored(State& s) {
   s.in_pos += 4;
   if (len != (~nlen & 0xFFFF)) return InflateResult::BadData;
   if (s.in_size - s.in_pos < len) return InflateResult::Truncated;
-  if (s.out_capacity - s.out_pos < len) return InflateResult::OutputFull;
+  if (s.out_capacity - s.out_pos < len) {
+    const size_t room = s.out_capacity - s.out_pos;
+    std::memcpy(s.out + s.out_pos, s.in + s.in_pos, room);
+    s.out_pos += room;
+    return InflateResult::OutputFull;
+  }
   std::memcpy(s.out + s.out_pos, s.in + s.in_pos, len);
   s.in_pos += len;
   s.out_pos += len;

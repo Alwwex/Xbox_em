@@ -217,6 +217,16 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       dest_size = static_cast<uint32_t>(w[3]);
     }
   }
+  // The usual layout: destination (pointer, skip, size) before the file.
+  // `skip` is 0 for whole chunks; a chunk read in pieces is decompressed and
+  // bytes [skip, skip + size) of its output are delivered (measured on
+  // GTA VI's .ttpf streaming: the pieces' skip + size add up to the chunk).
+  uint64_t skip = 0;
+  if (!dest && fi == 4 && w[1] >= 0x10000 && w[1] < 0x800000000000ull && w[3] && w[3] < (1ull << 32)) {
+    dest = reinterpret_cast<uint8_t*>(w[1]);
+    dest_size = w[3];
+    skip = w[2] < (1ull << 32) ? w[2] : 0;
+  }
   for (int i = 1; i < fi && !dest_size; ++i) {
     if (!dest && w[i] >= 0x10000 && w[i] < 0x800000000000ull) {
       dest = reinterpret_cast<uint8_t*>(w[i]);
@@ -255,7 +265,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     return S_OK;
   }
   size_t produced = 0;
-  const InflateResult r = inflate_auto(buffer.data(), buffer.size(), dest, dest_size, produced);
+  InflateResult r;
+  if (skip) {
+    std::vector<uint8_t> whole(skip + dest_size);
+    r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
+    if (r == InflateResult::OutputFull) r = InflateResult::Ok;  // the rest of the chunk is not wanted
+    if (produced > skip) std::memcpy(dest, whole.data() + skip, std::min<uint64_t>(produced - skip, dest_size));
+  } else {
+    r = inflate_auto(buffer.data(), buffer.size(), dest, dest_size, produced);
+  }
   q->bytes_out += produced;
   if (r != InflateResult::Ok) {
     static std::atomic<int> warned{0};

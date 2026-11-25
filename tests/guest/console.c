@@ -1042,6 +1042,16 @@ static void test_dstorage(void) {
   ((SubmitFn)qv[6])(queue);
   CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
   CHECK(text[0] == 'x' && text[5] == 'D' && text[263] == ' ' && text[264] == 0);
+  /* A piece of a chunk: (dest, skip, size) delivers bytes [skip, skip + size)
+   * of the decompressed chunk (the 264-byte text is 8 x 33 bytes). */
+  static uint8_t piece[40];
+  memset(piece, 0xee, sizeof piece);
+  uint64_t preq[12] = {0x200001, (uint64_t)(uintptr_t)piece, 33, 33, (uint64_t)(uintptr_t)file, at, 44};
+  ((EnqueueFn)qv[3])(queue, preq);
+  ((EnqueueStatusFn)qv[4])(queue, status, 1);
+  ((SubmitFn)qv[6])(queue);
+  CHECK(((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+  CHECK(memcmp(piece, text + 33, 33) == 0 && piece[33] == 0xee);
   CHECK(*(volatile const uint8_t*)&kZlibChunk[47] == 0x01); /* keeps the chunk in the image */
 
   /* 12 EnqueueSetEvent(HANDLE): requests complete at once, so the event is set */
