@@ -100,6 +100,24 @@ slot-57 pipelines (alpha blending assumed; slot 55 variants carry a
 D3D12_BLEND_DESC at +4), MSAA, mip levels, texture updates after first
 upload (textures are uploaded once), performance (everything synchronous).
 
+## Current blocker: out of memory while loading the world
+
+With `--press A@45,A@95,A@105,A@115,A@125,A@135` the title goes through the
+first-boot settings screens (NAVIGATION EXPERIENCE, SUBTITLES, ...; they
+render correctly) and starts loading the world (black screen). About 140 s
+in, the game's main heap runs out: allocator object `0x1471c1560` (vtable
+`0x1462fc060`, created by fn `0x221a4f0` from fn `0x1e1cf60`, on the
+0x25400000-byte region XMemVirtualAlloc'ed at +0x1e1d28d) fails a
+0x1000-byte allocation: int3 at +0x22106e0 (out-of-memory callback, vtable
++0x30 of the allocator), +0x2219650, +0x6fea92, then a null dereference at
++0x1284221. Happens with and without the renderer. Leads:
+- DirectStorage requests with compression formats 2 (first bytes `5f de dc
+  5d`, probably BCPack textures) and 14 (`31 31 5a 5a`, a title codec?)
+  fail (`inflate failed` warnings); maybe retries or fallbacks leak.
+- Find what fills the heap: trace allocations of fn 0x140104070 by size /
+  caller (`--trace-at` with conditions), or compare with the heap's free
+  list just before the failure.
+
 ## Plan (original, items 1-3 done)
 
 1. DONE: Vulkan device (`src/gpu/vk/vk_core.*`), `xbem gpu`.
@@ -121,3 +139,4 @@ upload (textures are uploaded once), performance (everything synchronous).
 - e36afc9: Vulkan core, typed graphics pipelines.
 - 377b327: RDNA2 -> GLSL translator.
 - 31eed69: renderer; first GTA VI screen rendered on the GTX 1080.
+- d06c226: texture refresh; 4fe3623: DirectStorage chunk pieces.

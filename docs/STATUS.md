@@ -88,25 +88,10 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
 
 ## How far the title gets (latest run)
 
-CRT and TLS init, memory manager (xmem, placeholders, physical pages), GDK
-runtime binding, GameInput, window, `D3D12XboxCreateDevice` (headless
-device), DXGI output modes, frame pacing, descriptor heaps in title memory,
-back buffers, the raytracing BVH builder (52 DXIL compute pipelines, root
-signatures), XG texture uploads, DirectStorage loading, all 1,234 shader
-programs, audio start-up (APU heap, XMA shape contexts, Core Audio spatial
-streams), the signed-in user (XUserAddAsync), the title screen, Bink video.
-
-The boot state machine (state in `0x1498f828c`, set by fn `0x1ac7760`,
-dispatched by fn `0x1d83960`) goes 0 -> 1 -> 3; state 3 (fn `0x21b7070`)
-waits for "press A" (a game timer in `0x1478ac9c8` that only runs once the
-title screen is dismissed). With `--press A@45` it goes 3 -> 4 -> 5 -> 6 ->
-13; state 13 (fn `0x21b7530`) is the game's main loop. Run on `354754c`
-with `--press A@45`: **no crash in 200 s**, the main loop runs (about 230
-frame events, 2,500 draws and 100 dispatches recorded per second, 58 guest
-threads) and streams the world (`levels.rpf`, `anim.rpf`, `core_bvh4.rpf`,
-`packs.rpf`, `textures.rpf`, ... - over 10,000 DirectStorage requests). The
-only int3 left is the known render-target budget check (+0x247af2d). What
-the title shows cannot be seen yet (no renderer).
+See `docs/HANDOFF.md` for the GPU work and the current blocker. In short:
+the title boots, its first-boot settings screens are rendered on the host
+GPU (Vulkan through Dozen on WSL2) and accept gamepad input; loading the
+world after them runs out of memory in the game's main heap (~140 s).
 
 Unattended runs press buttons with `--press BUTTONS@SECONDS[:MS]` (seconds
 after GameInputCreate; the title screen accepts A from about 40 s on this
