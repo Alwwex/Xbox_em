@@ -1310,6 +1310,17 @@ static void test_headless_d3d12(void) {
   const uint32_t* rs_back = ((GetRsDescFn)VT(deser)[3])(deser);
   CHECK(rs_back && rs_back[0] == 2 && rs_back[8] == 0x03000000);
 
+  /* 86 CreatePipelineState(D3D12_PIPELINE_STATE_STREAM_DESC, riid, ppv): a
+   * PC pipeline state stream (GTA VI's carry DXIL clear shaders); the object
+   * is created and the stream logged. Subobjects: root signature, VS. */
+  static const uint8_t dxil_stub[8] = {'D', 'X', 'B', 'C'};
+  struct { uint64_t type_rs; void* rs; uint64_t type_vs; const void* code; uint64_t size; } stream = {
+      0, root_sig, 1, dxil_stub, sizeof dxil_stub};
+  struct { uint64_t size; void* data; } stream_desc = {sizeof stream, &stream};
+  typedef HRESULT (*CreateStreamPsoFn)(void*, const void*, const void*, void**);
+  void* stream_pso = 0;
+  CHECK(((CreateStreamPsoFn)VT(device)[86])(device, &stream_desc, iid, &stream_pso) == 0 && stream_pso);
+
   /* Frame pacing (78-80): accepted; WaitFrameEventX hands out fresh tokens */
   typedef HRESULT (*Frame4Fn)(void*, uint64_t, uint64_t, uint64_t, uint64_t);
   typedef HRESULT (*WaitFn)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t*);
