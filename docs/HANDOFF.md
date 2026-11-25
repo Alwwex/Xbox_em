@@ -122,6 +122,32 @@ Fixed on the way (all with guest tests):
 - Command list slots 71 (label write: address, 32-bit value) and 72
   (timestamp write) are now performed at ExecuteCommandLists.
 
+## WHERE WORK STOPPED (2026-11-26) - read first
+
+- Story loading (after Confirm at ~197 s with the press script) ends in the
+  title's loading watchdog (+0x23cf683, thread ~328) at ~240-300 s.
+- Mechanism understood: the loader thread 260 polls (fn 0x23cf6a0) a
+  semaphore (handle 0x648, created at +0x166245a) that the main thread 344
+  releases (+0x23cf2c9) once per main-loop pass. The watchdog (fn
+  0x2215a60) crashes when no loading "operation" (0xb5b6b0/0xb5b6f0) runs
+  for 30 s. Between ~240 and 270 s the main thread almost stops (frames
+  +500 per 30 s) and was seen in state D (uninterruptible wait).
+- Tried: a read cache for game files (src/platform/file_cache.*, 256 KiB
+  blocks, XBEM_READ_CACHE_MB) - disk reads are only ~20 s of 240 s, so I/O
+  alone is not it. Was measuring memory/swap (WSL has 7 GB RAM, 2 GB swap;
+  guest memory is a memfd, shown as shared/cache in `free`) when stopped:
+  `VmSwap` of the xbem process at 240-270 s is the next number to read.
+- Next ideas: check swapping (if so: smaller physical pool, MADV, or more
+  WSL memory via .wslconfig); otherwise sample the main thread's guest RIP
+  during the stall (several SIGINT-free samples via /proc/<tid>/syscall or
+  a tracepoint ring) to find what it waits on.
+- Debug aids added: XBEM_TRACE_HANDLE=0x.. (create/set/release of one
+  handle), CreateThread log (handle -> guest thread), "[thread] guest
+  thread N runs on host tid T", "[files]" read statistics.
+- Tried and reverted: console-tiled texture sizes / tight linear layout
+  (made the title's partial-read asserts go from ~50 to ~20000; the
+  256-byte-pitch linear layout matches the files best).
+
 ## Current blocker: watchdog crash while loading the story (~240-270 s)
 
 The page-table crash is fixed (root cause: XG texture computer slot 10 is
@@ -242,5 +268,6 @@ probably one of these.
 - 5b031ba: list label writes (slots 71/72).
 - 9bb1437/ed83e1c: 2D-array and 3D textures, DXIL clear PSO, strips
   (menu highlight and tinted background now render).
-- a8fbec9: small resources (4 KiB). 3efa950 + latest: DirectStorage physical
+- a8fbec9: small resources (4 KiB).
+- latest: read cache for game files, handle/thread tracing aids. 3efa950 + latest: DirectStorage physical
   destinations. 2aa95a8: XG GetResourceTiling (page-table crash fixed).

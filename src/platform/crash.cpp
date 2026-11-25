@@ -1306,6 +1306,11 @@ bool overlaps_watched_page(uint64_t address, uint64_t size) {
 
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();
+  {
+    char line[96];
+    std::snprintf(line, sizeof line, "[info ][thread] guest thread %u runs on host tid %d\n", guest_thread_id, self);
+    write_str(line);
+  }
   for (DumpSlot& s : g_dump_slots) {
     int expected = 0;
     if (s.tid.compare_exchange_strong(expected, self)) {

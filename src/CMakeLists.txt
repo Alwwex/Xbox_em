@@ -6,6 +6,7 @@ add_library(xbem_core STATIC
   common/xml.cpp
 
   platform/memory.cpp
+  platform/file_cache.cpp
   platform/cpu.cpp
   platform/thread.cpp
   platform/crash.cpp

@@ -39,6 +39,7 @@
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
 #include "hle/registry.h"
+#include "platform/file_cache.h"
 #include "platform/memory.h"
 #include "runtime/objects.h"
 
@@ -82,13 +83,9 @@ struct FileState {
     covered[start] = end;
   }
 
+  std::string host_path;
   bool read(uint64_t offset, uint8_t* out, size_t n) {
-    std::lock_guard lock(mutex);
-    if (!stream.is_open()) return false;
-    stream.clear();
-    stream.seekg(static_cast<std::streamoff>(offset));
-    stream.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
-    return stream.gcount() == static_cast<std::streamsize>(n);
+    return platform::cached_read(host_path, offset, out, n) == static_cast<int64_t>(n);
   }
 };
 
@@ -589,7 +586,10 @@ HRESULT XBEM_GUEST_ABI factory_open_file(ProbeObject* self, const void* path, co
   auto r = proc().vfs().resolve(std::string_view(guest));
   auto* state = new FileState;
   state->guest_path = guest;
-  if (r) state->stream.open(r->host_path, std::ios::binary);
+  if (r) {
+    state->stream.open(r->host_path, std::ios::binary);
+    state->host_path = r->host_path.string();
+  }
   static std::atomic<int> logged{0};
   if (!state->stream.is_open()) {
     delete state;

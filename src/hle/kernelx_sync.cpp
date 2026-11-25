@@ -3,6 +3,7 @@
 // WaitOnAddress) and TLS/FLS slots.
 
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <csetjmp>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "hle/discovery.h"
 #include "hle/hle_util.h"
 #include "platform/thread.h"
 
@@ -51,7 +53,10 @@ HANDLE XBEM_GUEST_ABI hle_CreateThread(void*, SIZE_T stack_size, uint64_t start,
     return 0;
   }
   if (thread_id) *thread_id = t->id;
-  return proc().handles().insert(t);
+  const HANDLE h = proc().handles().insert(t);
+  XBEM_INFO("kernelx", "CreateThread: guest thread {} at {} (param {}) -> handle {:#x}, from {}", t->id,
+            describe_code_address(start), param, h, describe_code_address(XBEM_RETURN_ADDRESS()));
+  return h;
 }
 
 [[noreturn]] void XBEM_GUEST_ABI hle_ExitThread(DWORD code) { exit_guest_thread(code); }
@@ -185,17 +190,41 @@ HANDLE make_event(bool manual, bool initial, const std::string& name) {
   return proc().handles().insert(std::make_shared<rt::EventObject>(manual, initial));
 }
 
+
+namespace {
+// XBEM_TRACE_HANDLE=0x...: log creation and signalling of that handle with
+// the caller (finding who should signal an object a title waits for).
+uint64_t traced_handle() {
+  static const uint64_t h = [] {
+    const char* v = std::getenv("XBEM_TRACE_HANDLE");
+    return v ? std::strtoull(v, nullptr, 0) : 0ull;
+  }();
+  return h;
+}
+void trace_handle(uint64_t h, const char* what, uint64_t caller) {
+  if (h && h == traced_handle()) XBEM_INFO("kernelx", "handle {:#x}: {} from {}", h, what, describe_code_address(caller));
+}
+}  // namespace
+
 HANDLE XBEM_GUEST_ABI hle_CreateEventA(void*, BOOL manual, BOOL initial, LPCSTR name) {
-  return make_event(manual, initial, narrow(name));
+  const HANDLE h = make_event(manual, initial, narrow(name));
+  trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventW(void*, BOOL manual, BOOL initial, LPCWSTR name) {
-  return make_event(manual, initial, narrow(name));
+  const HANDLE h = make_event(manual, initial, narrow(name));
+  trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventExW(void*, LPCWSTR name, DWORD flags, DWORD) {
-  return make_event(flags & 1 /*MANUAL_RESET*/, flags & 2 /*INITIAL_SET*/, narrow(name));
+  const HANDLE h = make_event(flags & 1 /*MANUAL_RESET*/, flags & 2 /*INITIAL_SET*/, narrow(name));
+  trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventExA(void*, LPCSTR name, DWORD flags, DWORD) {
-  return make_event(flags & 1, flags & 2, narrow(name));
+  const HANDLE h = make_event(flags & 1, flags & 2, narrow(name));
+  trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  return h;
 }
 
 BOOL XBEM_GUEST_ABI hle_SetEvent(HANDLE h) {
@@ -204,6 +233,7 @@ BOOL XBEM_GUEST_ABI hle_SetEvent(HANDLE h) {
     set_last_error(ERROR_INVALID_HANDLE);
     return FALSE;
   }
+  trace_handle(h, "SetEvent", XBEM_RETURN_ADDRESS());
   e->set();
   return TRUE;
 }
@@ -223,7 +253,9 @@ HANDLE XBEM_GUEST_ABI hle_CreateSemaphoreW(void*, LONG initial, LONG maximum, LP
     set_last_error(ERROR_INVALID_PARAMETER);
     return 0;
   }
-  return proc().handles().insert(std::make_shared<rt::SemaphoreObject>(initial, maximum));
+  const HANDLE h = proc().handles().insert(std::make_shared<rt::SemaphoreObject>(initial, maximum));
+  trace_handle(h, "CreateSemaphore", XBEM_RETURN_ADDRESS());
+  return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateSemaphoreA(void* sa, LONG initial, LONG maximum, LPCSTR) {
   return hle_CreateSemaphoreW(sa, initial, maximum, nullptr);
@@ -238,6 +270,7 @@ BOOL XBEM_GUEST_ABI hle_ReleaseSemaphore(HANDLE h, LONG count, LONG* previous) {
     set_last_error(ERROR_INVALID_HANDLE);
     return FALSE;
   }
+  trace_handle(h, "ReleaseSemaphore", XBEM_RETURN_ADDRESS());
   if (!s->release(count, previous)) {
     set_last_error(ERROR_TOO_MANY_POSTS);
     return FALSE;

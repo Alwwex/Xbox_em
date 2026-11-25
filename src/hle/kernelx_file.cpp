@@ -17,6 +17,7 @@
 #include "hle/heap.h"
 #include "hle/hle_util.h"
 #include "platform/crash.h"
+#include "platform/file_cache.h"
 
 namespace xbem::hle {
 namespace {
@@ -263,8 +264,13 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
   std::lock_guard lock(f->mutex);
   const uint64_t offset = ov ? (static_cast<uint64_t>(ov->offset_high) << 32 | ov->offset) : f->position;
   size_t got = 0;
-  if (seek_host(f->file, offset)) {
-    if (platform::overlaps_watched_page(reinterpret_cast<uint64_t>(buffer), count)) {
+  const bool watched = platform::overlaps_watched_page(reinterpret_cast<uint64_t>(buffer), count);
+  if (!f->writable && !watched) {
+    // Read-only (game) files: through the block cache (see platform/file_cache.h).
+    const int64_t r = platform::cached_read(f->path.string(), offset, buffer, count);
+    got = r > 0 ? static_cast<size_t>(r) : 0;
+  } else if (seek_host(f->file, offset)) {
+    if (watched) {
       // A watchpoint protects the destination: the kernel's write would fail
       // (EFAULT) instead of faulting, so copy in user space.
       std::vector<uint8_t> bounce(count);
