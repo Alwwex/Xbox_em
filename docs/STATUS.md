@@ -506,10 +506,12 @@ fills one with a test pattern to see the path work.
    GDK calls per frame are the signals until something is drawn. Bind XStore
    (entitlements/licence queries start with the main loop) and the other
    families when the title needs them.
-2. Command lists: type the console command list (Leonida documents the
-   shifted slots: 0-26 PC order, 27-30 console-only, then +4, SetDescriptorHeaps
-   at 32, ExecuteIndirect at 61) and record commands, so draws and dispatches
-   become visible.
+2. Command lists are recorded and decoded (`--capture-commands`, see
+   `GPU.md`); a frame at 90 s is a UI screen (font atlas, UI meshes, one
+   4K target copied to the display texture). Remaining: decode device
+   slots 61/70 (console view creation) and the console-only list slots,
+   identify the graphics pipeline creation (device slots 55/57, objects
+   used by SetPipelineState) and its shaders.
 3. GPU backend (`GPU.md`): RDNA2 → SPIR-V translation of the captured native
    shaders (`xbem gpu-disasm` decodes all of them; the first 3 instructions of
    each are embedded metadata), then a Vulkan backend. Note the owner's GPU
