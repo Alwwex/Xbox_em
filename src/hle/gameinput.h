@@ -42,4 +42,8 @@ std::vector<GamepadPress> parse_gamepad_script(const std::string& spec);
 // window's keyboard).
 void gamepad_set_buttons(uint32_t buttons, bool down);
 
+// The run window's keyboard (an X11 keysym): Enter/Space A, Backspace B,
+// X, Y, arrows and WASD the D-pad, Escape Menu, Tab View, Q/E the shoulders.
+void gamepad_key(unsigned long keysym, bool down);
+
 }  // namespace xbem::hle

@@ -80,3 +80,20 @@ TEST(registry_routes_new_modules) {
   const std::string* name = reg.name_of(reinterpret_cast<uint64_t>(look.exp->address));
   CHECK(name != nullptr && *name == "kernelx.dll!CreateThread");
 }
+
+#include "hle/gameinput.h"
+
+TEST(gamepad_press_script) {
+  const auto presses = hle::parse_gamepad_script("A@20,menu+B@25.5:1000,,UP@1");
+  CHECK_EQ(presses.size(), size_t{3});
+  CHECK_EQ(presses[0].buttons, uint32_t{hle::kGamepadA});
+  CHECK_EQ(presses[0].at_ms, uint32_t{20000});
+  CHECK_EQ(presses[0].hold_ms, uint32_t{200});
+  CHECK_EQ(presses[1].buttons, uint32_t{hle::kGamepadMenu | hle::kGamepadB});
+  CHECK_EQ(presses[1].at_ms, uint32_t{25500});
+  CHECK_EQ(presses[1].hold_ms, uint32_t{1000});
+  CHECK_EQ(presses[2].buttons, uint32_t{hle::kGamepadDPadUp});
+  CHECK_THROWS(hle::parse_gamepad_script("A"));
+  CHECK_THROWS(hle::parse_gamepad_script("TRIANGLE@3"));
+  CHECK_THROWS(hle::parse_gamepad_script("A@soon"));
+}

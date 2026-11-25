@@ -66,6 +66,8 @@ bool window_open(const std::string&, WindowStatusProvider, std::string& reason) 
   return false;
 }
 void window_set_surface(const void*, uint32_t, uint32_t, uint64_t, uint32_t) {}
+void window_set_key_handler(KeyHandler handler) { g_key_handler.store(handler); }
+
 bool window_is_open() { return false; }
 }  // namespace xbem::platform
 
@@ -115,6 +117,7 @@ struct Xlib {
   int (*SetWMProtocols)(void*, XID, XID*, int);
   int (*DestroyWindow)(void*, XID);
   int (*CloseDisplay)(void*);
+  unsigned long (*LookupKeysym)(void*, int);
 };
 
 bool bind_xlib(Xlib& x, std::string& reason) {
@@ -153,6 +156,7 @@ bool bind_xlib(Xlib& x, std::string& reason) {
   bind(x.SetWMProtocols, "XSetWMProtocols");
   bind(x.DestroyWindow, "XDestroyWindow");
   bind(x.CloseDisplay, "XCloseDisplay");
+  bind(x.LookupKeysym, "XLookupKeysym");
   if (!ok) reason = "libX11.so.6 lacks functions the window needs";
   return ok;
 }
@@ -160,8 +164,11 @@ bool bind_xlib(Xlib& x, std::string& reason) {
 constexpr int kImageWidth = 960, kImageHeight = 540;  // a 3840x2160 surface at 1/4
 constexpr int kLineHeight = 16, kStatusLines = 5;
 constexpr int kStatusHeight = kLineHeight * kStatusLines + 8;
-constexpr long kExposureMask = 1L << 15, kStructureNotifyMask = 1L << 17;
-constexpr int kClientMessage = 33, kZPixmap = 2;
+constexpr long kKeyPressMask = 1L << 0, kKeyReleaseMask = 1L << 1, kExposureMask = 1L << 15,
+               kStructureNotifyMask = 1L << 17;
+constexpr int kKeyPress = 2, kKeyRelease = 3, kClientMessage = 33, kZPixmap = 2;
+
+std::atomic<KeyHandler> g_key_handler{nullptr};
 
 struct Surface {
   const void* pixels = nullptr;
@@ -232,20 +239,24 @@ void draw(WindowState& s) {
 void window_thread(WindowState* s) {
   XID wm_delete = s->x.InternAtom(s->display, "WM_DELETE_WINDOW", 0);
   s->x.SetWMProtocols(s->display, s->window, &wm_delete, 1);
+  unsigned ticks = 0;
   while (g_open.load()) {
     while (s->x.Pending(s->display)) {
       long event[24] = {};
       s->x.NextEvent(s->display, event);
       // XClientMessageEvent: type at +0, data.l[0] at +56.
-      if (static_cast<int>(event[0]) == kClientMessage && static_cast<XID>(event[7]) == wm_delete) {
+      const int type = static_cast<int>(event[0]);
+      if ((type == kKeyPress || type == kKeyRelease) && g_key_handler.load())
+        g_key_handler.load()(s->x.LookupKeysym(event, 0), type == kKeyPress);
+      if (type == kClientMessage && static_cast<XID>(event[7]) == wm_delete) {
         g_open.store(false);
         XBEM_INFO("window", "window closed; the title keeps running (Ctrl+C ends it)");
       }
     }
     if (!g_open.load()) break;
-    draw(*s);
+    if (++ticks % 6 == 0) draw(*s);  // about 10 redraws a second; input is read every 16 ms
     s->x.Flush(s->display);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
   }
   s->x.DestroyWindow(s->display, s->window);
   s->x.CloseDisplay(s->display);
@@ -283,7 +294,7 @@ bool window_open(const std::string& title, WindowStatusProvider status, std::str
   s->window = s->x.CreateSimpleWindow(s->display, s->x.RootWindow(s->display, s->screen), 0, 0, kImageWidth,
                                       kStatusHeight + kImageHeight, 0, 0, s->x.BlackPixel(s->display, s->screen));
   s->x.StoreName(s->display, s->window, title.c_str());
-  s->x.SelectInput(s->display, s->window, kExposureMask | kStructureNotifyMask);
+  s->x.SelectInput(s->display, s->window, kKeyPressMask | kKeyReleaseMask | kExposureMask | kStructureNotifyMask);
   s->gc = s->x.DefaultGC(s->display, s->screen);
   s->image = s->x.CreateImage(s->display, s->x.DefaultVisual(s->display, s->screen),
                               static_cast<unsigned>(s->x.DefaultDepth(s->display, s->screen)), kZPixmap, 0,
@@ -305,6 +316,8 @@ void window_set_surface(const void* pixels, uint32_t width, uint32_t height, uin
   std::lock_guard lock(g_surface_mutex);
   g_surface = {pixels, width, height, format, pitch};
 }
+
+void window_set_key_handler(KeyHandler handler) { g_key_handler.store(handler); }
 
 bool window_is_open() { return g_open.load(); }
 

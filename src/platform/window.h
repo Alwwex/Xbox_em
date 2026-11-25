@@ -27,6 +27,11 @@ bool window_open(const std::string& title, WindowStatusProvider status, std::str
 // converted; others are reported). Can be called again to switch surfaces.
 void window_set_surface(const void* pixels, uint32_t width, uint32_t height, uint64_t pitch, uint32_t format);
 
+// Keys pressed and released in the window, as X11 keysyms (called from the
+// window's thread).
+using KeyHandler = void (*)(unsigned long keysym, bool down);
+void window_set_key_handler(KeyHandler handler);
+
 // For tests and logs: true while the window is open.
 bool window_is_open();
 

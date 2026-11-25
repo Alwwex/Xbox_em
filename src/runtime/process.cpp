@@ -12,6 +12,7 @@
 
 #include "common/log.h"
 #include "common/strings.h"
+#include "hle/gameinput.h"
 #include "hle/guest_types.h"
 #include "hle/d3d12_device.h"
 #include "hle/file_log.h"
@@ -642,8 +643,10 @@ int Process::run() {
   }).detach();
   if (options_.window) {
     std::string reason;
-    if (platform::window_open(std::format("xbem - {}", main->name), &window_status_lines, reason))
-      XBEM_INFO("window", "run window opened (--no-window runs without it)");
+    if (platform::window_open(std::format("xbem - {}", main->name), &window_status_lines, reason)) {
+      platform::window_set_key_handler(&hle::gamepad_key);
+      XBEM_INFO("window", "run window opened (--no-window runs without it); its keyboard drives the gamepad");
+    }
     else
       XBEM_INFO("window", "no run window: {}", reason);
   }

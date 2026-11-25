@@ -484,7 +484,9 @@ it): status lines (uptime, guest threads, frame events, command lists,
 draws and dispatches recorded) and the title's first display surface - the
 first 2D texture created with `D3D12_HEAP_FLAG_ALLOW_DISPLAY` - scaled to
 960x540 (`src/platform/window.*`). There is no renderer yet, so the
-title's back buffer stays black; the guest test `present.exe` (`-- wait`)
+title's back buffer stays black; its keyboard drives the emulated gamepad
+(Enter/Space A, Backspace B, X, Y, arrows/WASD D-pad, Escape Menu, Tab
+View, Q/E shoulders); the guest test `present.exe` (`-- wait`)
 fills one with a test pattern to see the path work.
 
 ## Known approximations
@@ -514,8 +516,6 @@ fills one with a test pattern to see the path work.
    is a GTX 1080 (no ray tracing in Vulkan, wave32) and WSL2 Vulkan on NVIDIA
    goes through Mesa's dzn layer; a Windows or native-Linux host will be
    needed for presentation.
-4. Input from the run window's keyboard (`gamepad_set_buttons` in
-   `src/hle/gameinput.h` is the entry point).
-5. Audio output (the spatial objects' buffers are zeroed and dropped; XMA
+4. Audio output (the spatial objects' buffers are zeroed and dropped; XMA
    decoding through XApu returns no results), chad (XDsp), real XG tiling and
    the network stay stubbed for now.

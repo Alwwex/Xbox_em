@@ -658,6 +658,26 @@ std::vector<GamepadPress> parse_gamepad_script(const std::string& spec) {
 
 void gamepad_set_buttons(uint32_t buttons, bool down) { set_pad_buttons(buttons, down); }
 
+void gamepad_key(unsigned long keysym, bool down) {
+  uint32_t button = 0;
+  switch (keysym) {
+    case 0xff0d: case 0x20: button = kGamepadA; break;               // Return, space
+    case 0xff08: button = kGamepadB; break;                          // BackSpace
+    case 'x': button = kGamepadX; break;
+    case 'y': case 'z': button = kGamepadY; break;                   // QWERTZ keyboards
+    case 0xff1b: button = kGamepadMenu; break;                       // Escape
+    case 0xff09: button = kGamepadView; break;                       // Tab
+    case 0xff52: case 'w': button = kGamepadDPadUp; break;
+    case 0xff54: case 's': button = kGamepadDPadDown; break;
+    case 0xff51: case 'a': button = kGamepadDPadLeft; break;
+    case 0xff53: case 'd': button = kGamepadDPadRight; break;
+    case 'q': button = kGamepadLeftShoulder; break;
+    case 'e': button = kGamepadRightShoulder; break;
+    default: return;
+  }
+  set_pad_buttons(button, down);
+}
+
 ModuleDef make_gameinput_module() {
   ModuleDef m;
   m.name = "gameinput.dll";
