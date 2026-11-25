@@ -100,23 +100,67 @@ slot-57 pipelines (alpha blending assumed; slot 55 variants carry a
 D3D12_BLEND_DESC at +4), MSAA, mip levels, texture updates after first
 upload (textures are uploaded once), performance (everything synchronous).
 
-## Current blocker: out of memory while loading the world
+## How far the title gets now (press script)
 
-With `--press A@45,A@95,A@105,A@115,A@125,A@135` the title goes through the
-first-boot settings screens (NAVIGATION EXPERIENCE, SUBTITLES, ...; they
-render correctly) and starts loading the world (black screen). About 140 s
-in, the game's main heap runs out: allocator object `0x1471c1560` (vtable
-`0x1462fc060`, created by fn `0x221a4f0` from fn `0x1e1cf60`, on the
-0x25400000-byte region XMemVirtualAlloc'ed at +0x1e1d28d) fails a
-0x1000-byte allocation: int3 at +0x22106e0 (out-of-memory callback, vtable
-+0x30 of the allocator), +0x2219650, +0x6fea92, then a null dereference at
-+0x1284221. Happens with and without the renderer. Leads:
-- DirectStorage requests with compression formats 2 (first bytes `5f de dc
-  5d`, probably BCPack textures) and 14 (`31 31 5a 5a`, a title codec?)
-  fail (`inflate failed` warnings); maybe retries or fallbacks leak.
-- Find what fills the heap: trace allocations of fn 0x140104070 by size /
-  caller (`--trace-at` with conditions), or compare with the heap's free
-  list just before the failure.
+```bash
+P="A@45,A@95,A@105,A@115,A@125,A@135,A@150,DOWN@158,A@161,DOWN@168,DOWN@170,A@172,A@185,DOWN@188,A@191,DOWN@194,A@197"
+./build/bin/xbem run /mnt/d/GTAVI/GTAVI --continue-after-breakpoint --press "$P" --screenshot ~/xbem-runs/s.ppm@190 > ~/xbem-runs/run.log 2>&1
+```
+
+Screens rendered on the GPU in order: title -> NAVIGATION EXPERIENCE ->
+SUBTITLES -> ... -> BRIGHTNESS -> FINISH SETUP? (with controller icons) ->
+LEGAL NOTICES -> ROCKSTAR GAMES LEGAL TERMS & POLICIES (checkboxes, Confirm)
+-> Confirm at ~197 s starts loading the story (black screen; story000.rpf,
+script.rpf, core_restofworld streamed through DirectStorage).
+(Screenshots: PPM, convert with a tiny zlib PNG writer - PIL is not installed.)
+
+Fixed on the way (all with guest tests):
+- scanf %n always stored 0 -> the "~0~" icon token in FINISH SETUP text
+  never advanced the layout -> out of memory (that was the old "OOM").
+- strtoul & co. copied the whole rest of the string -> the XML parser
+  (number lists, megabytes) was quadratic -> loading never finished.
+- Command list slots 71 (label write: address, 32-bit value) and 72
+  (timestamp write) are now performed at ExecuteCommandLists.
+
+## Current blocker: double unmap in the game's GPU page table (~210-330 s)
+
+Crash at +0xf2cb40 (write at index 0x55555555): fn 0xf2c470 processes a
+queue of page operations (dword: type = bits 29-31, virtual page = bits
+8-28, count-1 = bits 0-7; jump table at 0x14674c2bc: 0 and 2 map a physical
+page from the free list (tail 0x1471bfcd8, packed 21-bit list at
+0x1471bfcd0), 5 unmaps). Unmap uses fn 0x221ba60 (page table at
+[0x1471bfb08], entry: low 15 bits refcount, bits 20-40 physical index,
+pool size [0x1471bfac8] >> 16 = 99776 pages = the third
+XMemAllocatePhysicalPages). It returns -1 when the entry's refcount is 0
+or its "physical index" is out of the pool -> crash.
+- Type-5 unmaps are rare (4 per run), all from the deferred release
+  0x4fd22d0 -> 0x50498a0 -> 0x194110 -> 0xe88f0 (item+0x38 = op list).
+- The failing page was mapped once by a type-2 op on the main thread (344)
+  and then released by type 5; its entry had been changed in between by
+  direct writes (0x52387f4..0x52389f7, 0x555b30d, 0x221b832.., 0x93222 inc,
+  0xe8890 dec: refcount -1, at 0 it frees via 0x221b7d0).
+- Not caused by: failed DirectStorage formats (XBEM_DSTORAGE_PRETEND=1
+  still crashes), the label writes (crashed before them too, later).
+- Not deterministic (different page each run): a race is possible; the
+  page-table lock is the title's own (0x1471bfad8, wakes via
+  ReleaseSemaphore). Next: log the entry writers for the failing page in
+  one run (watch the table entry with `--watch at:0x221ba79:rdx+<vpage*8>`
+  once the failing vpage repeats), compare with the op history
+  (`--trace-at 0xf2c612` logs every op in rcx).
+
+New debugging aids: `--trace-log SKIP+N` (log hits after skipping SKIP),
+tracepoint memory operands nest (`[[reg+a]+b]+c`), renderer present log
+lists the top skip reasons.
+
+## Renderer gaps seen on these screens
+
+Skipped draws per frame on LEGAL NOTICES: the clear pipeline from device
+slot 86 (CreatePipelineState with a stream: DXIL VS_Clear/PS_Clear - needs a
+DXIL path or a hand-written clear), triangle strips (topology 5), 3D
+textures (dim 2) and 2D-array textures (dim 5) in image_sample/image_load
+(needs view types in image_of + typed bindless arrays). The selected
+menu item's label is invisible and the legal text bodies are empty -
+probably one of these.
 
 ## Plan (original, items 1-3 done)
 
@@ -140,3 +184,7 @@ in, the game's main heap runs out: allocator object `0x1471c1560` (vtable
 - 377b327: RDNA2 -> GLSL translator.
 - 31eed69: renderer; first GTA VI screen rendered on the GTX 1080.
 - d06c226: texture refresh; 4fe3623: DirectStorage chunk pieces.
+- 12a28d5: scanf %n (FINISH SETUP no longer runs out of memory).
+- 51b2f2e/728ec43: SDWA, fmaak/fmamk, readfirstlane; device slot 86.
+- 8b56880: linear strtoul (story loading no longer hangs).
+- 5b031ba: list label writes (slots 71/72).
