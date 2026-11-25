@@ -78,10 +78,32 @@ kill -INT $(pgrep -x xbem)                 # thread dump into the log, then exit
   mapping (dword5: byte1 = SGPR, byte0 = kind 4 = table pointer?), 0x42,
   0x43 = 128-bit hash. Not fully decoded.
 
-## Plan for the renderer (in progress)
+## Renderer state
+
+WORKING: with the run window open (no `--no-window`), xbem executes the
+title's command lists on the GPU and shows the display texture. At ~90 s
+with `--press A@45` the window shows the "NAVIGATION EXPERIENCE" settings
+screen fully rendered (`--screenshot ~/xbem-runs/x.ppm@90` to check without
+looking). Pieces: `src/hle/d3d12_render.cpp` (Renderer), `src/gpu/translate.*`
+(RDNA2 -> GLSL + scalar CPU run), `src/gpu/vk/vk_core.*`.
+
+Debug env vars: XBEM_GPU_TRACE=N (log N draws with their per-draw words),
+XBEM_GPU_TRACE_FROM=draw#, XBEM_GPU_TRACE_VS=<vs hash>, XBEM_GPU_TRACE_READS=
+<vs hash> (log scalar memory reads), XBEM_GPU_STATS=1 (lit pixels of every
+render target at power-of-two presents), XBEM_NO_GPU=1 (disable).
+
+Known gaps (draws are skipped and logged with `[gpu]`): pipelines not from
+slots 57/55 (`d3d12.device.m86`: unknown creation slot 86; compute PSOs -
+Dispatch is ignored), SDWA operands, v_fmaak/v_fmamk, image dims other than
+2D, v_readfirstlane, branches, depth buffers (no depth test), blend state of
+slot-57 pipelines (alpha blending assumed; slot 55 variants carry a
+D3D12_BLEND_DESC at +4), MSAA, mip levels, texture updates after first
+upload (textures are uploaded once), performance (everything synchronous).
+
+## Plan (original, items 1-3 done)
 
 1. DONE: Vulkan device (`src/gpu/vk/vk_core.*`), `xbem gpu`.
-2. Translator `src/gpu/translate.*`: RDNA2 -> GLSL 4.60 (Vulkan) compiled
+2. DONE: Translator `src/gpu/translate.*`: RDNA2 -> GLSL 4.60 (Vulkan) compiled
    with glslangValidator (cache SPIR-V by hash under ~/.cache/xbem).
    Scalar part (SALU/SMEM) runs on the CPU per draw ("scalar pre-pass",
    uniform per draw for UI shaders); every SGPR value a vector instruction
@@ -97,3 +119,5 @@ kill -INT $(pgrep -x xbem)                 # thread dump into the log, then exit
 ## Progress log
 
 - e36afc9: Vulkan core, typed graphics pipelines.
+- 377b327: RDNA2 -> GLSL translator.
+- 31eed69: renderer; first GTA VI screen rendered on the GTX 1080.
