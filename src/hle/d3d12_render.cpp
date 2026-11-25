@@ -113,6 +113,8 @@ struct GpuImage {
   uint32_t texture_index = 0;  // in the bindless array, 0 = not yet
   bool rendered = false;       // the GPU holds its contents
   uint64_t last_render = 0;
+  uint64_t uploaded_frame = 0;  // textures from guest memory: refreshed once per frame they are used
+  uint64_t content_hash = 0;
 };
 
 class Renderer {
@@ -360,7 +362,19 @@ class Renderer {
   GpuImage* image_of(ResourceState* r, bool for_render) {
     if (!r) return nullptr;
     auto it = images_.find(r);
-    if (it != images_.end()) return it->second.get();
+    if (it != images_.end()) {
+      GpuImage* g = it->second.get();
+      // Guest-written textures change (glyph caches, streamed data): refresh
+      // once per frame when the memory changed.
+      if (!for_render && !g->rendered && g->uploaded_frame != presents_ && r->gpu_va) {
+        g->uploaded_frame = presents_;
+        uint32_t format;
+        std::memcpy(&format, r->desc + 32, 4);
+        const VkFormat vf = vk_format(format);
+        upload_texture(*g, r, format, vf >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vf <= VK_FORMAT_BC7_SRGB_BLOCK);
+      }
+      return g;
+    }
     uint32_t dimension, height, format;
     uint64_t width;
     std::memcpy(&dimension, r->desc, 4);
@@ -394,7 +408,10 @@ class Renderer {
       core_.fn().vkCreateImageView(core_.device(), &vci, nullptr, &g->image.view);
     }
     transition(g->image.image, VK_IMAGE_ASPECT_COLOR_BIT);
-    if (!for_render && r->gpu_va) upload_texture(*g, r, format, block);
+    if (!for_render && r->gpu_va) {
+      upload_texture(*g, r, format, block);
+      g->uploaded_frame = presents_;
+    }
     if (next_texture_ < kMaxTextures) {
       g->texture_index = next_texture_++;
       bind_texture(g->texture_index, g->image.view);
@@ -411,8 +428,13 @@ class Renderer {
     const MipLayout& m = l.mip[0];
     const VkDeviceSize size = uint64_t{m.pitch_bytes} * m.height_elements;
     if (size > (64u << 20)) return;
+    scratch_.resize(size);
+    if (!platform::safe_read(r->gpu_va, scratch_.data(), size)) return;
+    const uint64_t hash = fnv1a(scratch_.data(), size);
+    if (hash == g.content_hash) return;
+    g.content_hash = hash;
     const VkDeviceSize at = ring_alloc(size, 16);
-    if (!platform::safe_read(r->gpu_va, static_cast<uint8_t*>(ring_.mapped) + at, size)) return;
+    std::memcpy(static_cast<uint8_t*>(ring_.mapped) + at, scratch_.data(), size);
     const uint32_t row_texels = block ? m.pitch_bytes / l.element.bytes * 4 : m.pitch_bytes / l.element.bytes;
     copy_to_image(g.image, at, row_texels, block ? m.height_elements * 4 : m.height_elements);
     full_barrier();
@@ -1037,6 +1059,7 @@ class Renderer {
   int readback_index_ = 0;
   uint64_t render_serial_ = 0, draws_ = 0, skipped_ = 0, presents_ = 0;
   int traced_ = 0;
+  std::vector<uint8_t> scratch_;
   bool trace_reads_ = false;
   int reads_traced_ = 0;
   std::set<std::string> notes_;

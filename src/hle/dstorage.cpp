@@ -31,6 +31,7 @@
 #include "common/inflate.h"
 #include "common/strings.h"
 #include "hle/d3d12_device.h"
+#include "hle/d3d12_internal.h"
 #include "hle/discovery.h"
 #include "hle/file_log.h"
 #include "hle/hle_util.h"
@@ -208,7 +209,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   // non-zero word.
   uint8_t* dest = nullptr;
   uint64_t dest_size = 0;
-  for (int i = 1; i < fi; ++i) {
+  // A buffer destination: (ID3D12Resource*, offset, size) - the resource is
+  // one of the emulator's objects, its memory the destination.
+  if (fi >= 4) {
+    if (d3d12::ResourceState* res = d3d12::resource_of(w[1]); res && res->gpu_va) {
+      dest = reinterpret_cast<uint8_t*>(res->gpu_va + w[2]);
+      dest_size = static_cast<uint32_t>(w[3]);
+    }
+  }
+  for (int i = 1; i < fi && !dest_size; ++i) {
     if (!dest && w[i] >= 0x10000 && w[i] < 0x800000000000ull) {
       dest = reinterpret_cast<uint8_t*>(w[i]);
     } else if (dest && !dest_size && w[i] && w[i] < (1ull << 32)) {
@@ -252,9 +261,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     static std::atomic<int> warned{0};
     if (warned.fetch_add(1) < 8)
       XBEM_WARN("dstorage", "{}: compression {} chunk at {:#x} ({:#x} bytes): inflate failed ({}) after {:#x} bytes; "
-                "first bytes {:02x} {:02x} {:02x} {:02x}",
+                "first bytes {:02x} {:02x} {:02x} {:02x}; request:{}",
                 file->guest_path, compression, offset, source_size, inflate_result_name(r), produced, buffer[0],
-                buffer.size() > 1 ? buffer[1] : 0, buffer.size() > 2 ? buffer[2] : 0, buffer.size() > 3 ? buffer[3] : 0);
+                buffer.size() > 1 ? buffer[1] : 0, buffer.size() > 2 ? buffer[2] : 0, buffer.size() > 3 ? buffer[3] : 0,
+                hex_qwords(w, 12));
+    if (warned.load() <= 8) {
+      uint64_t at_w1[6] = {};
+      platform::safe_read(w[1], at_w1, sizeof at_w1);
+      XBEM_WARN("dstorage", "  memory at word 1:{}", hex_qwords(at_w1, 6));
+    }
     return HRESULT(0x80070017);  // HRESULT_FROM_WIN32(ERROR_CRC): corrupt data
   }
   return S_OK;
