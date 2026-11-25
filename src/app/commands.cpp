@@ -16,6 +16,7 @@
 #include "common/log.h"
 #include "common/strings.h"
 #include "gpu/rdna2.h"
+#include "hle/gameinput.h"
 #include "hle/registry.h"
 #include "loader/pe_image.h"
 #include "package/package_layout.h"
@@ -788,6 +789,9 @@ int cmd_run(const Args& args) {
       }
     } else if (a == "--log-reads") {
       opt.log_reads = value();
+    } else if (a == "--press") {
+      opt.press += (opt.press.empty() ? "" : ",") + value();
+      hle::parse_gamepad_script(opt.press);  // reports mistakes before the run
     } else if (a == "--no-window") {
       opt.window = false;
     } else if (a == "--watch-log") {

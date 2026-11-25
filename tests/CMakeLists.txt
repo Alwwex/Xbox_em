@@ -253,7 +253,7 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   xbem_guest_test(guest_trace_hle COMMAND run ${GOUT}/seh.exe --trace-hle
                   EXPECT "PASS seh" "\\[trace\\] kernelx.dll!")
   if(XBEM_MINGW_WINDRES)
-    xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --dump-shaders ${GOUT}/shaders
+    xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --press A@0.05:1500 --dump-shaders ${GOUT}/shaders
                     EXPECT "PASS console" "HEADLESS device" "acphal.hal::Connect\\(0x1000, 0x1000\\)" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #2: 3 requests so far"
                            "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set \\(requests complete\\)"
                            "Submit #3: 19 requests so far"
@@ -261,9 +261,11 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                            "gap ending at 0x8000: memory 0x[0-9a-f]+-0x[0-9a-f]+ \\(0x7800 bytes\\) is all zero"
                            "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this"
                            "XMemFreePhysicalPages\\(0x380, .*\\(flags, &count, pages\\) 1 pages freed"
-                           "XMemFreePhysicalPages\\(0x280, .*no layout names allocated pages - nothing freed")
+                           "XMemFreePhysicalPages\\(0x280, .*no layout names allocated pages - nothing freed"
+                           "SSE4a EXTRQ/INSERTQ at console.exe\\+0x[0-9a-f]+ is not supported by this CPU - emulated|SSE4a"
+                           "gamepad: press 0x4 \\(--press\\)")
     # A watchpoint on physical memory mapped twice also guards the other view.
-    xbem_guest_test(guest_console_watch_views COMMAND run ${GOUT}/console.exe --watch at:console.exe!watch_here:rcx+0x120/8
+    xbem_guest_test(guest_console_watch_views COMMAND run ${GOUT}/console.exe --press A@0.05:1500 --watch at:console.exe!watch_here:rcx+0x120/8
                     EXPECT "armed at 0x[0-9a-f]+ \\(hit 1\\) in VirtualAlloc region .*; physical page 0x[0-9a-f]+, mapped at 2 address"
                            "write 1 via 0x[0-9a-f]+ by console.exe\\+0x[0-9a-f]+ \\(guest thread [0-9]+\\): 00 00 00 5a 00 00 00 00 -> 66 00 00 5a"
                            "PASS console")

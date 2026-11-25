@@ -327,8 +327,10 @@ std::atomic<bool> g_continue_after_breakpoint{false};
 // Instructions of the console CPU (AMD Zen 2) that the host CPU may lack.
 // Cache write-back hints (CLWB, CLFLUSHOPT) are rewritten in place into a NOP
 // of the same length (memory is coherent: they have no visible effect);
-// CLZERO, MONITORX and MWAITX are emulated each time.
+// CLZERO, MONITORX and MWAITX and the SSE4a bit-field instructions EXTRQ and
+// INSERTQ are emulated each time.
 std::atomic<uint32_t> g_patched_kinds{0};
+std::atomic<uint64_t> g_sse4a_emulated{0};
 
 void note_patch(uint32_t kind, const char* what, uint64_t rip) {
   if (g_patched_kinds.fetch_or(kind) & kind) return;
@@ -387,6 +389,55 @@ const char* patch_cache_hint_instruction(uint8_t* code) {
 
 namespace {
 
+// SSE4a (AMD only): EXTRQ / INSERTQ in their register forms, on the low 64
+// bits of an XMM register (the upper half is left as it is - undefined on AMD).
+//   66 0F 78 /0 ib ib   EXTRQ xmm, len, idx       66 0F 79 /r  EXTRQ xmm, xmm
+//   F2 0F 78 /r ib ib   INSERTQ xmm, xmm, len, idx F2 0F 79 /r  INSERTQ xmm, xmm
+// A length of 0 means 64.
+bool emulate_sse4a(ucontext_t* uc) {
+  greg_t* g = uc->uc_mcontext.gregs;
+  const auto* code = reinterpret_cast<const uint8_t*>(g[REG_RIP]);
+  size_t i = 0;
+  bool f2 = false, p66 = false;
+  for (; i < 4; ++i) {
+    if (code[i] == 0xF2) f2 = true;
+    else if (code[i] == 0x66) p66 = true;
+    else break;
+  }
+  uint8_t rex = 0;
+  if ((code[i] & 0xF0) == 0x40) rex = code[i++];
+  if (code[i] != 0x0F || (code[i + 1] != 0x78 && code[i + 1] != 0x79) || f2 == p66) return false;
+  const uint8_t op = code[i + 1], modrm = code[i + 2];
+  if ((modrm >> 6) != 3 || !uc->uc_mcontext.fpregs) return false;
+  const int reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0), rm = (modrm & 7) | ((rex & 1) ? 8 : 0);
+  auto* xmm = uc->uc_mcontext.fpregs->_xmm;
+  auto low = [&](int r) -> uint64_t* { return reinterpret_cast<uint64_t*>(&xmm[r].element[0]); };
+  auto high = [&](int r) -> uint64_t* { return reinterpret_cast<uint64_t*>(&xmm[r].element[2]); };
+  unsigned len, idx;
+  size_t size;
+  if (op == 0x78) {
+    if (p66 && ((modrm >> 3) & 7) != 0) return false;
+    len = code[i + 3] & 63;
+    idx = code[i + 4] & 63;
+    size = i + 5;
+  } else {
+    const uint64_t control = f2 ? *high(rm) : *low(rm);
+    len = control & 63;
+    idx = (control >> 8) & 63;
+    size = i + 3;
+  }
+  const uint64_t mask = len == 0 ? ~0ull : (1ull << len) - 1;
+  if (p66) {
+    uint64_t* dst = low(op == 0x78 ? rm : reg);
+    *dst = (*dst >> idx) & mask;
+  } else {
+    uint64_t* dst = low(reg);
+    *dst = (*dst & ~(mask << idx)) | ((*low(rm) & mask) << idx);
+  }
+  g[REG_RIP] += static_cast<greg_t>(size);
+  return true;
+}
+
 // Returns true when execution can continue at the (possibly updated) RIP.
 bool handle_unsupported_instruction(ucontext_t* uc) {
   greg_t* g = uc->uc_mcontext.gregs;
@@ -394,6 +445,17 @@ bool handle_unsupported_instruction(ucontext_t* uc) {
   const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
   if (const char* what = patch_cache_hint_instruction(code)) {
     note_patch(what[2] == 'W' ? 1 : 2, what, rip);
+    return true;
+  }
+  if (emulate_sse4a(uc)) {
+    const uint64_t n = ++g_sse4a_emulated;
+    note_patch(16, "SSE4a EXTRQ/INSERTQ", rip);
+    if ((n & (n - 1)) == 0 && n >= 1024) {
+      char line[160];
+      std::snprintf(line, sizeof line, "[info ][cpu  ] %llu SSE4a instructions emulated\n",
+                    static_cast<unsigned long long>(n));
+      write_str(line);
+    }
     return true;
   }
   const DecodedPrefixes d = skip_prefixes(code);

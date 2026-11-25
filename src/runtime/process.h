@@ -41,6 +41,7 @@ struct ProcessOptions {
   int trace_log_hits = 8;             // hits of each tracepoint logged as they happen
   bool window = true;                 // open the run window when a display is available
   std::string log_reads;              // log file operations on files whose path contains this
+  std::string press;                  // scripted gamepad presses (--press), see hle/gameinput.h
   std::vector<std::string> watch;    // data watchpoints: ADDRESS[/len] or alloc:CALLER+OFFSET[/len]
   int watch_log_writes = 16;          // writes of each watchpoint logged as they happen
   DeviceType device = DeviceType::XboxScarlettAnaconda;

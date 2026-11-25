@@ -98,6 +98,7 @@ std::vector<CpuFeature> host_cpu_features() {
       {"RDSEED", bit(l7.ebx, 18), false},
       {"ADX", bit(l7.ebx, 19), false},
       {"RDPID", bit(l7.ecx, 22), false},
+      {"SSE4a", bit(e1.ecx, 6), false},  // AMD only; EXTRQ/INSERTQ are emulated on SIGILL
   };
 }
 

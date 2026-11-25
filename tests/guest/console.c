@@ -254,6 +254,24 @@ static void test_zen2_instructions(void) {
   __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x38" ::"a"(p) : "memory"); /* clflushopt [rax] */
   __asm__ volatile(".byte 0x0f, 0x01, 0xfc" ::"a"(p + 5) : "memory");   /* clzero: line of rax */
   CHECK(buf[63] == 0xEE && buf[64] == 0 && buf[127] == 0 && buf[128] == 0xEE);
+
+  /* SSE4a bit fields (AMD only, emulated on Intel): INSERTQ / EXTRQ */
+  uint64_t value = 0x1122334455667788ull, field = 0xAB, out = 0, control = 0x0808;
+  __asm__ volatile("movq %1, %%xmm1\n\tmovq %2, %%xmm2\n\t"
+                   ".byte 0xf2, 0x0f, 0x78, 0xca, 0x08, 0x10\n\t" /* insertq xmm1, xmm2, 8, 16 */
+                   "movq %%xmm1, %0"
+                   : "=r"(out) : "r"(value), "r"(field) : "xmm1", "xmm2");
+  CHECK(out == 0x1122334455AB7788ull);
+  __asm__ volatile("movq %1, %%xmm1\n\t"
+                   ".byte 0x66, 0x0f, 0x78, 0xc1, 0x08, 0x10\n\t" /* extrq xmm1, 8, 16 */
+                   "movq %%xmm1, %0"
+                   : "=r"(out) : "r"(value) : "xmm1");
+  CHECK(out == 0x66);
+  __asm__ volatile("movq %1, %%xmm9\n\tmovq %2, %%xmm2\n\t"
+                   ".byte 0x66, 0x44, 0x0f, 0x79, 0xca\n\t" /* extrq xmm9, xmm2 (len 8, index 8) */
+                   "movq %%xmm9, %0"
+                   : "=r"(out) : "r"(value), "r"(control) : "xmm9", "xmm2");
+  CHECK(out == 0x77);
 }
 
 typedef void** Vt;
@@ -263,7 +281,10 @@ typedef void** Vt;
 
 /* Texture uploads: the computer copies linear rows into the emulator's
  * linear D3D12 layout (rows aligned to 256 bytes, subresources to 512). */
+static uint8_t mip1_data_for_xg[100];
+
 static void test_xg(void) {
+  for (int i = 0; i < 100; ++i) mip1_data_for_xg[i] = (uint8_t)(i + 1);
   static uint8_t xg_desc[64];
   uint32_t mode = 0xFFFF;
   CHECK(XGSuggestSwizzleMode(xg_desc, 0, &mode) == 0 && mode == 0);
@@ -284,6 +305,34 @@ static void test_xg(void) {
   CHECK(memcmp(back, mip1, 100) == 0);
   typedef uint32_t (*RefFn)(void*);
   CHECK(((RefFn)VT(computer)[1])(computer) == 0); /* Release */
+
+  /* A described texture: R8 100x4 with 2 mips. XG_RESOURCE_LAYOUT: header
+   * (size, alignment, mips, planes), plane 0 at 0x18 with its mips from
+   * +0x38, 0x70 bytes each (size, offset, 2D size, pitch in bytes at +0x1c). */
+  static uint8_t desc[64];
+  memset(desc, 0, sizeof desc);
+  *(uint32_t*)desc = 3;             /* TEXTURE2D */
+  *(uint64_t*)(desc + 16) = 100;    /* width */
+  *(uint32_t*)(desc + 24) = 4;      /* height */
+  *(uint16_t*)(desc + 28) = 1;      /* array size */
+  *(uint16_t*)(desc + 30) = 2;      /* mips */
+  *(uint32_t*)(desc + 32) = 61;     /* R8_UNORM */
+  *(uint32_t*)(desc + 36) = 1;      /* samples */
+  CHECK(XGCreateTextureComputer(desc, &computer) == 0 && computer);
+  typedef HRESULT (*LayoutFn)(void*, uint8_t*);
+  static uint8_t layout[0x1b38];
+  memset(layout, 0xcc, sizeof layout);
+  CHECK(((LayoutFn)VT(computer)[2])(computer, layout) == 0);
+  const uint8_t* plane = layout + 0x18;
+  const uint8_t* mip1_layout = plane + 0x38 + 0x70;
+  CHECK(*(uint64_t*)layout == 1536 && *(uint32_t*)(layout + 0x10) == 2 && *(uint32_t*)(layout + 0x14) == 1);
+  CHECK(*(uint64_t*)(plane + 0x38) == 1024 && *(uint64_t*)(plane + 0x40) == 0 && *(uint32_t*)(plane + 0x38 + 0x1c) == 256);
+  CHECK(*(uint64_t*)mip1_layout == 512 && *(uint64_t*)(mip1_layout + 8) == 1024 && *(uint32_t*)(mip1_layout + 0x1c) == 256);
+  CHECK(*(uint32_t*)(mip1_layout + 0x30) == 50 && *(uint32_t*)(mip1_layout + 0x34) == 2);
+  memset(gpu, 0, sizeof gpu);
+  CHECK(((CopyFn)VT(computer)[8])(computer, gpu, 0, 1, mip1_data_for_xg, 50, 100) == 0);
+  CHECK(gpu[1024] == 1 && gpu[1024 + 256 + 49] == 100);
+  CHECK(((RefFn)VT(computer)[1])(computer) == 0);
 }
 
 /* --------------------------------------------------------------- locale */
@@ -825,6 +874,28 @@ static void test_audio_endpoint(void) {
   CloseHandle(event);
 }
 
+static volatile int g_device_reports, g_reading_callbacks;
+static volatile uint32_t g_callback_buttons;
+static void* volatile g_reported_device;
+
+typedef _Bool (*GiGamepadState)(void*, uint32_t*);
+static void gi_device_callback(uint64_t token, void* context, void* device, uint64_t timestamp, uint32_t status,
+                               uint32_t previous) {
+  (void)token, (void)timestamp, (void)previous;
+  if (context == (void*)7 && (status & 1)) {
+    g_reported_device = device;
+    g_device_reports++;
+  }
+}
+static void gi_reading_callback(uint64_t token, void* context, void* reading, _Bool overrun) {
+  (void)token, (void)context, (void)overrun;
+  uint32_t state[7] = {0};
+  if (((GiGamepadState)(*(void***)reading)[22])(reading, state)) g_callback_buttons |= state[0];
+  g_reading_callbacks++;
+}
+
+/* GameInput: one gamepad. The test runs with --press A@0.05:1500, so A is
+ * held from 50 ms after GameInputCreate. */
 static void test_gameinput(void) {
   void* gi = 0;
   CHECK(GameInputCreate(&gi) == 0 && gi);
@@ -832,10 +903,39 @@ static void test_gameinput(void) {
   const uint64_t t1 = ((GiTimestamp)vt[3])(gi);
   Sleep(2);
   CHECK(((GiTimestamp)vt[3])(gi) > t1);
-  void* reading = (void*)1;
-  CHECK(((GiCurrentReading)vt[4])(gi, 0x40000 /*Gamepad*/, 0, &reading) == (HRESULT)0x838A0003 && reading == 0);
+  void* reading = 0;
+  CHECK(((GiCurrentReading)vt[4])(gi, 0x40000 /*Gamepad*/, 0, &reading) == 0 && reading);
+  ((Release)(*(void***)reading)[2])(reading);
+  reading = (void*)1;
+  CHECK(((GiCurrentReading)vt[4])(gi, 0x10 /*Keyboard*/, 0, &reading) == (HRESULT)0x838A0003 && reading == 0);
+
+  /* The device callback reports the gamepad during registration */
   uint64_t token = 0;
-  CHECK(((GiRegisterDevice)vt[9])(gi, 0, 0x40000, 1, 1, 0, 0, &token) == 0 && token != 0);
+  CHECK(((GiRegisterDevice)vt[9])(gi, 0, 0x40000, 1, 2, (void*)7, (void*)gi_device_callback, &token) == 0 && token);
+  CHECK(g_device_reports == 1 && g_reported_device);
+  void* device = g_reported_device;
+  typedef const uint8_t* (*InfoFn)(void*);
+  typedef uint32_t (*StatusFn)(void*);
+  const uint8_t* info = ((InfoFn)(*(void***)device)[3])(device);
+  CHECK(info && *(uint32_t*)info == 320 && *(uint16_t*)(info + 4) == 0x045e && (*(uint32_t*)(info + 104) & 0x40000));
+  CHECK(((StatusFn)(*(void***)device)[4])(device) & 1);
+  CHECK(((GiRegisterDevice)vt[9])(gi, 0, 0x10, 1, 2, (void*)7, (void*)gi_device_callback, &token) == 0);
+  CHECK(g_device_reports == 1); /* no keyboard */
+
+  /* The scripted press reaches readings and reading callbacks */
+  typedef HRESULT (*RegisterReadingFn)(void*, void*, uint32_t, float, void*, void*, uint64_t*);
+  CHECK(((RegisterReadingFn)vt[8])(gi, 0, 0x40000, 0.0f, 0, (void*)gi_reading_callback, &token) == 0);
+  uint32_t state[7] = {0};
+  for (int i = 0; i < 400 && !(state[0] & 4); ++i) {
+    Sleep(5);
+    CHECK(((GiCurrentReading)vt[4])(gi, 0x40000, 0, &reading) == 0);
+    CHECK(((GiGamepadState)(*(void***)reading)[22])(reading, state));
+    ((Release)(*(void***)reading)[2])(reading);
+  }
+  CHECK(state[0] == 4); /* A */
+  for (int i = 0; i < 200 && !g_reading_callbacks; ++i) Sleep(5);
+  CHECK(g_reading_callbacks >= 1 && (g_callback_buttons & 4));
+
   void* dispatcher = 0;
   CHECK(((GiCreateDispatcher)vt[14])(gi, &dispatcher) == 0 && dispatcher);
   CHECK(!((GiDispatch)(*(void***)dispatcher)[3])(dispatcher, 0));
