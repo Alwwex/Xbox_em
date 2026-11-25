@@ -462,9 +462,25 @@ void run_status(QueueState* q, ProbeObject* array, uint32_t index) {
   }
 }
 
+void drain(QueueState* q);
+
+// Work runs when it is enqueued, except requests into physical memory
+// (options 0x20xxxx): the title fills their frame arrays after Enqueue and
+// before Submit, so they wait for Submit - and so does everything enqueued
+// after them, to keep the order. (Waiting for Submit with everything made
+// GTA VI's synchronous reads hang: it relies on the queue starting work by
+// itself.)
 void enqueue(QueueState* q, QueueState::Pending p) {
-  std::lock_guard lock(q->mutex);
-  q->pending.push_back(p);
+  const bool deferred = p.kind == QueueState::Pending::Request && (p.words[0] & 0x200000);
+  {
+    std::lock_guard lock(q->mutex);
+    if (deferred || !q->pending.empty()) {
+      q->pending.push_back(p);
+      return;
+    }
+    q->pending.push_back(p);
+  }
+  drain(q);
 }
 
 HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* request) {
@@ -499,7 +515,7 @@ HRESULT XBEM_GUEST_ABI queue_enqueue_set_event(ProbeObject* self, uint64_t handl
   auto event = proc().handles().get_as<rt::EventObject>(handle);
   if (event) enqueue(static_cast<QueueState*>(self->state), {QueueState::Pending::Event, {}, handle, 0, 0});
   probe_log(self, 12,
-            std::format("EnqueueSetEvent({:#x}) -> {}", handle, event ? "set when submitted work completes" : "not an event"),
+            std::format("EnqueueSetEvent({:#x}) -> {}", handle, event ? "set when the work before it completes" : "not an event"),
             XBEM_RETURN_ADDRESS());
   return S_OK;
 }

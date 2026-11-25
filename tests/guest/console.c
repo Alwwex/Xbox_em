@@ -1049,7 +1049,6 @@ static void test_dstorage(void) {
   const uint32_t size = *(uint32_t*)(info + 36) < sizeof image ? *(uint32_t*)(info + 36) : sizeof image;
   uint64_t whole[12] = {0, (uint64_t)(uintptr_t)image, 0, size, (uint64_t)(uintptr_t)file, 0, size};
   ((EnqueueFn)qv[3])(queue, whole);
-  CHECK(image[0] == 0); /* nothing happens before Submit */
   ((SubmitFn)qv[6])(queue);
   uint32_t at = 0;
   for (uint32_t i = 0; i + 4 <= size; ++i)
@@ -1088,9 +1087,13 @@ static void test_dstorage(void) {
     CHECK(view && XMemMapPhysicalPages(view, 1, frames) == view);
     memset(view, 0xee, 80);
     const uint64_t frame = frames[0];
-    uint64_t phys[12] = {0x200001, (uint64_t)(uintptr_t)frames, 33, 33, (uint64_t)(uintptr_t)file, at, 44};
+    /* Enqueued with the frame array still empty: it is read at Submit. */
+    uint64_t later[1] = {0};
+    uint64_t phys[12] = {0x200001, (uint64_t)(uintptr_t)later, 33, 33, (uint64_t)(uintptr_t)file, at, 44};
     ((EnqueueFn)qv[3])(queue, phys);
     ((EnqueueStatusFn)qv[4])(queue, status, 1);
+    CHECK(!((IsCompleteFn)(*(void***)status)[3])(status, 1));
+    later[0] = frames[0];
     ((SubmitFn)qv[6])(queue);
     CHECK(((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
     CHECK(frames[0] == frame);
@@ -1102,9 +1105,7 @@ static void test_dstorage(void) {
   typedef void (*SetEventFn)(void*, HANDLE);
   HANDLE done = CreateEventW(0, 1, 0, 0);
   ((SetEventFn)qv[12])(queue, done);
-  CHECK(WaitForSingleObject(done, 0) == WAIT_TIMEOUT); /* set when the submitted work completes */
-  ((SubmitFn)qv[6])(queue);
-  CHECK(WaitForSingleObject(done, 0) == WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(done, 0) == WAIT_OBJECT_0); /* the work before it is done */
 
   /* Coverage in the Submit log: 16 requests on a second file object, with a
    * gap of 0x7800 bytes that no request reads. */

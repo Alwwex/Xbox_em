@@ -256,8 +256,8 @@ if(NOT WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   if(XBEM_MINGW_WINDRES)
     xbem_guest_test(guest_console COMMAND run ${GOUT}/console.exe --press A@0.05:1500 --capture-commands ${GOUT}/commands.txt@0:60000 --dump-shaders ${GOUT}/shaders
                     EXPECT "PASS console" "HEADLESS device" "acphal.hal::Connect\\(0x1000, 0x1000\\)" "captured shader #1: .*cs_[0-9a-f]+\\.bin \\(32 bytes\\)" "dstorage. Submit #3: 3 requests so far"
-                           "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set when submitted work completes"
-                           "Submit #7: 21 requests so far"
+                           "EnqueueSetEvent\\(0x[0-9a-f]+\\) -> set"
+                           "Submit #6: 21 requests so far"
                            "console.exe: 16 requests cover 0x0-0x8800 of 0x[0-9a-f]+ bytes; 1 gaps \\(0x7800 bytes\\): 0x800-0x8000"
                            "gap ending at 0x8000: memory 0x[0-9a-f]+-0x[0-9a-f]+ \\(0x7800 bytes\\) is all zero"
                            "created d3d12.device.m301 into the zeroed output" "method302 called with an unknown this"
