@@ -181,12 +181,92 @@ HRESULT XBEM_GUEST_ABI computer_copy_from(ProbeObject* self, uint8_t* linear, ui
   return S_OK;
 }
 
+// GetResourceTiling(numTiles*, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*,
+// numSubresourceTilings* (in/out), firstSubresource, D3D12_SUBRESOURCE_TILING*)
+// with D3D12's standard 64 KiB tiles: tile shapes of 256x256 (1-byte
+// elements) down to 64x64 (16-byte elements, BC blocks); a mip with a side
+// smaller than the tile and all smaller ones are "packed" into whole tiles of
+// their own. GTA VI sizes its streamed textures from this (fn 0x1403441f0);
+// an empty answer gave them no pages while their release freed the full size.
+HRESULT computer_get_tiling(ProbeObject* self, uint32_t* num_tiles, uint8_t* packed, uint32_t* shape,
+                            uint32_t* num_subresources, uint32_t first, uint8_t* tilings) {
+  ComputerState* state = state_of(self);
+  if (!state->computed()) return E_INVALIDARG;
+  const TextureLayout l = linear_layout(state->desc);
+  if (l.mip.empty()) return E_INVALIDARG;
+  const uint32_t e = std::max<uint32_t>(l.element.bytes, 1);
+  const uint32_t tile_w = e <= 2 ? 256 : e <= 8 ? 128 : 64;
+  const uint32_t tile_h = e == 1 ? 256 : e == 2 ? 128 : e == 4 ? 128 : 64;
+  uint32_t standard = 0;
+  while (standard < l.mips && l.mip[standard].width_elements >= tile_w && l.mip[standard].height_elements >= tile_h)
+    ++standard;
+  uint64_t packed_bytes = 0;
+  for (uint32_t m = standard; m < l.mips; ++m) packed_bytes += uint64_t{l.mip[m].width_elements} * l.mip[m].height_elements * e * std::max<uint32_t>(l.mip[m].depth, 1);
+  const uint32_t packed_tiles = standard < l.mips ? static_cast<uint32_t>((packed_bytes + 0xFFFF) / 0x10000) : 0;
+  std::vector<uint32_t> start(l.mips), wide(l.mips), high(l.mips), deep(l.mips);
+  uint32_t per_slice = 0;
+  for (uint32_t m = 0; m < standard; ++m) {
+    wide[m] = (l.mip[m].width_elements + tile_w - 1) / tile_w;
+    high[m] = (l.mip[m].height_elements + tile_h - 1) / tile_h;
+    deep[m] = std::max<uint32_t>(l.mip[m].depth, 1);
+    start[m] = per_slice;
+    per_slice += wide[m] * high[m] * deep[m];
+  }
+  const uint32_t packed_start = per_slice;
+  per_slice += packed_tiles;
+  const uint32_t slices = std::max<uint32_t>(l.slices, 1);
+  if (num_tiles) *num_tiles = per_slice * slices;
+  if (packed) {
+    packed[0] = static_cast<uint8_t>(standard);
+    packed[1] = static_cast<uint8_t>(l.mips - standard);
+    put<uint32_t>(packed, 4, packed_tiles);
+    put<uint32_t>(packed, 8, packed_tiles ? packed_start : 0);
+  }
+  if (shape) {
+    const uint32_t texels = l.element.block ? 4 : 1;
+    shape[0] = tile_w * texels;
+    shape[1] = tile_h * texels;
+    shape[2] = 1;
+  }
+  if (num_subresources && tilings) {
+    const uint32_t total = l.mips * slices;
+    uint32_t n = first < total ? std::min(*num_subresources, total - first) : 0;
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint32_t sub = first + k, m = sub % l.mips, slice = sub / l.mips;
+      uint8_t* t = tilings + k * 12;
+      const bool is_packed = m >= standard;
+      put<uint32_t>(t, 0, is_packed ? 0 : wide[m]);
+      put<uint16_t>(t, 4, static_cast<uint16_t>(is_packed ? 0 : high[m]));
+      put<uint16_t>(t, 6, static_cast<uint16_t>(is_packed ? 0 : deep[m]));
+      put<uint32_t>(t, 8, is_packed ? 0xFFFFFFFFu : slice * per_slice + start[m]);
+    }
+    *num_subresources = n;
+  }
+  if (log_now())
+    XBEM_INFO("xg", "GetResourceTiling({}x{} format {}, {} mips) -> {} tiles, {} standard mips, {} packed in {} tiles",
+              l.mip[0].width, l.mip[0].height, l.format, l.mips, per_slice * slices, standard, l.mips - standard,
+              packed_tiles);
+  return S_OK;
+}
+
+// Slot 10 is called in two shapes: GetResourceTiling (fn 0x1403441f0: the
+// second argument is a pointer) and CopyFromSubresource (a plane number).
+HRESULT XBEM_GUEST_ABI computer_slot10(ProbeObject* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                       uint64_t a5, uint64_t a6) {
+  if (a2 >= 0x10000)
+    return computer_get_tiling(self, reinterpret_cast<uint32_t*>(a1), reinterpret_cast<uint8_t*>(a2),
+                               reinterpret_cast<uint32_t*>(a3), reinterpret_cast<uint32_t*>(a4),
+                               static_cast<uint32_t>(a5), reinterpret_cast<uint8_t*>(a6));
+  return computer_copy_from(self, reinterpret_cast<uint8_t*>(a1), static_cast<uint32_t>(a2), static_cast<uint32_t>(a3),
+                            reinterpret_cast<const uint8_t*>(a4), static_cast<uint32_t>(a5), static_cast<uint32_t>(a6));
+}
+
 const ProbeVtable& computer_vtable() {
   static const ProbeVtable v = make_probe_vtable({{0, reinterpret_cast<void*>(&computer_add_ref)},
                                                   {1, reinterpret_cast<void*>(&computer_release)},
                                                   {2, reinterpret_cast<void*>(&computer_get_layout)},
                                                   {8, reinterpret_cast<void*>(&computer_copy_into)},
-                                                  {10, reinterpret_cast<void*>(&computer_copy_from)}});
+                                                  {10, reinterpret_cast<void*>(&computer_slot10)}});
   return v;
 }
 

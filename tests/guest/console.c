@@ -333,6 +333,28 @@ static void test_xg(void) {
   CHECK(((CopyFn)VT(computer)[8])(computer, gpu, 0, 1, mip1_data_for_xg, 50, 100) == 0);
   CHECK(gpu[1024] == 1 && gpu[1024 + 256 + 49] == 100);
   CHECK(((RefFn)VT(computer)[1])(computer) == 0);
+
+  /* Slot 10 with pointers: GetResourceTiling (D3D12's standard 64 KiB tiles),
+   * as GTA VI sizes its streamed textures. BC7 1024x1024 with 9 mips: tiles of
+   * 64x64 blocks (256x256 texels); mips 1024, 512, 256 take 16 + 4 + 1 tiles,
+   * the 6 smaller ones are packed into one more: 22 tiles. */
+  *(uint64_t*)(desc + 16) = 1024;
+  *(uint32_t*)(desc + 24) = 1024;
+  *(uint16_t*)(desc + 30) = 9;
+  *(uint32_t*)(desc + 32) = 98; /* BC7_UNORM */
+  CHECK(XGCreateTextureComputer(desc, &computer) == 0 && computer);
+  typedef HRESULT (*TilingFn)(void*, uint32_t*, uint8_t*, uint32_t*, uint32_t*, uint32_t, uint8_t*);
+  uint32_t tiles = 0, shape[3] = {0}, count = 16;
+  uint8_t packed[12] = {0}, tilings[16 * 12];
+  memset(tilings, 0xcc, sizeof tilings);
+  CHECK(((TilingFn)VT(computer)[10])(computer, &tiles, packed, shape, &count, 0, tilings) == 0);
+  CHECK(tiles == 22 && packed[0] == 3 && packed[1] == 6 && *(uint32_t*)(packed + 4) == 1 && *(uint32_t*)(packed + 8) == 21);
+  CHECK(shape[0] == 256 && shape[1] == 256 && shape[2] == 1 && count == 9);
+  CHECK(*(uint32_t*)tilings == 4 && *(uint16_t*)(tilings + 4) == 4 && *(uint32_t*)(tilings + 8) == 0);
+  CHECK(*(uint32_t*)(tilings + 12) == 2 && *(uint32_t*)(tilings + 12 + 8) == 16);
+  CHECK(*(uint32_t*)(tilings + 24) == 1 && *(uint32_t*)(tilings + 24 + 8) == 20);
+  CHECK(*(uint32_t*)(tilings + 36) == 0 && *(uint32_t*)(tilings + 36 + 8) == 0xFFFFFFFFu);
+  CHECK(((RefFn)VT(computer)[1])(computer) == 0);
 }
 
 /* --------------------------------------------------------------- locale */
