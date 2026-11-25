@@ -81,9 +81,10 @@ up in a new session; `ARCHITECTURE.md` and `GPU.md` hold the design.
    Crash reports end with every other guest thread's RIP and the guest
    return addresses on its stack ("Other guest threads at the crash"): a
    thread blocked in an emulated wait shows the call it waits in.
-6. `--continue-after-breakpoint` skips one known title assertion
-   (+0x247af2d, a render-target budget check that expects the console's tiled
-   texture sizes); everything after it runs normally.
+6. `--continue-after-breakpoint` skips title assertions (int3) and logs the
+   first 32 with registers, backtrace and the strings the code before
+   loaded; the one left is +0x247af2d, a render-target budget check that
+   expects the console's tiled texture sizes.
 
 ## How far the title gets (latest run)
 
@@ -91,10 +92,18 @@ CRT and TLS init, memory manager (xmem, placeholders, physical pages), GDK
 runtime binding, GameInput, window, `D3D12XboxCreateDevice` (headless
 device), DXGI output modes, frame pacing, descriptor heaps in title memory,
 back buffers, the raytracing BVH builder (52 DXIL compute pipelines, root
-signatures), XG texture uploads, DirectStorage loading (≈4200 requests,
-≈275 MB inflated from `shaders.rpf` and others), 42 native RDNA2 compute
-pipelines. It then runs for about ten seconds; every crash so far has been a
-console API the emulator answered wrongly, found from the crash report.
+signatures), XG texture uploads, DirectStorage loading, all 1,234 shader
+programs, audio start-up (APU heap, XMA shape contexts, Core Audio spatial
+streams). Run on `0944bf2`: **no crash in 200+ s**; the main loop runs
+steadily (about 230 frame events, 1,300 draws and 110 dispatches recorded
+per second, 56 guest threads), streaming from `audio.rpf` and others. The
+only int3 left is the known render-target budget check (+0x247af2d). What
+the title shows cannot be seen yet (no renderer); input reports no devices.
+
+The run log has a status line every 30 s (`grep "\[status\]" run.log`).
+Ctrl+C prints every guest thread and, as crash reports do, the tracepoint
+and watchpoint summaries (a hang is investigated like a crash; send the
+signal to the xbem process itself, `kill -INT $(pgrep -x xbem)`).
 
 ## Console API findings (measured on this title)
 
@@ -120,6 +129,45 @@ D3D12.X (`src/hle/d3d12_device.cpp`, table in `GPU.md`):
   `GPU.md`). Topology `0x11` is the AMD RECTLIST.
 - Unified memory: GPU virtual address = CPU address.
 
+Audio (`src/hle/console_devices.cpp`, `src/hle/audio_endpoint.cpp`):
+
+- `ApuCreateHeap(cachedBytes, nonCachedBytes)` once (0x1c700000 / 0x226e00);
+  `ApuAlloc(&va, &apuAddress, size, alignment 0x800, flags)` (flags 2 =
+  non-cached); APU addresses are 32-bit, stored in XMA contexts (+0x1c/+0x20)
+  and mapped back with `ApuMapApuAddress`.
+- `AcpHalAllocateShapeContexts(SHAPE_CONTEXTS*)`: six u32 counts (SRC, EQ,
+  filter/volume, DMA, XMA, PCM), six array pointers at +0x18; the title asks
+  for 350 XMA contexts of 64 bytes.
+- `AcpHalCreate(&hal)`: not COM - slot 0 Connect(0x1000, 0x1000), 1
+  Disconnect, 2 SubmitCommand(id, mask, timeout, &arg), 5 Release.
+- `XApuConnect(params, &shared, &handle)`: params {1, 0x100, 2, 0x104000
+  shared bytes, ...}; shared+0 receives the command/result memory.
+- Core Audio: the title enumerates render endpoints through
+  `CoCreateInstance(MMDeviceEnumerator)` and renders through Spatial Audio
+  (`ISpatialAudioClient`, object render streams with static objects, an event
+  per 10 ms buffer). Without a device it falls back to a "fake audio mixer"
+  in which fn 0x5267720 takes the mixer lock and returns without releasing
+  it (no output stream: `[mixer+0x52c] == 0`) - the audio thread deadlocked
+  and the main loop waited 100 ms per frame for audio.
+
+GDK runtime binding (`src/hle/xgameruntime.cpp`): the title does not call
+xgameruntime exports; its static library calls
+`QueryApiImpl(clsid, iid, &object)` before every GDK call and then a slot of
+the object (IUnknown, then the family's functions). Bound so far: XSystem
+`{e349bd1a-...}` (3 GetConsoleId, 4 GetXboxLiveSandboxId - the title
+asserts unless it is RETAIL, CERT, CERT.DEBUG or RKTR.*, 5
+GetAppSpecificDeviceId) and XNetworking `{37e56907-...}` (15
+GetConnectivityHint, polled from many places). Other families still answer
+E_NOINTERFACE: `{073b7dcb-...}` (clsid = iid), `{03f0fe74-...}`,
+`{af406016-...}`, `{01acd177-...}`, `{f4faf4d4-...}`, `{973a344e-...}`,
+`{3e241977-...}`; their wrappers are found with `xbem xrefs <exe> <address
+of the clsid>` (the slot is the `call [rax+N]` after the QueryApiImpl
+wrapper fn 0x55de048).
+
+Descriptor heaps: the console desc is the PC desc plus the descriptors'
+memory (+16) and its size (+24); some call sites fill only the PC part, so
+the memory is used only when the size covers the heap.
+
 Other modules: XG (`src/hle/xg.cpp`) keeps textures in the linear D3D12
 layout and reports `SW_LINEAR`; DirectStorage (`src/hle/dstorage.cpp`)
 follows the PC `dstorage.h` method order, executes requests synchronously,
@@ -134,7 +182,24 @@ Leonida's code - notably its RDNA2 → SPIR-V translator - may be reused with
 attribution (keep its copyright notices, name the source in the file
 header). Leonida is not in this repository; the owner uploads it when needed.
 
-## Open crash (latest run)
+## Fixed on the way to the main loop (runs on `48e2abc`..`0944bf2`)
+
+1. Global `0x14ab5cdf8` null (crash at +0x57f9a81): its setter (fn
+   `0x5a6f390`, called by fn `0x2425c90`) was skipped because the audio
+   start-up (fn `0x43ad8b0`) asserted on `ApuCreateHeap` -> E_NOTIMPL; the
+   int3s at +0x43ad94e, +0x43a657e, +0x25a4ca0 and +0x2425df4 were that one
+   failure. Fixed by the APU heap, shape contexts, HAL object and XApu
+   queue.
+2. Crash at +0x4fd2b64 on a pointer tagged `0x0010...` (a buffer
+   descriptor's stride): fn `0x1c744f0` creates a descriptor heap with only
+   the 16 PC bytes of the desc; the stack behind them held a pointer into the
+   render context, which the old "first allocated pointer in 64 bytes" scan
+   took as the heap's memory, so descriptors were written over the context.
+3. Sandbox assert (+0x3dda76b): see the GDK binding above.
+4. Audio deadlock (int3 +0x4dcbc9d about 6 times a second, ring buffer
+   full): see Core Audio above.
+
+## Earlier crashes (fixed)
 
 Run on `78b7391` (PFNs in 4 KiB units): **all 1,234 program lookups
 succeed** (a counting tracepoint on `0x247c833?rax=0`: 0 matched) and the
@@ -384,9 +449,10 @@ fills one with a test pattern to see the path work.
 
 ## Next steps
 
-1. Keep the headless path running: fix each crash from the crash report and
-   the probe log, add a guest test (`tests/guest/console.c`) for every new
-   console method.
+1. The title runs its main loop: find what it waits for next. The GDK
+   families still unbound (above) and input (GameInput reports no devices;
+   a title screen may wait for "press any button") are the candidates; the
+   probe log and the QueryApiImpl lines show which are called per frame.
 2. Command lists: type the console command list (Leonida documents the
    shifted slots: 0-26 PC order, 27-30 console-only, then +4, SetDescriptorHeaps
    at 32, ExecuteIndirect at 61) and record commands, so draws and dispatches
@@ -397,4 +463,6 @@ fills one with a test pattern to see the path work.
    is a GTX 1080 (no ray tracing in Vulkan, wave32) and WSL2 Vulkan on NVIDIA
    goes through Mesa's dzn layer; a Windows or native-Linux host will be
    needed for presentation.
-4. Audio (acphal/chad/xapu), real XG tiling, network stay stubbed for now.
+4. Audio output (the spatial objects' buffers are zeroed and dropped; XMA
+   decoding through XApu returns no results), chad (XDsp), real XG tiling and
+   the network stay stubbed for now.
