@@ -163,6 +163,26 @@ DWORD guest_main(void* peb) {
   CHECK(strtol("4294967296", 0, 10) == 2147483647);
   CHECK(*_errno() == 34); /* ERANGE */
   CHECK(strtoul("-1", 0, 10) == 4294967295u);
+  /* A long list read number by number (GTA VI's XML parser does this with
+   * megabytes of text): each call looks only at its number. */
+  {
+    static char list[1 << 20];
+    size_t at = 0;
+    uint32_t written = 0;
+    while (at + 4 < sizeof list) { list[at++] = '4'; list[at++] = '2'; list[at++] = ' '; ++written; }
+    list[at] = '<';
+    const char* p = list;
+    char* next = 0;
+    uint32_t count = 0, sum = 0;
+    while (*p != '<') {
+      sum += strtoul(p, &next, 10);
+      CHECK(next == p + 2);
+      p = next + 1;
+      ++count;
+    }
+    CHECK(count == written && sum == count * 42);
+    CHECK(strtoul(" 0x1fz", &next, 16) == 31 && *next == 'z');
+  }
   char* end = 0;
   CHECK(strtod("2.5x", &end) == 2.5 && *end == 'x');
   CHECK(atoi("  -17") == -17);

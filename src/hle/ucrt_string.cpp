@@ -546,9 +546,21 @@ wchar* XBEM_GUEST_ABI hle_wmemchr(const wchar* s, uint32_t c, SIZE_T n) {
 // Parses with the host strto* on an ASCII view of the guest string so that
 // character positions map 1:1 for the end pointer.
 template <class C>
+// The part of a guest string a number conversion can consume: leading white
+// space, then characters that may belong to a number (digits and letters for
+// any base, signs, '.', "inf"/"nan(...)" forms). Stopping there keeps
+// strtol & co. linear - titles call them in loops over megabytes of text
+// (GTA VI's XML parser reads number lists with strtoul).
 std::string ascii_view(const C* s) {
   std::string out;
-  for (; *s; ++s) out.push_back(static_cast<uint32_t>(*s) < 0x80 ? static_cast<char>(*s) : '\x01');
+  for (; *s == ' ' || (*s >= '\t' && *s <= '\r'); ++s) out.push_back(static_cast<char>(*s));
+  for (; *s && out.size() < 4096; ++s) {
+    const uint32_t c = static_cast<uint32_t>(*s);
+    const bool part = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '+' ||
+                      c == '-' || c == '.' || c == '_' || c == '(' || c == ')';
+    if (!part) break;
+    out.push_back(static_cast<char>(c));
+  }
   return out;
 }
 
