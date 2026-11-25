@@ -94,11 +94,23 @@ device), DXGI output modes, frame pacing, descriptor heaps in title memory,
 back buffers, the raytracing BVH builder (52 DXIL compute pipelines, root
 signatures), XG texture uploads, DirectStorage loading, all 1,234 shader
 programs, audio start-up (APU heap, XMA shape contexts, Core Audio spatial
-streams). Run on `0944bf2`: **no crash in 200+ s**; the main loop runs
-steadily (about 230 frame events, 1,300 draws and 110 dispatches recorded
-per second, 56 guest threads), streaming from `audio.rpf` and others. The
+streams), the signed-in user (XUserAddAsync), the title screen, Bink video.
+
+The boot state machine (state in `0x1498f828c`, set by fn `0x1ac7760`,
+dispatched by fn `0x1d83960`) goes 0 -> 1 -> 3; state 3 (fn `0x21b7070`)
+waits for "press A" (a game timer in `0x1478ac9c8` that only runs once the
+title screen is dismissed). With `--press A@45` it goes 3 -> 4 -> 5 -> 6 ->
+13; state 13 (fn `0x21b7530`) is the game's main loop. Run on `354754c`
+with `--press A@45`: **no crash in 200 s**, the main loop runs (about 230
+frame events, 2,500 draws and 100 dispatches recorded per second, 58 guest
+threads) and streams the world (`levels.rpf`, `anim.rpf`, `core_bvh4.rpf`,
+`packs.rpf`, `textures.rpf`, ... - over 10,000 DirectStorage requests). The
 only int3 left is the known render-target budget check (+0x247af2d). What
-the title shows cannot be seen yet (no renderer); input reports no devices.
+the title shows cannot be seen yet (no renderer).
+
+Unattended runs press buttons with `--press BUTTONS@SECONDS[:MS]` (seconds
+after GameInputCreate; the title screen accepts A from about 40 s on this
+machine, so `A@45` is safe).
 
 The run log has a status line every 30 s (`grep "\[status\]" run.log`).
 Ctrl+C prints every guest thread and, as crash reports do, the tracepoint
@@ -150,26 +162,55 @@ Audio (`src/hle/console_devices.cpp`, `src/hle/audio_endpoint.cpp`):
   it (no output stream: `[mixer+0x52c] == 0`) - the audio thread deadlocked
   and the main loop waited 100 ms per frame for audio.
 
-GDK runtime binding (`src/hle/xgameruntime.cpp`): the title does not call
-xgameruntime exports; its static library calls
+GDK runtime binding (`src/hle/xgameruntime.cpp`, `src/hle/xuser.cpp`): the
+title does not call xgameruntime exports; its static library calls
 `QueryApiImpl(clsid, iid, &object)` before every GDK call and then a slot of
-the object (IUnknown, then the family's functions). Bound so far: XSystem
-`{e349bd1a-...}` (3 GetConsoleId, 4 GetXboxLiveSandboxId - the title
-asserts unless it is RETAIL, CERT, CERT.DEBUG or RKTR.*, 5
-GetAppSpecificDeviceId) and XNetworking `{37e56907-...}` (15
-GetConnectivityHint, polled from many places). Other families still answer
-E_NOINTERFACE: `{073b7dcb-...}` (clsid = iid), `{03f0fe74-...}`,
-`{af406016-...}`, `{01acd177-...}`, `{f4faf4d4-...}`, `{973a344e-...}`,
-`{3e241977-...}`; their wrappers are found with `xbem xrefs <exe> <address
-of the clsid>` (the slot is the `call [rax+N]` after the QueryApiImpl
-wrapper fn 0x55de048).
+the object (IUnknown, then the family's functions). **The slots follow the
+order of the public GDK headers** (checked by the argument counts of the
+title's wrappers - `xbem xrefs <exe> <clsid address>` lists them; the slot
+is the `mov rax,[rax+N]` before the guarded call). Bound:
+
+- XAsync / XTaskQueue / XThread `{073b7dcb-...}` (clsid = iid): 3-6
+  XAsync.h, 7-11 XAsyncProvider.h, 12 XTaskQueueCreate, 13 GetPort, 14
+  CreateComposite, 15 DuplicateHandle, 16 Dispatch, 17 CloseHandle, 18/19
+  Submit(Delayed)Callback, 20/21 (Un)RegisterWaiter, 22 Terminate, 23/24
+  (Un)RegisterMonitor, 25/26 Get/SetCurrentProcessTaskQueue, 27-29 XThread
+  (29 XThreadAssertNotTimeSensitive runs before most GDK calls).
+- XUser `{01acd177-...}` in XUser.h order (7 AddAsync, 8 AddResult, 33
+  RegisterForChangeEvent, ...); its second interface `{cef4fac0-...}` has
+  the newer XUserGetGamertag(user, component, ...) in slot 3. One signed-in
+  offline user; the title adds it with AddDefaultUserSilently at start-up.
+- XSystem `{e349bd1a-...}` (3 GetConsoleId, 4 GetXboxLiveSandboxId - the
+  title asserts unless it is RETAIL, CERT, CERT.DEBUG or RKTR.*, 5
+  GetAppSpecificDeviceId) and XNetworking `{37e56907-...}` (15
+  GetConnectivityHint, polled from many places).
+
+Unbound (E_NOINTERFACE; unknown slots of bound families fail with
+E_NOTIMPL): XStore `{0dd112ac-...}` (75 slots in XStore.h order: 3
+CreateContext(user, &ctx), 5 QueryAssociatedProductsAsync, 9/10
+QueryEntitledProducts{Async,Result} - called once the main loop runs),
+`{af406016-...}` (probably XPackage: 4 takes no arguments, 39 is
+(1, 0, context, callback) like XPackageEnumeratePackages), `{3e241977-...}`,
+`{973a344e-...}`, `{03f0fe74-...}`, `{f4faf4d4-...}`, `{704c3f58-...}`.
+
+XG_RESOURCE_LAYOUT (what the title reads, `src/hle/xg.cpp`): a 0x18-byte
+header (size, alignment, mip count, plane count), then planes of 0x6c8
+bytes - a 0x38-byte header (+0x10 bytes between array slices) and 15 mips
+of 0x70 bytes (+0x00 size, +0x08 offset, +0x10 2D slice size, +0x1c row
+pitch in bytes). fn `0x5121690` locks textures through it (Bink frame
+buffers), fn `0x979c40` sizes staging buffers. Left unfilled, Bink got
+uninitialised pointers and pitches and crashed.
+
+The console CPU has SSE4a: EXTRQ/INSERTQ (+0x455bac7, +0x2e7ff1) are
+emulated on hosts without it, like CLZERO and MONITORX.
 
 Descriptor heaps: the console desc is the PC desc plus the descriptors'
 memory (+16) and its size (+24); some call sites fill only the PC part, so
 the memory is used only when the size covers the heap.
 
 Other modules: XG (`src/hle/xg.cpp`) keeps textures in the linear D3D12
-layout and reports `SW_LINEAR`; DirectStorage (`src/hle/dstorage.cpp`)
+layout (`src/hle/texture_layout.*`, shared with D3D12) and reports
+`SW_LINEAR`; DirectStorage (`src/hle/dstorage.cpp`)
 follows the PC `dstorage.h` method order, executes requests synchronously,
 compression format 1 is zlib (`src/common/inflate.*`). Root signatures
 (`src/gpu/root_signature.*`) serialize byte-identically to Microsoft's RTS0
@@ -182,7 +223,7 @@ Leonida's code - notably its RDNA2 → SPIR-V translator - may be reused with
 attribution (keep its copyright notices, name the source in the file
 header). Leonida is not in this repository; the owner uploads it when needed.
 
-## Fixed on the way to the main loop (runs on `48e2abc`..`0944bf2`)
+## Fixed on the way to the main loop (runs on `48e2abc`..`354754c`)
 
 1. Global `0x14ab5cdf8` null (crash at +0x57f9a81): its setter (fn
    `0x5a6f390`, called by fn `0x2425c90`) was skipped because the audio
@@ -198,6 +239,12 @@ header). Leonida is not in this repository; the owner uploads it when needed.
 3. Sandbox assert (+0x3dda76b): see the GDK binding above.
 4. Audio deadlock (int3 +0x4dcbc9d about 6 times a second, ring buffer
    full): see Core Audio above.
+5. Boot state 3 waited forever: XUserAddAsync failed (XAsync and XUser
+   unbound), then the title screen waited for A from a gamepad that did
+   not exist (GameInput now has one; `--press`).
+6. Bink crash (bink2scarlett.dll+0xc4b1) writing a frame: XG layouts were
+   not filled (above).
+7. SIGILL at +0x455bac7: SSE4a INSERTQ (above).
 
 ## Earlier crashes (fixed)
 
@@ -449,10 +496,11 @@ fills one with a test pattern to see the path work.
 
 ## Next steps
 
-1. The title runs its main loop: find what it waits for next. The GDK
-   families still unbound (above) and input (GameInput reports no devices;
-   a title screen may wait for "press any button") are the candidates; the
-   probe log and the QueryApiImpl lines show which are called per frame.
+1. The main loop runs and streams the world: find out what the title does
+   (menus? the game itself?) - the probe log, the files it reads and the
+   GDK calls per frame are the signals until something is drawn. Bind XStore
+   (entitlements/licence queries start with the main loop) and the other
+   families when the title needs them.
 2. Command lists: type the console command list (Leonida documents the
    shifted slots: 0-26 PC order, 27-30 console-only, then +4, SetDescriptorHeaps
    at 32, ExecuteIndirect at 61) and record commands, so draws and dispatches
@@ -463,6 +511,8 @@ fills one with a test pattern to see the path work.
    is a GTX 1080 (no ray tracing in Vulkan, wave32) and WSL2 Vulkan on NVIDIA
    goes through Mesa's dzn layer; a Windows or native-Linux host will be
    needed for presentation.
-4. Audio output (the spatial objects' buffers are zeroed and dropped; XMA
+4. Input from the run window's keyboard (`gamepad_set_buttons` in
+   `src/hle/gameinput.h` is the entry point).
+5. Audio output (the spatial objects' buffers are zeroed and dropped; XMA
    decoding through XApu returns no results), chad (XDsp), real XG tiling and
    the network stay stubbed for now.

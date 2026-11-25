@@ -140,10 +140,11 @@ HRESULT XBEM_GUEST_ABI computer_get_layout(ProbeObject* self, uint8_t* out) {
     put<uint32_t>(mip, 0x38, l.dimension == 4 ? ml.depth : l.slices);
     put<uint32_t>(mip, 0x3c, l.samples);
   }
-  probe_log(self, 2,
-            std::format("GetResourceLayout({}) -> {} bytes, {} mips, mip 0 pitch {}", static_cast<void*>(out), l.total,
-                        l.mips, l.mip.empty() ? 0 : l.mip[0].pitch_bytes),
-            XBEM_RETURN_ADDRESS());
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8)
+    XBEM_INFO("xg", "GetResourceLayout({}) from {} -> {} bytes, {} mips, mip 0 pitch {}", static_cast<void*>(out),
+              describe_code_address(XBEM_RETURN_ADDRESS()), l.total, l.mips,
+              l.mip.empty() ? 0 : l.mip[0].pitch_bytes);
   return S_OK;
 }
 
