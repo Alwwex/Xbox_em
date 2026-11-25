@@ -174,6 +174,25 @@ decryption). Suspects:
   (GetRaytracingAccelerationStructurePrebuildInfo and friends) and answer
   plausibly, or make the builder's work a no-op.
 
+### Texture layout still disagrees with the files (the partial-read asserts)
+
+The read layer (fn 0x4ffd520) maps a texture's data to the .ttpf chunk table
+(8-byte entries from file offset 0x10: 3-byte offset >> 8, ...). When the
+title's idea of a texture's pieces does not match the chunks it asserts
+(+0x4ffd879: piece smaller than a compressed chunk, +0x4ffd868: piece not at
+a chunk start) and, ignoring that, issues DirectStorage requests whose
+source offset lies inside a compressed stream (e.g. chunk 0xe24c00 of
+ttdb_graphics.ttpf, 0x3efde bytes for 4 pages, read as four requests at
+0xe24c00 + k * 0x10000 - "inflate failed" in the log). The pieces come from
+XG GetResourceTiling / GetResourceAllocationInfo answers: ours use D3D12
+standard tile shapes, the linear layout and 64 KiB tiles. Asserting cases:
+BC1 128x128 (6 mips: 4 KiB pieces vs 12 KiB chunks), BC3/BC4 128x128, small
+BC7. Real console answers probably use RDNA2 swizzle modes (4 KiB tiles for
+small textures, mip tails). Next: make GetResourceTiling (and allocation
+sizes) follow the chunking the files use - e.g. derive the rules from the
+title's own table entries for textures that do not assert, or from AMD
+addrlib (gfx10.3) for 4KB_S / 64KB_S swizzle modes.
+
 ## DirectStorage request layout (measured on GTA VI)
 
 `w0` options (low byte: compression 0 none, 1 zlib, 2 and 14 unknown -
@@ -221,5 +240,7 @@ probably one of these.
 - 51b2f2e/728ec43: SDWA, fmaak/fmamk, readfirstlane; device slot 86.
 - 8b56880: linear strtoul (story loading no longer hangs).
 - 5b031ba: list label writes (slots 71/72).
+- 9bb1437/ed83e1c: 2D-array and 3D textures, DXIL clear PSO, strips
+  (menu highlight and tinted background now render).
 - a8fbec9: small resources (4 KiB). 3efa950 + latest: DirectStorage physical
   destinations. 2aa95a8: XG GetResourceTiling (page-table crash fixed).
