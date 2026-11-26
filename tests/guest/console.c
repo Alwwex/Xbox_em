@@ -1002,6 +1002,16 @@ static const uint8_t kZlibChunk[48] = {
 
 /* Console DirectStorage: open this executable, read its header, then read
  * and inflate the zlib chunk above from the file, with a status array. */
+/* DirectStorage work runs on the queue's own thread: wait for a status entry. */
+typedef BOOL (*DsIsCompleteFn)(void*, uint32_t);
+static int ds_wait(void* status, uint32_t index) {
+  for (int i = 0; i < 5000; ++i) {
+    if (((DsIsCompleteFn)(*(void***)status)[3])(status, index)) return 1;
+    Sleep(1);
+  }
+  return 0;
+}
+
 static void test_dstorage(void) {
   void* factory = 0;
   CHECK(DStorageGetFactory(kFactoryIid, &factory) == 0 && factory);
@@ -1041,7 +1051,7 @@ static void test_dstorage(void) {
   ((EnqueueFn)qv[3])(queue, req);
   ((EnqueueStatusFn)qv[4])(queue, status, 0);
   ((SubmitFn)qv[6])(queue);
-  CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 0) && ((GetHrFn)(*(void***)status)[4])(status, 0) == 0);
+  CHECK(ds_wait(status, 0) && ((GetHrFn)(*(void***)status)[4])(status, 0) == 0);
   CHECK(header[0] == 'M' && header[1] == 'Z');
 
   /* Find the chunk in the file, then read it compressed. */
@@ -1049,7 +1059,9 @@ static void test_dstorage(void) {
   const uint32_t size = *(uint32_t*)(info + 36) < sizeof image ? *(uint32_t*)(info + 36) : sizeof image;
   uint64_t whole[12] = {0, (uint64_t)(uintptr_t)image, 0, size, (uint64_t)(uintptr_t)file, 0, size};
   ((EnqueueFn)qv[3])(queue, whole);
+  ((EnqueueStatusFn)qv[4])(queue, status, 0);
   ((SubmitFn)qv[6])(queue);
+  CHECK(ds_wait(status, 0));
   uint32_t at = 0;
   for (uint32_t i = 0; i + 4 <= size; ++i)
     if (image[i] == 'X' && image[i + 1] == 'B' && image[i + 2] == 'D' && image[i + 3] == 'S' && image[i + 4] == 0x78) {
@@ -1063,7 +1075,7 @@ static void test_dstorage(void) {
   ((EnqueueFn)qv[3])(queue, zreq);
   ((EnqueueStatusFn)qv[4])(queue, status, 1);
   ((SubmitFn)qv[6])(queue);
-  CHECK(((IsCompleteFn)(*(void***)status)[3])(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+  CHECK(ds_wait(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
   CHECK(text[0] == 'x' && text[5] == 'D' && text[263] == ' ' && text[264] == 0);
   /* A piece of a chunk: (base, offset, size) - the chunk covers the region at
    * base, and bytes [offset, offset + size) of its output go to base + offset
@@ -1074,7 +1086,7 @@ static void test_dstorage(void) {
   ((EnqueueFn)qv[3])(queue, preq);
   ((EnqueueStatusFn)qv[4])(queue, status, 1);
   ((SubmitFn)qv[6])(queue);
-  CHECK(((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+  CHECK(ds_wait(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
   CHECK(region[0] == 0xee && region[32] == 0xee && memcmp(region + 33, text + 33, 33) == 0 && region[66] == 0xee);
   /* Options 0x20xxxx: a physical destination - word 1 points to the frame
    * numbers of its 64 KiB pages, word 2 is the offset in it, word 3 the size;
@@ -1095,17 +1107,18 @@ static void test_dstorage(void) {
     CHECK(!((IsCompleteFn)(*(void***)status)[3])(status, 1));
     later[0] = frames[0];
     ((SubmitFn)qv[6])(queue);
-    CHECK(((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+    CHECK(ds_wait(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
     CHECK(frames[0] == frame);
     CHECK(((volatile uint8_t*)view)[32] == 0xee && memcmp(view + 33, text + 33, 33) == 0 && view[66] == 0xee);
   }
   CHECK(*(volatile const uint8_t*)&kZlibChunk[47] == 0x01); /* keeps the chunk in the image */
 
-  /* 12 EnqueueSetEvent(HANDLE): requests complete at once, so the event is set */
+  /* 12 EnqueueSetEvent(HANDLE): set once the work before it is done */
   typedef void (*SetEventFn)(void*, HANDLE);
   HANDLE done = CreateEventW(0, 1, 0, 0);
   ((SetEventFn)qv[12])(queue, done);
-  CHECK(WaitForSingleObject(done, 0) == WAIT_OBJECT_0); /* the work before it is done */
+  ((SubmitFn)qv[6])(queue);
+  CHECK(WaitForSingleObject(done, 5000) == WAIT_OBJECT_0);
 
   /* Coverage in the Submit log: 16 requests on a second file object, with a
    * gap of 0x7800 bytes that no request reads. */
@@ -1119,6 +1132,9 @@ static void test_dstorage(void) {
     uint64_t r[12] = {0, (uint64_t)(uintptr_t)(pieces + offset), 0, 0x100, (uint64_t)(uintptr_t)file2, offset, 0x100};
     ((EnqueueFn)qv[3])(queue, r);
   }
+  ((EnqueueStatusFn)qv[4])(queue, status, 0);
+  ((SubmitFn)qv[6])(queue);
+  CHECK(ds_wait(status, 0)); /* the coverage log is written at the next Submit */
   ((SubmitFn)qv[6])(queue);
 }
 

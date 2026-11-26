@@ -12,14 +12,18 @@
 //            12 EnqueueSetEvent(HANDLE) (set at once when it is an event)
 //   status:  3 IsComplete(index), 4 GetHResult(index)
 //
-// Requests are executed synchronously when they are enqueued (file read, then
-// decompression), so a status entry or fence enqueued after them is complete
-// at once. The request structure is the console's: it is decoded by locating
+// Every queue has a worker thread that executes its work in order (file
+// read, then decompression; status entries, fences and events after the
+// requests before them), as the console's DirectStorage hardware does: the
+// thread that enqueues and submits is not held up by the reads (doing them
+// on the title's main thread stalled GTA VI's loading until its watchdog
+// fired). XBEM_DSTORAGE_SYNC=1 runs the work on the enqueuing thread instead. The request structure is the console's: it is decoded by locating
 // the file object among its fields (the emulator knows its file objects) -
 // the offset and the compressed size follow it - and the destination buffer
 // and size before it. The first requests are logged in full.
 
 #include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "common/inflate.h"
@@ -178,7 +183,11 @@ struct QueueState {
     uint64_t value;      // status index / fence value
     uint64_t caller;
   };
-  std::vector<Pending> pending;
+  std::vector<Pending> pending;  // waiting for Submit
+  // Released work, run in order by the worker thread.
+  std::vector<Pending> ready;
+  std::condition_variable wake;
+  bool worker_started = false;
 };
 
 std::string hex_qwords(const uint64_t* q, int n) {
@@ -460,6 +469,15 @@ void run_status(QueueState* q, ProbeObject* array, uint32_t index) {
 }
 
 void drain(QueueState* q);
+void release(QueueState* q, std::vector<QueueState::Pending> work);
+
+bool synchronous_queues() {
+  static const bool sync = [] {
+    const char* v = std::getenv("XBEM_DSTORAGE_SYNC");
+    return v && *v && *v != '0';
+  }();
+  return sync;
+}
 
 // Work runs when it is enqueued, except requests into physical memory
 // (options 0x20xxxx): the title fills their frame arrays after Enqueue and
@@ -475,9 +493,8 @@ void enqueue(QueueState* q, QueueState::Pending p) {
       q->pending.push_back(p);
       return;
     }
-    q->pending.push_back(p);
   }
-  drain(q);
+  release(q, {p});
 }
 
 HRESULT XBEM_GUEST_ABI queue_enqueue_request(ProbeObject* self, const uint8_t* request) {
@@ -517,13 +534,7 @@ HRESULT XBEM_GUEST_ABI queue_enqueue_set_event(ProbeObject* self, uint64_t handl
   return S_OK;
 }
 
-// Runs everything enqueued so far, in order.
-void drain(QueueState* q) {
-  std::vector<QueueState::Pending> work;
-  {
-    std::lock_guard lock(q->mutex);
-    work.swap(q->pending);
-  }
+void run_work(QueueState* q, const std::vector<QueueState::Pending>& work) {
   for (const QueueState::Pending& p : work) {
     switch (p.kind) {
       case QueueState::Pending::Request:
@@ -540,6 +551,46 @@ void drain(QueueState* q) {
         break;
     }
   }
+}
+
+void worker(QueueState* q) {
+  for (;;) {
+    std::vector<QueueState::Pending> work;
+    {
+      std::unique_lock lock(q->mutex);
+      q->wake.wait(lock, [q] { return !q->ready.empty(); });
+      work.swap(q->ready);
+    }
+    run_work(q, work);
+  }
+}
+
+// Hands work to the queue's worker (or runs it here in synchronous mode).
+void release(QueueState* q, std::vector<QueueState::Pending> work) {
+  if (work.empty()) return;
+  if (synchronous_queues()) {
+    run_work(q, work);
+    return;
+  }
+  {
+    std::lock_guard lock(q->mutex);
+    q->ready.insert(q->ready.end(), work.begin(), work.end());
+    if (!q->worker_started) {
+      q->worker_started = true;
+      std::thread(worker, q).detach();
+    }
+  }
+  q->wake.notify_one();
+}
+
+// Releases everything waiting for Submit, in order.
+void drain(QueueState* q) {
+  std::vector<QueueState::Pending> work;
+  {
+    std::lock_guard lock(q->mutex);
+    work.swap(q->pending);
+  }
+  release(q, std::move(work));
 }
 
 void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
@@ -645,7 +696,7 @@ HRESULT XBEM_GUEST_ABI hle_DStorageGetFactory(const void*, void** out) {
 ModuleDef make_dstorage_module() {
   ModuleDef m;
   m.name = "xcrdapi.dll";
-  m.description = "Console DirectStorage: files, queues, status arrays; requests read and inflated synchronously";
+  m.description = "Console DirectStorage: files, queues, status arrays; requests read and inflated by a worker thread per queue";
   m.exports = {XBEM_HLE(DStorageGetFactory)};
   return m;
 }

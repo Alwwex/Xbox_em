@@ -28,6 +28,7 @@ void unregister_dump_thread() {}
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <execinfo.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -155,6 +156,7 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
                 slot.tid.load(), static_cast<unsigned long long>(rip),
                 where[0] ? where : "(in xbem / host code: blocked in an emulated API)");
   write_str(line);
+  const bool in_host = !where[0];
   // Scan the stack for return addresses into guest modules.
   const uint64_t high = slot.stack_high ? slot.stack_high : rsp + 0x10000;
   const bool compact = g_dump_compact.load();
@@ -175,6 +177,14 @@ void dump_one(const DumpSlot& slot, void* ctx_raw) {
     ++shown;
   }
   if (!shown) write_str("    (no guest return addresses found on the stack)\n");
+  // A thread waiting in the emulator: where in xbem (module+offset, for
+  // addr2line). Only for the continuing dump (Ctrl+\\) - crash reports stay short.
+  if (!compact && in_host) {
+    void* frames[16];
+    const int n = backtrace(frames, 16);
+    write_str("    host frames:\n");
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+  }
   if (g_context_printer && !compact) g_context_printer(&write_str);
   unlock_print();
 #else
@@ -1210,6 +1220,10 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
 void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site) {
   if (!g_describer) g_describer = describer;
   g_call_site = call_site;
+  {
+    void* warm[2];  // backtrace() loads libgcc on first use: not in a signal handler
+    backtrace(warm, 2);
+  }
   struct sigaction sa;
   std::memset(&sa, 0, sizeof sa);
   sa.sa_sigaction = dump_signal_handler;
