@@ -185,10 +185,22 @@ restart and check that loading gets past ~300 s.
   (bindings 4-6), UAV images marked GPU-held. Menus still render; the
   loading screen's 3 compute shaders (LUT 07e3ae7e..., 7695aa85...,
   4d61c01e...) translate and run.
-- The heavy scene (from ~270 s) is reached only in some runs (run25 yes;
-  run4/30/31 stayed on the loading screen with Bink threads waiting) - cause
-  unknown. Next: bindless descriptors (shadow tables), typed buffer loads,
-  then look at the heavy scene's dispatches (cap380_*.txt).
+- Since then: typed buffer loads (format from V# dword 3 = 5th word of
+  Buffer slots), carries (v_add_co_ci), DPP16, image_gather4: 662 / 2680
+  (24.7 %) translate, all valid GLSL (commit d9ce202).
+- The heavy scene (from ~270 s) was reached only once (run25); run4/30/31
+  and run32_1-3 stayed on the loading screen (Bink threads waiting) - cause
+  unknown. run32_3 crashed: null deref at +0x4da62a6 (fn 0x4da62a0, from
+  0x47e175b / 0xb597a3) at ~270 s.
+- OPEN DECISION (asked the owner): ~1300 shaders pick descriptors at run
+  time (bindless: s_load_dwordx4 s[..], table, s44 with s44 = index << 5,
+  then the V# is used/modified). dzn has no VK_EXT_external_memory_host, so
+  the GPU cannot read guest memory directly. Options: (1) the CPU scans the
+  descriptor table window, uploads every referenced buffer and gives the
+  GPU a guest-VA -> device-address lookup (+ descriptor -> bindless index
+  table); (2) rebuild the memory model so GPU-visible guest memory is
+  Vulkan memory. Recommended: (1) first; or first find why the heavy scene
+  is reached so rarely.
 
 ## WHERE WORK STOPPED (2026-11-26, evening) - read first
 
