@@ -157,6 +157,39 @@ console gives the title 13.5 GB. Fix applied: C:\Users\alexa\.wslconfig
 cache default lowered to 128 MB. Next: rerun the press script after the WSL
 restart and check that loading gets past ~300 s.
 
+## COMPUTE SHADERS (2026-11-26, night) - read first
+
+- Translator (src/gpu/translate.cpp, "wave mode", ShaderStage::Compute):
+  every invocation is one lane of a wave32 (= the Vulkan subgroup, 32 on the
+  GTX 1080 via dzn). SALU runs in GLSL on wave-uniform variables (s0.., scc,
+  vcc_lo, exec_lo), VALU is guarded by `if (lane_on())`, compares are
+  subgroupBallot, readlane is subgroupShuffle, control flow is a
+  `while (blk) switch (blk)` block loop (loops + exec masking work). LDS,
+  buffer stores/atomics, image_store, s_barrier supported.
+- CPU part: user SGPRs + SMEM results are slots from a LINEAR scalar run;
+  known_sgprs() checks statically that SMEM addresses and VMEM descriptors
+  depend only on user SGPRs/constants/SMEM (loop-carried values become
+  unknown at the loop head). s_buffer_load at a GPU-side offset reads the
+  buffer on the GPU (Buffer slot).
+- Launch state: compute PSO desc (slot 67) = root sig +0x00, state A
+  (+0x08, 0x1c bytes: dword3 x|y<<16, dword4 z, dword5 RSRC1, dword6
+  RSRC2 -> user SGPR count, TGID x/y/z, TIDIG, LDS), state B +0x18, code
+  +0x28, meta +0x38. Root parameters start at s4 for compute (s8 graphics).
+- Coverage: `xbem gpu-translate --coverage ~/xbem-runs/shaders6 --validate`
+  (cs-native_*.bin + cs-info_*.bin from --dump-shaders): 428 / 2680 (16 %),
+  all valid GLSL. Top failures: descriptors chosen at run time (bindless:
+  s_load_dwordx4 from a table at a GPU-side offset, ~1050), typed buffer
+  loads (buffer_load_format_*: format is in the V#), samplers from GPU-side
+  SGPRs, image_gather4, DPP (operand 250).
+- Renderer runs Dispatch (slot 14): compute pipelines, storage images
+  (bindings 4-6), UAV images marked GPU-held. Menus still render; the
+  loading screen's 3 compute shaders (LUT 07e3ae7e..., 7695aa85...,
+  4d61c01e...) translate and run.
+- The heavy scene (from ~270 s) is reached only in some runs (run25 yes;
+  run4/30/31 stayed on the loading screen with Bink threads waiting) - cause
+  unknown. Next: bindless descriptors (shadow tables), typed buffer loads,
+  then look at the heavy scene's dispatches (cap380_*.txt).
+
 ## WHERE WORK STOPPED (2026-11-26, evening) - read first
 
 Commits today: 3c9f6d4 (DirectStorage worker threads), 06ac221 (descriptor
