@@ -12,6 +12,9 @@
 // The pool is host-visible (system memory the GPU reads over the bus): the
 // copies are plain memcpy, and GPU writes are visible to the CPU at once.
 // When the budget is used up, the pages unused for longest are dropped.
+// Pages shaders reach without a copy (descriptors read on the GPU name
+// buffers the CPU never saw) are reported by the shaders and copied in after
+// the submission, so from the next one on they read right.
 
 #include <cstdint>
 #include <string>
@@ -39,6 +42,7 @@ class GuestMemory {
 
   struct Stats {
     uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, evicted = 0, unmapped = 0;
+    uint64_t misses = 0, misses_dropped = 0;  // pages shaders reached without a copy
   };
   const Stats& stats() const { return stats_; }
 
@@ -56,6 +60,7 @@ class GuestMemory {
   uint32_t allocate();
   void release(uint32_t idx);
   void forget_range(uint64_t va, uint64_t size);
+  void clear_missed(uint64_t va, uint64_t size);
 
   Core* core_ = nullptr;
   Buffer table_;

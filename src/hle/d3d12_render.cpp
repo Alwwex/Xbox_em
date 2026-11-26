@@ -295,8 +295,8 @@ class Renderer {
     if (const uint64_t n = presents_ + 1; n >= 64 && (n & (n - 1)) == 0 && memory_.ready()) {
       const auto& m = memory_.stats();
       XBEM_INFO("gpu", "guest memory copy at present {}: {} pages resident ({} MiB), {} uploaded, {} refreshed, "
-                "{} written back, {} evicted, {} unmapped", n, m.resident, m.resident >> 4, m.uploaded, m.refreshed,
-                m.written_back, m.evicted, m.unmapped);
+                "{} written back, {} evicted, {} unmapped, {} misses ({} dropped)", n, m.resident, m.resident >> 4,
+                m.uploaded, m.refreshed, m.written_back, m.evicted, m.unmapped, m.misses, m.misses_dropped);
     }
     if (!display_) return;
     GpuImage& g = *display_;

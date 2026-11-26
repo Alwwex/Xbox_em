@@ -174,12 +174,30 @@ void GuestMemory::forget_range(uint64_t va, uint64_t size) {
   }
 }
 
+// Pages of [va, va + size) may be reported as misses again.
+void GuestMemory::clear_missed(uint64_t va, uint64_t size) {
+  const uint64_t end = std::min<uint64_t>(va + size, 1ull << 40);
+  for (uint64_t page = va >> 16; page < (end + kPage - 1) >> 16;) {
+    uint32_t& w = words()[kMissedWord + page / 32];
+    if (page % 32 == 0 && (page + 32) << 16 <= end) {
+      w = 0;
+      page += 32;
+    } else {
+      w &= ~(1u << (page % 32));
+      ++page;
+    }
+  }
+}
+
 void GuestMemory::begin_submission() {
   if (!ready()) return;
   ++serial_;
   pg::Changes changes;
   pg::collect(changes);
-  for (const auto& [va, size] : changes.remapped) forget_range(va, size);
+  for (const auto& [va, size] : changes.remapped) {
+    forget_range(va, size);
+    clear_missed(va, size);
+  }
   for (const auto& [id, mask] : changes.written) {
     auto it = by_id_.find(id);
     if (it == by_id_.end()) continue;
@@ -198,6 +216,20 @@ void GuestMemory::begin_submission() {
 
 void GuestMemory::end_submission() {
   if (!ready()) return;
+  // Pages shaders reached without a copy: copied in for the next submission.
+  // A page that is not guest memory keeps its bit (it is not reported again
+  // until a mapping changes there).
+  {
+    uint32_t* w = words();
+    const uint32_t n = std::min(w[kMissWord], kMaxMisses);
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t page = w[kMissWord + 1 + i];
+      if (require(uint64_t{page} << 16, kPage)) w[kMissedWord + page / 32] &= ~(1u << (page % 32));
+    }
+    stats_.misses += n;
+    if (w[kMissWord] > kMaxMisses) stats_.misses_dropped += w[kMissWord] - kMaxMisses;
+    w[kMissWord] = 0;
+  }
   uint32_t* w = words() + kWrittenWord;
   const size_t n = (pages_.size() + 1) / 2;
   for (size_t i = 0; i < n; ++i) {
