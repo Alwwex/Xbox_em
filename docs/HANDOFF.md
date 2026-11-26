@@ -147,7 +147,35 @@ the UI samples via ps 736a6b6841007e1e). Needed:
 Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
 slot-57 pipelines, MRT.
 
-## GPU GUEST MEMORY MIRROR (2026-11-26, late) - read first
+## STREAMING PIECES + COMPUTE COVERAGE (2026-11-27) - read first
+
+- Compute coverage: 2429+ / 2680 (90.6 % before the s_getpc work, all
+  valid GLSL; `--coverage ... --validate` now takes ~20 min because far
+  more shaders reach glslang). Added: depth-compare sampling (_c, manual
+  compare of the bilinear footprint, S# dword0 bits 12-14), _o offsets,
+  cube maps as 2D arrays (coordinates arrive projected), v_cube*, DPP8,
+  packed/scalar f16, 16-bit ints, global_load/store, image_load_mip,
+  o/u/nlg/64-bit compares, GFX10 opcodes the console uses (v_mad_f32,
+  v_mac_f32, v_madmk/madak_f32), BVH ray ops stubbed as misses,
+  s_getpc_b64 (program uploaded per compute shader, direct device address)
+  and far jumps (getpc/add/addc/setpc -> static branch, decoding continues
+  past s_endpgm while branches reach further).
+- Texture streaming: the title's read layer (fn 0x4ffd520) cuts textures
+  into pieces from our GetResourceTiling answers (table 0x149c3e1d0, 0x38
+  bytes per texture: +0x18 mip offsets / +0x20 mip sizes in 4 KiB pages,
+  +0x28 slices, +0x2a slice stride; filled by fn 0x51fb680 from fn
+  0x1403441f0 = our tiling). The .ttpf files are compressed in 256 KiB
+  chunks; a piece inside a chunk was requested at "chunk + offset in chunk"
+  (int3 +0x4ffd868) and failed to inflate. DirectStorage now finds the
+  chunk start and delivers the piece (dstorage.cpp shifted_chunk_piece).
+  Still open: whether our tiling matches the console's at all.
+- Loading screen after Confirm still lasts past 420 s in every run
+  (thread dumps at 300/330/360 s: threads move, the loader is busy - not a
+  deadlock). Next: profile what the host spends time on during loading.
+- The owner reports a fully green screen at the start; not reproduced in
+  screenshots at 5/10/15/20/40 s (black, then the menu).
+
+## GPU GUEST MEMORY MIRROR (2026-11-26, late)
 
 Why a mirror: on WSL, dzn cannot import host memory (D3D12
 OpenExistingHeapFromAddress1 returns E_NOTIMPL - tested with a patched Mesa,

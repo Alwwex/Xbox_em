@@ -216,6 +216,14 @@ std::mutex g_chunk_mutex;
 std::vector<DecodedChunk> g_chunks;  // most recent last
 std::map<std::pair<const FileState*, uint64_t>, uint64_t> g_chunk_start;  // (file, bad offset) -> chunk start
 std::atomic<uint64_t> g_shifted_ok{0}, g_shifted_failed{0};
+// Offsets where compressed requests decoded from their first byte: chunk
+// starts, tried first for a piece inside a chunk.
+std::map<const FileState*, std::set<uint64_t>> g_chunk_starts;
+
+void note_chunk_start(const FileState* file, uint64_t offset) {
+  std::lock_guard lock(g_chunk_mutex);
+  g_chunk_starts[file].insert(offset);
+}
 
 constexpr uint64_t kMaxChunkShift = 0x40000, kMaxChunkBytes = 0x100000;
 
@@ -243,7 +251,20 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
   uint64_t start = UINT64_MAX;
   if (auto it = g_chunk_start.find(key); it != g_chunk_start.end()) start = it->second;
   const DecodedChunk* c = nullptr;
-  if (start != UINT64_MAX) {
+  if (start == UINT64_MAX) {
+    // The nearest chunk start seen before.
+    if (auto f = g_chunk_starts.find(file); f != g_chunk_starts.end()) {
+      auto it = f->second.lower_bound(offset);
+      if (it != f->second.begin() && offset - *std::prev(it) <= kMaxChunkShift) {
+        const uint64_t candidate = *std::prev(it);
+        c = decoded_chunk(file, candidate, compressed);
+        if (c && c->data.size() >= offset - candidate + skip + size) g_chunk_start[key] = start = candidate;
+        else c = nullptr;
+      }
+    }
+  }
+  if (c) {
+  } else if (start != UINT64_MAX) {
     c = decoded_chunk(file, start, compressed);
   } else {
     for (uint64_t shift = 0x1000; shift <= kMaxChunkShift && shift <= offset && !c; shift += 0x1000) {
@@ -396,6 +417,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       whole.resize(skip + dest_size);
       r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
       if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+      if (r == InflateResult::Ok && compression == 1) note_chunk_start(file, offset);
       if (r != InflateResult::Ok && compression == 1 &&
           shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
         r = InflateResult::Ok;
@@ -439,6 +461,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     // A piece shorter than its chunk (the title's int3 at +0x4ffd879): the
     // rest of the chunk is not wanted.
     if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+    if (r == InflateResult::Ok && compression == 1) note_chunk_start(file, offset);
     if ((r == InflateResult::BadData || r == InflateResult::Truncated) && compression == 1 &&
         shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
       r = InflateResult::Ok;

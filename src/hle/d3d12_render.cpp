@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -353,9 +354,25 @@ class Renderer {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd_;
-    f.vkQueueSubmit(core_.queue(), 1, &si, fence_);
-    f.vkWaitForFences(core_.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+    const auto started = std::chrono::steady_clock::now();
+    VkResult r = f.vkQueueSubmit(core_.queue(), 1, &si, fence_);
+    if (r == VK_SUCCESS) r = f.vkWaitForFences(core_.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
     f.vkResetFences(core_.device(), 1, &fence_);
+    // A submission that takes long or loses the device (a shader that hangs
+    // the GPU): name the compute shaders it ran.
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    if (r != VK_SUCCESS || ms > 250) {
+      static int logged = 0;
+      if (logged++ < 20) {
+        std::string list;
+        for (uint64_t h : submitted_cs_) list += std::format(" {:016x}", h);
+        XBEM_WARN("gpu", "submission {} after {} ms ({} draws, {} dispatches); compute shaders:{}",
+                  r == VK_SUCCESS ? "done" : std::format("FAILED ({})", static_cast<int>(r)), ms, submitted_draws_,
+                  submitted_dispatches_, list.empty() ? " none" : list);
+      }
+    }
+    submitted_cs_.clear();
+    submitted_draws_ = submitted_dispatches_ = 0;
     recording_ = false;
     memory_.end_submission();
     ring_offset_ = 0;
@@ -1396,6 +1413,7 @@ class Renderer {
     state_.target->rendered = true;
     state_.target->last_render = ++render_serial_;
     ++draws_;
+    ++submitted_draws_;
     if (is_display_target()) {
       display_ = state_.target;
       display_format_ = 28;
@@ -1477,6 +1495,8 @@ class Renderer {
     const VkDeviceAddress push[2] = {data, memory_.table_address()};
     f.vkCmdPushConstants(cmd_, compute_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
     f.vkCmdDispatch(cmd_, x, y, z);
+    submitted_cs_.insert(p->cs_hash);
+    ++submitted_dispatches_;
     full_barrier();
     ++dispatches_;
     static const int trace = [] {
@@ -1533,6 +1553,9 @@ class Renderer {
   std::mutex mutex_;
   Core core_;
   Buffer ring_;
+  // What the command buffer being recorded runs (for slow / failed submissions).
+  std::set<uint64_t> submitted_cs_;
+  uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0;
   gpu::vk::GuestMemory memory_;
   uint64_t descriptors_ = 0, descriptor_misses_ = 0, descriptor_table_resets_ = 0;
   std::vector<HeapWindow> windows_;

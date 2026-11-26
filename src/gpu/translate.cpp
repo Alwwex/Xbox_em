@@ -302,8 +302,12 @@ class Translator {
     for (int k = 0; k < 3; ++k)
       if (out_.compute.tgid[k]) line(std::format("{} = gl_WorkGroupID.{};", sreg(r++), "xyz"[k]));
     if (out_.compute.tg_size) line(std::format("{} = gl_NumSubgroups | (gl_SubgroupID << 6);", sreg(r++)));
-    line("uint blk = 0u;");
-    line("while (blk != 0xffffffffu) {");
+    // A loop that never ends (a translation mistake or a value the GPU
+    // computes differently) must not hang the GPU: on Windows the device is
+    // removed after ~2 s and every later submission fails. The guard ends the
+    // program after 2^18 block transitions.
+    line("uint blk = 0u, guard = 0u;");
+    line("while (blk != 0xffffffffu && ++guard < 0x40000u) {");
     line("switch (blk) {");
     bool open = false;
     for (uint32_t k = 0; k < insns.size(); ++k) {
@@ -996,6 +1000,16 @@ class Translator {
       }
       return true;
     };
+    if ((n == "ds_append" || n == "ds_consume") && !((w0 >> 17) & 1)) {
+      // A wave-wide counter in LDS at M0's base + offset: one atomic for the
+      // active lanes, every lane gets the value before it.
+      lds_words_ = std::max<uint32_t>(lds_words_, ((offset + 4) >> 2) + 1);
+      line(std::format("{{ uint idx = (((m0 & 0xffffu) + {}u) >> 2) & LDS_MASK, old = 0u;", offset));
+      line(std::format("  if (subgroupElect()) old = atomicAdd(lds[idx], {}uint(bitCount(exec_lo)));",
+                       n == "ds_append" ? "" : "0u - "));
+      line(std::format("  {} = subgroupBroadcastFirst(old); }}", vreg(vdst)));
+      return true;
+    }
     if (n == "ds_read_b32") return line(std::format("{} = {};", vreg(vdst), at(offset))), true;
     if (n == "ds_read_b64" || n == "ds_read_b96" || n == "ds_read_b128") {
       const int words = n == "ds_read_b64" ? 2 : n == "ds_read_b96" ? 3 : 4;
