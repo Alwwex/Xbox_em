@@ -1092,6 +1092,17 @@ static void test_dstorage(void) {
   ((SubmitFn)qv[6])(queue);
   CHECK(ds_wait(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
   CHECK(text[0] == 'x' && text[5] == 'D' && text[263] == ' ' && text[264] == 0);
+  /* A format the emulator cannot decode (2): delivered as zeros, reported done. */
+  {
+    static uint8_t unknown[64];
+    memset(unknown, 0xee, sizeof unknown);
+    uint64_t ureq[12] = {2, (uint64_t)(uintptr_t)unknown, 0, sizeof unknown, (uint64_t)(uintptr_t)file, 0, 32 | (uint64_t)64 << 32};
+    ((EnqueueFn)qv[3])(queue, ureq);
+    ((EnqueueStatusFn)qv[4])(queue, status, 1);
+    ((SubmitFn)qv[6])(queue);
+    CHECK(ds_wait(status, 1) && ((GetHrFn)(*(void***)status)[4])(status, 1) == 0);
+    CHECK(unknown[0] == 0 && unknown[63] == 0);
+  }
   /* A piece of a chunk: (base, offset, size) - the chunk covers the region at
    * base, and bytes [offset, offset + size) of its output go to base + offset
    * (the 264-byte text is 8 x 33 bytes); the rest of the region is untouched. */

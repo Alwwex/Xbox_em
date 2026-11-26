@@ -384,12 +384,19 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       platform::safe_read(w[1], at_w1, sizeof at_w1);
       XBEM_WARN("dstorage", "  memory at word 1:{}", hex_qwords(at_w1, 6));
     }
-    // Experiment switch: report undecodable formats as delivered (zeros).
-    if (std::getenv("XBEM_DSTORAGE_PRETEND") && compression != 1) {
-      if (!physical) {
-        const std::vector<uint8_t> zeros(dest_size);
-        deliver(zeros.data(), zeros.size());
-      }
+    // Formats the emulator cannot decode (2 and 14 in GTA VI: no public
+    // description) are delivered as zeros and reported as done. Leaving the
+    // destination alone kept stale contents of recycled physical pages, which
+    // the title then followed as pointers (crashes in 2 of 3 runs); zeros it
+    // treats as empty. XBEM_DSTORAGE_STRICT=1 fails these requests instead.
+    static const bool strict = [] {
+      const char* v = std::getenv("XBEM_DSTORAGE_STRICT");
+      return v && *v && *v != '0';
+    }();
+    if (!strict && compression != 1) {
+      const std::vector<uint8_t> zeros(dest_size);
+      if (physical) to_physical(zeros.data(), skip, zeros.size());
+      else deliver(zeros.data(), zeros.size());
       return S_OK;
     }
     return HRESULT(0x80070017);  // HRESULT_FROM_WIN32(ERROR_CRC): corrupt data
