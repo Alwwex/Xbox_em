@@ -844,13 +844,21 @@ void capture_marker(ProbeObject* queue, const char* what) {
 void* resource_at(uint64_t address, uint64_t desc) {
   static std::mutex lock;
   static std::map<std::pair<uint64_t, uint64_t>, void*> resources;
-  uint8_t d[56] = {};
+  // The console's resource description continues past the D3D12 part:
+  // dword 14 repeats the format and dword 15 is the swizzle mode (ADDR_SW_*,
+  // measured on GTA VI: 2 256B_D, 4 4KB_Z, 5 4KB_S, 8 64KB_Z, 9 64KB_S, 10 64KB_D).
+  uint32_t d[16] = {};
   platform::safe_read(desc, d, sizeof d);
+  const uint32_t swizzle = d[14] == d[8] && d[15] < 32 ? d[15] : 0;
   uint64_t h = 1469598103934665603ull;
-  for (uint8_t b : d) h = (h ^ b) * 1099511628211ull;
+  for (size_t i = 0; i < 56; ++i) h = (h ^ reinterpret_cast<const uint8_t*>(d)[i]) * 1099511628211ull;
+  h = (h ^ swizzle) * 1099511628211ull;
   std::lock_guard guard(lock);
   void*& r = resources[{address, h}];
-  if (!r) r = new_resource(child_name("view_resource"), reinterpret_cast<const uint8_t*>(desc), address);
+  if (!r) {
+    r = new_resource(child_name("view_resource"), reinterpret_cast<const uint8_t*>(desc), address);
+    if (auto* rs = resource_of(reinterpret_cast<uint64_t>(r))) rs->swizzle = swizzle;
+  }
   return r;
 }
 
@@ -938,6 +946,20 @@ uint64_t XBEM_GUEST_ABI device_descriptor_method(ProbeObject* self, uint64_t a1,
                                stride ? count : count * element, 0x0002403c, 0, 0, 0, 0};
         platform::safe_write(a3, v, sizeof v);
       } else {  // a texture at an address: the emulator's descriptor naming a resource for it
+        static std::atomic<int> logged{0};
+        uint32_t fmt_probe = 0;
+        platform::safe_read(a1 + 32, &fmt_probe, 4);
+        if (std::getenv("XBEM_LOG_SRV_DESC") && fmt_probe >= 70 && fmt_probe <= 99 && logged.fetch_add(1) < 24) {
+          uint32_t d[24] = {};
+          platform::safe_read(a1, d, sizeof d);
+          std::string w;
+          for (uint32_t x : d) w += std::format(" {:08x}", x);
+          uint32_t v[12] = {};
+          platform::safe_read(a2, v, sizeof v);
+          std::string vw;
+          for (uint32_t x : v) vw += std::format(" {:08x}", x);
+          XBEM_INFO("d3d12", "SRV by address {:#x}: resource desc{}\n  view{}", address, w, vw);
+        }
         write_descriptor(a3, kSrv, reinterpret_cast<uint64_t>(resource_at(address, a1)), 0, 0);
       }
       break;

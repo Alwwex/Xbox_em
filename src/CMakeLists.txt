@@ -40,6 +40,7 @@ add_library(xbem_core STATIC
   hle/texture_layout.cpp
   gpu/gl_backend.cpp
   gpu/translate.cpp
+  gpu/swizzle.cpp
   hle/d3d12_render.cpp
   hle/xg.cpp
   hle/dstorage.cpp
@@ -67,7 +68,7 @@ add_library(xbem_core STATIC
 )
 
 target_include_directories(xbem_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(xbem_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(xbem_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS} PRIVATE addrlib)
 
 if(MSVC)
   target_compile_options(xbem_core PUBLIC /W4 /utf-8 /permissive- /Zc:__cplusplus)

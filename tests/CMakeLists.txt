@@ -13,6 +13,7 @@ add_executable(xbem_unit_tests
   unit/test_platform.cpp
   unit/test_rdna2.cpp
   unit/test_translate.cpp
+  unit/test_swizzle.cpp
   unit/test_root_signature.cpp
   unit/test_inflate.cpp
 )

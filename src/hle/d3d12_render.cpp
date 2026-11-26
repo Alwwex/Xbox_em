@@ -36,6 +36,7 @@
 #include <unordered_map>
 
 #include "common/log.h"
+#include "gpu/swizzle.h"
 #include "gpu/translate.h"
 #include "gpu/vk/vk_core.h"
 #include "hle/hle_util.h"
@@ -428,6 +429,11 @@ class Renderer {
                         VK_COMPONENT_SWIZZLE_R};
       vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
       core_.fn().vkCreateImageView(core_.device(), &vci, nullptr, &g->image.view);
+      if (!volume) {  // the array view too (shaders sample A8 glyphs as arrays)
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        vci.subresourceRange.layerCount = g->image.layers;
+        core_.fn().vkCreateImageView(core_.device(), &vci, nullptr, &g->image.array_view);
+      }
     }
     transition(g->image.image, VK_IMAGE_ASPECT_COLOR_BIT);
     if (!for_render && r->gpu_va) {
@@ -455,6 +461,10 @@ class Renderer {
   void upload_texture(GpuImage& g, ResourceState* r, uint32_t format, bool block) {
     const TextureLayout l = linear_layout(r->desc);
     if (l.mip.empty()) return;
+    if (r->swizzle) {
+      upload_swizzled(g, r, l, block);
+      return;
+    }
     const MipLayout& m = l.mip[0];
     // Mip 0 of every array slice (each slice_stride apart), or all depth
     // slices of a 3D image's mip 0 (contiguous, slice_2d apart).
@@ -475,6 +485,102 @@ class Renderer {
     for (uint32_t k = 0; k < layers; ++k) copy_to_image(g.image, at + k * one, row_texels, rows, k);
     full_barrier();
     (void)format;
+  }
+
+  // A texture in an RDNA2 swizzled layout: mip 0 of every slice gathered
+  // into rows through addrlib's element offsets, then uploaded.
+  void upload_swizzled(GpuImage& g, ResourceState* r, const TextureLayout& l, bool block) {
+    const MipLayout& m = l.mip[0];
+    const uint32_t layers = g.image.volume ? 1 : g.image.layers;
+    const auto table = gpu::swizzle_table(r->swizzle, l.element.bytes, m.width_elements, m.height_elements,
+                                          g.image.volume ? g.image.depth : layers, g.image.volume, l.mips);
+    if (!table || table->size > (256u << 20)) {
+      note(std::format("swizzle mode {} of a {}x{} texture (format {}) not supported", r->swizzle, m.width, m.height,
+                       l.format));
+      return;
+    }
+    const uint64_t read = std::min<uint64_t>(table->size, table->slice_size * layers);
+    scratch_.resize(read ? read : table->size);
+    // Streamed textures map only their resident mips: unreadable pages read as zeros.
+    if (!platform::safe_read(r->gpu_va, scratch_.data(), scratch_.size())) {
+      for (uint64_t off = 0; off < scratch_.size();) {
+        const uint64_t n = std::min<uint64_t>(4096 - ((r->gpu_va + off) & 4095), scratch_.size() - off);
+        if (!platform::safe_read(r->gpu_va + off, scratch_.data() + off, n)) std::memset(scratch_.data() + off, 0, n);
+        off += n;
+      }
+    }
+    const uint64_t hash = fnv1a(scratch_.data(), scratch_.size());
+    if (hash == g.content_hash) return;
+    g.content_hash = hash;
+    if (std::getenv("XBEM_DUMP_TEXTURES")) {
+      uint64_t nonzero = 0;
+      for (uint8_t b : scratch_) nonzero += b != 0;
+      XBEM_INFO("gpu", "swizzled texture {}x{} format {} mode {} at {:#x}: {:#x} bytes, {:#x} non-zero", m.width,
+                m.height, l.format, r->swizzle, r->gpu_va, scratch_.size(), nonzero);
+    }
+    const uint32_t e = l.element.bytes;
+    const VkDeviceSize one = uint64_t{m.width_elements} * m.height_elements * e;
+    if (one * layers > (64u << 20)) return;
+    const VkDeviceSize at = ring_alloc(one * layers, 16);
+    auto* dst = static_cast<uint8_t*>(ring_.mapped) + at;
+    for (uint32_t k = 0; k < layers; ++k) {
+      const uint64_t base = k * table->slice_size;
+      for (size_t i = 0; i < table->offset.size(); ++i) {
+        const uint64_t src = base + table->offset[i];
+        if (src + e <= scratch_.size()) std::memcpy(dst + k * one + i * e, scratch_.data() + src, e);
+      }
+    }
+    const uint32_t row_texels = block ? m.width_elements * 4 : m.width_elements;
+    const uint32_t rows = block ? m.height_elements * 4 : m.height_elements;
+    for (uint32_t k = 0; k < layers; ++k) copy_to_image(g.image, at + k * one, row_texels, rows, k);
+    full_barrier();
+    if (const char* dir = std::getenv("XBEM_DUMP_TEXTURES"))
+      dump_texture(dir, r, l.format, m.width_elements, m.height_elements, dst);
+  }
+
+  // Development: a decoded copy of a texture as a PPM (BC1/BC3 colour, RGBA8).
+  void dump_texture(const char* dir, const ResourceState* r, uint32_t format, uint32_t we, uint32_t he,
+                    const uint8_t* data) {
+    static int dumped = 0;
+    if (dumped >= 200) return;
+    const bool bc1 = format >= 70 && format <= 72, bc3 = format >= 76 && format <= 78;
+    const bool rgba = format == 28 || format == 29 || format == 87;
+    if (!bc1 && !bc3 && !rgba) return;
+    const uint32_t w = rgba ? we : we * 4, h = rgba ? he : he * 4;
+    if (w > 4096 || h > 4096) return;
+    std::vector<uint8_t> px(uint64_t{w} * h * 3);
+    if (rgba) {
+      for (uint64_t i = 0; i < uint64_t{w} * h; ++i)
+        for (int c = 0; c < 3; ++c) px[i * 3 + c] = data[i * 4 + (format == 87 ? 2 - c : c)];
+    } else {
+      const uint32_t bytes = bc1 ? 8 : 16;
+      for (uint32_t by = 0; by < he; ++by)
+        for (uint32_t bx = 0; bx < we; ++bx) {
+          const uint8_t* b = data + (uint64_t{by} * we + bx) * bytes + (bc3 ? 8 : 0);
+          const uint16_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+          uint8_t pal[4][3];
+          const auto rgb = [](uint16_t c, uint8_t* o) {
+            o[0] = static_cast<uint8_t>((c >> 11) * 255 / 31);
+            o[1] = static_cast<uint8_t>(((c >> 5) & 63) * 255 / 63);
+            o[2] = static_cast<uint8_t>((c & 31) * 255 / 31);
+          };
+          rgb(c0, pal[0]);
+          rgb(c1, pal[1]);
+          for (int c = 0; c < 3; ++c) {
+            pal[2][c] = static_cast<uint8_t>((2 * pal[0][c] + pal[1][c]) / 3);
+            pal[3][c] = static_cast<uint8_t>((pal[0][c] + 2 * pal[1][c]) / 3);
+          }
+          const uint32_t bits = b[4] | b[5] << 8 | b[6] << 16 | static_cast<uint32_t>(b[7]) << 24;
+          for (int i = 0; i < 16; ++i) {
+            const uint32_t x = bx * 4 + i % 4, y = by * 4 + i / 4;
+            std::memcpy(&px[(uint64_t{y} * w + x) * 3], pal[(bits >> (2 * i)) & 3], 3);
+          }
+        }
+    }
+    const std::string path = std::format("{}/tex_{:03}_{}x{}_f{}_sw{}.ppm", dir, dumped++, w, h, format, r->swizzle);
+    std::ofstream out(path, std::ios::binary);
+    out << "P6\n" << w << " " << h << "\n255\n";
+    out.write(reinterpret_cast<const char*>(px.data()), static_cast<std::streamsize>(px.size()));
   }
 
   // Copies guest memory a draw reads into the ring (once per submission).

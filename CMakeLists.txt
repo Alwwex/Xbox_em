@@ -38,6 +38,7 @@ if(GIT_FOUND)
   endif()
 endif()
 
+add_subdirectory(third_party/addrlib)
 add_subdirectory(src)
 
 if(XBEM_BUILD_TESTS)

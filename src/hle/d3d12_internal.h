@@ -19,6 +19,9 @@ struct ResourceState {
   uint64_t gpu_va = 0;
   uint64_t size = 0;
   void* cpu = nullptr;
+  // RDNA2 swizzle mode of the memory (ADDR_SW_*; 0 = linear): textures the
+  // title streams in are stored swizzled - see gpu/swizzle.h.
+  uint32_t swizzle = 0;
   std::mutex mutex;
 };
 
