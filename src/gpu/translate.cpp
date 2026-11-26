@@ -423,6 +423,16 @@ class Translator {
                        shift ? "((from & ~15u) == (lane & ~15u)) && from < 32u" : "true",
                        bound_ctrl ? "0u" : vreg(v.dst)));
       dpp_ = true;
+    } else if (insn.extension == rdna2::Instruction::Extension::Dpp8) {
+      // DPP8: lane i of each group of 8 reads lane sel[i] (3 bits each from
+      // bit 8); operand 234 (FI) also reads inactive lanes, 233 gets 0 there.
+      const uint32_t w1 = insn.words[1];
+      const bool fi = (insn.words[0] & 0x1ff) == 0xEA || (insn.words[0] & 0xff) == 0xEA;
+      line(std::format("{{ uint from = (lane & ~7u) | (({:#x}u >> ((lane & 7u) * 3u)) & 7u); dppv = subgroupShuffle({}, from);",
+                       w1 >> 8, vreg(w1 & 0xff)));
+      if (!fi) line("  if (((exec_lo >> from) & 1u) == 0u) dppv = 0u;");
+      line("}");
+      dpp_ = true;
     }
     line("if (lane_on()) {");
     post_.clear();
@@ -1187,7 +1197,7 @@ class Translator {
         case kScc: return e = "uint(scc)", true;
         case 251: return e = "uint(vcc_lo == 0u)", true;   // src_vccz
         case 252: return e = "uint(exec_lo == 0u)", true;  // src_execz
-        case 250: return dpp_ ? (e = "dppv", true) : fail("DPP outside wave mode");
+        case 250: case 233: case 234: return dpp_ ? (e = "dppv", true) : fail("DPP outside wave mode");
         default: return fail(std::format("operand {}", s));
       }
     }
@@ -1400,6 +1410,110 @@ class Translator {
       if (!src(v.src[0], insn, a)) return false;
       line(std::format("{} = {};", vreg(v.dst),
                        fresult(v, std::format("float({}({}))", n == "v_cvt_f32_i32" ? "int" : "uint", a))));
+      return true;
+    }
+    // Half-precision arithmetic. Packed (VOP3P): each half with its own
+    // op_sel (lo) / op_sel_hi (hi) source half and neg_lo / neg_hi. Scalar
+    // f16 ops read the low half (VOP3: op_sel picks) and write the low half
+    // (VOP3 op_sel bit 3: the high one), keeping the other.
+    {
+      static const std::pair<std::string_view, const char*> kF16[] = {
+          {"add", "{0} + {1}"}, {"sub", "{0} - {1}"}, {"subrev", "{1} - {0}"}, {"mul", "{0} * {1}"},
+          {"max", "max({0}, {1})"}, {"min", "min({0}, {1})"}, {"fma", "fma({0}, {1}, {2})"},
+          {"rcp", "1.0 / {0}"}, {"sqrt", "sqrt({0})"}, {"rsq", "inversesqrt({0})"}, {"fract", "fract({0})"},
+          {"floor", "floor({0})"}, {"ceil", "ceil({0})"}, {"trunc", "trunc({0})"}, {"rndne", "roundEven({0})"},
+          {"fmac", "fma({0}, {1}, {3})"}};
+      const bool packed = starts(n, "v_pk_") && n.ends_with("_f16");
+      const bool scalar = !packed && starts(n, "v_") && n.ends_with("_f16") && n.find("cvt") == std::string_view::npos &&
+                          n.find("cmp") == std::string_view::npos && n.find("mix") == std::string_view::npos;
+      if (packed || scalar) {
+        const std::string_view op = n.substr(packed ? 5 : 2, n.size() - (packed ? 5 : 2) - 4);
+        const char* pattern = nullptr;
+        for (const auto& [k, p] : kF16)
+          if (op == k) pattern = p;
+        if (pattern) {
+          const int operands = std::string_view(pattern).find("{2}") != std::string_view::npos ? 3
+                               : std::string_view(pattern).find("{1}") != std::string_view::npos ? 2 : 1;
+          const uint32_t neg_hi = (insn.words[0] >> 8) & 7;
+          const auto half = [&](int k, bool hi, std::string& e) {
+            uint32_t c;
+            if (v.src[k] >= 240 && v.src[k] <= 248 && inline_constant(v.src[k], c)) {
+              e = std::format("uintBitsToFloat({:#x}u)", c);
+            } else {
+              std::string u;
+              if (!src(v.src[k], insn, u)) return false;
+              const bool sel = insn.format == Format::Vop3 || insn.format == Format::Vop3p
+                                   ? ((hi ? v.opsel_hi : v.opsel) >> k) & 1
+                                   : false;
+              e = std::format("unpackHalf2x16({}).{}", u, sel ? 'y' : 'x');
+            }
+            if (packed ? ((hi ? neg_hi : v.neg) >> k) & 1 : (v.neg >> k) & 1) e = std::format("(-{})", e);
+            if (!packed && insn.format == Format::Vop3 && ((v.abs >> k) & 1)) e = std::format("abs({})", e);
+            return true;
+          };
+          std::string lo[3], hi[3];
+          for (int k = 0; k < operands; ++k) {
+            if (!half(k, false, lo[k])) return false;
+            if (packed && !half(k, true, hi[k])) return false;
+          }
+          const auto clamp = [&](std::string e) { return v.clamp ? std::format("clamp({}, 0.0, 1.0)", e) : e; };
+          // fmac accumulates into the destination's half.
+          std::string acc_lo = std::format("unpackHalf2x16({}).x", vreg(v.dst)),
+                      acc_hi = std::format("unpackHalf2x16({}).y", vreg(v.dst));
+          if (!packed && insn.format == Format::Vop3 && (v.opsel & 8)) acc_lo = acc_hi;
+          const std::string rl = clamp(std::vformat(pattern, std::make_format_args(lo[0], lo[1], lo[2], acc_lo)));
+          if (packed) {
+            const std::string rh = clamp(std::vformat(pattern, std::make_format_args(hi[0], hi[1], hi[2], acc_hi)));
+            line(std::format("{} = packHalf2x16(vec2({}, {}));", vreg(v.dst), rl, rh));
+          } else if (insn.format == Format::Vop3 && (v.opsel & 8)) {
+            line(std::format("{0} = ({0} & 0xffffu) | (packHalf2x16(vec2({1}, 0.0)) << 16);", vreg(v.dst), rl));
+          } else {
+            line(std::format("{0} = ({0} & 0xffff0000u) | (packHalf2x16(vec2({1}, 0.0)) & 0xffffu);", vreg(v.dst), rl));
+          }
+          return true;
+        }
+      }
+    }
+    if (n == "v_add_nc_u16" || n == "v_sub_nc_u16" || n == "v_mul_lo_u16" || n == "v_cvt_u16_f16" ||
+        n == "v_cvt_i16_f16" || n == "v_cvt_f16_u16" || n == "v_cvt_f16_i16") {
+      // 16-bit integer ops and conversions on the low halves; the high half
+      // of the destination is kept.
+      std::string s0, s1 = "0u";
+      if (!src(v.src[0], insn, s0)) return false;
+      if (n.find("_nc_") != std::string_view::npos || n == "v_mul_lo_u16")
+        if (!src(v.src[1], insn, s1)) return false;
+      std::string e;
+      if (n == "v_add_nc_u16") e = std::format("{} + {}", s0, s1);
+      else if (n == "v_sub_nc_u16") e = std::format("{} - {}", s0, s1);
+      else if (n == "v_mul_lo_u16") e = std::format("({} & 0xffffu) * ({} & 0xffffu)", s0, s1);
+      else if (n == "v_cvt_u16_f16") e = std::format("uint(clamp(unpackHalf2x16({}).x, 0.0, 65535.0))", s0);
+      else if (n == "v_cvt_i16_f16") e = std::format("uint(int(clamp(unpackHalf2x16({}).x, -32768.0, 32767.0)))", s0);
+      else if (n == "v_cvt_f16_u16") e = std::format("packHalf2x16(vec2(float({} & 0xffffu), 0.0))", s0);
+      else e = std::format("packHalf2x16(vec2(float(bitfieldExtract(int({}), 0, 16)), 0.0))", s0);
+      line(std::format("{0} = ({0} & 0xffff0000u) | (({1}) & 0xffffu);", vreg(v.dst), e));
+      return true;
+    }
+    if (n == "v_pack_b32_f16") {
+      // dst = half of src0 | half of src1 << 16 (op_sel picks the halves).
+      std::string s0, s1;
+      if (!src(v.src[0], insn, s0) || !src(v.src[1], insn, s1)) return false;
+      const auto part = [&](const std::string& u, int k) {
+        std::string h = std::format("(({} >> {}u) & 0xffffu)", u, ((v.opsel >> k) & 1) * 16);
+        if ((v.neg >> k) & 1) h = std::format("({} ^ 0x8000u)", h);
+        return h;
+      };
+      line(std::format("{} = {} | ({} << 16);", vreg(v.dst), part(s0, 0), part(s1, 1)));
+      return true;
+    }
+    if (n == "v_pk_lshrrev_b16" || n == "v_pk_lshlrev_b16") {
+      std::string s0, s1;
+      if (!src(v.src[0], insn, s0) || !src(v.src[1], insn, s1)) return false;
+      const char* sh = n == "v_pk_lshrrev_b16" ? ">>" : "<<";
+      const auto part = [&](bool hi) {
+        const uint32_t k0 = ((hi ? v.opsel_hi : v.opsel) & 1) * 16, k1 = (((hi ? v.opsel_hi : v.opsel) >> 1) & 1) * 16;
+        return std::format("(((({} >> {}u) & 0xffffu) {} (({} >> {}u) & 15u)) & 0xffffu)", s1, k1, sh, s0, k0);
+      };
+      line(std::format("{} = {} | ({} << 16);", vreg(v.dst), part(false), part(true)));
       return true;
     }
     if (n == "v_cvt_f32_f16") {
