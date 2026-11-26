@@ -36,8 +36,10 @@
 #include <unordered_map>
 
 #include "common/log.h"
+#include "gpu/guest_memory_layout.h"
 #include "gpu/swizzle.h"
 #include "gpu/translate.h"
+#include "gpu/vk/guest_memory.h"
 #include "gpu/vk/vk_core.h"
 #include "hle/hle_util.h"
 #include "hle/texture_layout.h"
@@ -57,6 +59,8 @@ constexpr uint32_t kMaxTextures = 4096, kSamplers = 8, kMaxArrayTextures = 1024,
 // Storage images (UAVs that compute shaders write): 2D, 2D array, 3D.
 constexpr uint32_t kMaxStorage = 2048, kMaxStorageArrays = 512, kMaxStorageVolumes = 256;
 constexpr VkDeviceSize kRingSize = 256ull << 20;
+constexpr VkShaderStageFlags kGraphicsStages =
+    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
 uint64_t fnv1a(const void* data, size_t size, uint64_t h = 1469598103934665603ull) {
   const auto* p = static_cast<const uint8_t*>(data);
@@ -137,6 +141,13 @@ class Renderer {
       info = "cannot allocate the upload ring";
       return false;
     }
+    {
+      // The GPU's copy of guest memory (XBEM_GPU_MEMORY_MB, default 2048).
+      const char* mb = std::getenv("XBEM_GPU_MEMORY_MB");
+      const uint64_t budget = (mb ? std::strtoull(mb, nullptr, 10) : 2048ull) << 20;
+      std::string why;
+      if (!memory_.init(core_, budget, why)) XBEM_WARN("gpu", "{} - guest buffers are copied per submission", why);
+    }
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = core_.queue_family();
@@ -177,15 +188,17 @@ class Renderer {
       info = "descriptor set layout failed";
       return false;
     }
-    VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8},
-                                   {VK_SHADER_STAGE_FRAGMENT_BIT, 8, 8}};
+    // Per-draw words of the vertex and pixel stages, then the guest memory table.
+    VkPushConstantRange push[3] = {{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8},
+                                   {VK_SHADER_STAGE_FRAGMENT_BIT, 8, 8},
+                                   {kGraphicsStages, 16, 8}};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &set_layout_;
-    plci.pushConstantRangeCount = 2;
+    plci.pushConstantRangeCount = 3;
     plci.pPushConstantRanges = push;
     f.vkCreatePipelineLayout(dev, &plci, nullptr, &layout_);
-    VkPushConstantRange cpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPushConstantRange cpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &cpush;
     f.vkCreatePipelineLayout(dev, &plci, nullptr, &compute_layout_);
@@ -279,6 +292,12 @@ class Renderer {
 
   void present() {
     std::lock_guard lock(mutex_);
+    if (const uint64_t n = presents_ + 1; n >= 64 && (n & (n - 1)) == 0 && memory_.ready()) {
+      const auto& m = memory_.stats();
+      XBEM_INFO("gpu", "guest memory copy at present {}: {} pages resident ({} MiB), {} uploaded, {} refreshed, "
+                "{} written back, {} evicted, {} unmapped", n, m.resident, m.resident >> 4, m.uploaded, m.refreshed,
+                m.written_back, m.evicted, m.unmapped);
+    }
     if (!display_) return;
     GpuImage& g = *display_;
     const uint32_t w = g.image.width, h = g.image.height;
@@ -317,6 +336,7 @@ class Renderer {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     core_.fn().vkBeginCommandBuffer(cmd_, &bi);
     recording_ = true;
+    memory_.begin_submission();
   }
 
   void submit() {
@@ -330,6 +350,7 @@ class Renderer {
     f.vkWaitForFences(core_.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
     f.vkResetFences(core_.device(), 1, &fence_);
     recording_ = false;
+    memory_.end_submission();
     ring_offset_ = 0;
     uploads_.clear();
   }
@@ -1040,7 +1061,11 @@ class Renderer {
           const uint64_t i = (base - 0x10000000u) >> 24;
           if (i < tokens.regions.size()) host = tokens.regions[i].first + (base & 0xffffff);
         }
-        const VkDeviceAddress a = size && host ? upload(host, size) : ring_.address;
+        // Guest memory is read through the GPU's copy (the slot holds the
+        // guest address); anything else is copied into the ring.
+        const uint64_t limited = std::min<uint64_t>(size, 64ull << 20);
+        const uint64_t a = size && host && memory_.require(host, limited) ? host
+                           : (size && host ? upload(host, size) : ring_.address) | gpu::mem::kDirect;
         out[0] = static_cast<uint32_t>(a);
         out[1] = static_cast<uint32_t>(a >> 32);
         out[2] = stride;
@@ -1252,6 +1277,8 @@ class Renderer {
     f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set_, 0, nullptr);
     f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8, &data[0]);
     f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 8, 8, &data[1]);
+    const VkDeviceAddress table = memory_.table_address();
+    f.vkCmdPushConstants(cmd_, layout_, kGraphicsStages, 16, 8, &table);
     VkViewport vp = state_.viewport;
     if (vp.width <= 0 || vp.height <= 0)
       vp = {0, 0, static_cast<float>(state_.target->image.width), static_cast<float>(state_.target->image.height), 0, 1};
@@ -1331,7 +1358,8 @@ class Renderer {
     const auto& f = core_.fn();
     f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, compute_layout_, 0, 1, &set_, 0, nullptr);
-    f.vkCmdPushConstants(cmd_, compute_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &data);
+    const VkDeviceAddress push[2] = {data, memory_.table_address()};
+    f.vkCmdPushConstants(cmd_, compute_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
     f.vkCmdDispatch(cmd_, x, y, z);
     full_barrier();
     ++dispatches_;
@@ -1389,6 +1417,7 @@ class Renderer {
   std::mutex mutex_;
   Core core_;
   Buffer ring_;
+  gpu::vk::GuestMemory memory_;
   VkDeviceSize ring_offset_ = 0;
   std::map<std::pair<uint64_t, uint64_t>, VkDeviceAddress> uploads_;
   VkCommandPool pool_ = VK_NULL_HANDLE;

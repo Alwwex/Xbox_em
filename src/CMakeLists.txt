@@ -90,11 +90,11 @@ endif()
 # library is loaded at run time); without them xbem builds without it.
 find_path(XBEM_VULKAN_INCLUDE vulkan/vulkan.h)
 if(XBEM_VULKAN_INCLUDE AND NOT WIN32)
-  target_sources(xbem_core PRIVATE gpu/vk/vk_core.cpp)
+  target_sources(xbem_core PRIVATE gpu/vk/vk_core.cpp gpu/vk/guest_memory.cpp)
   target_include_directories(xbem_core PUBLIC ${XBEM_VULKAN_INCLUDE})
   target_compile_definitions(xbem_core PUBLIC XBEM_HAVE_VULKAN=1)
   # Vulkan structures are filled field by field after {sType}.
-  set_source_files_properties(gpu/vk/vk_core.cpp hle/d3d12_render.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+  set_source_files_properties(gpu/vk/vk_core.cpp gpu/vk/guest_memory.cpp hle/d3d12_render.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 endif()
 
 add_executable(xbem

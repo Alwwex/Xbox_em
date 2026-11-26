@@ -373,12 +373,6 @@ bool write_page(uint64_t id, const void* data, uint16_t mask) {
       ok &= safe_write(id + at, src + at, kPartSize);
     }
   }
-  if (!(id & kSharedId)) {
-    // The write marked the page written: protect it again (a guest write in
-    // between is lost to the GPU copy - the GPU had just written the page).
-    std::lock_guard lock(s.mutex);
-    if (s.tracking) scan_written(s, id, kPageSize, [](uint64_t, uint64_t) {});
-  }
   return ok;
 }
 

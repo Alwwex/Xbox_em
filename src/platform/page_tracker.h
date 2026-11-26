@@ -62,8 +62,11 @@ void collect(Changes& out);
 
 // Contents of page `id` (64 KiB; unmapped parts read as zero).
 bool read_page(uint64_t id, void* out);
-// Writes the parts in `mask` of page `id` (the GPU wrote them) without
-// reporting them as written by the guest.
+// Writes the parts in `mask` of page `id` (the GPU wrote them). Physical
+// pages are written in the object (not reported); anonymous pages through
+// their address, so they are reported written at the next collect - the
+// consumer then re-reads the whole page, with any guest writes made while
+// the GPU ran.
 bool write_page(uint64_t id, const void* data, uint16_t mask);
 
 // For tests: forget all state (mappings stay as they are).

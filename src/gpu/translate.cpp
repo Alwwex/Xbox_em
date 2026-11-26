@@ -9,6 +9,8 @@
 #include <set>
 #include <string_view>
 
+#include "gpu/guest_memory_layout.h"
+
 namespace xbem::gpu {
 namespace {
 
@@ -921,7 +923,9 @@ class Translator {
     g += std::format("layout(local_size_x = {}, local_size_y = {}, local_size_z = {}) in;\n", c.local_size[0],
                      c.local_size[1], c.local_size[2]);
     g += "layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };\n"
-         "layout(push_constant) uniform Push { uint64_t data; } pc;\n"
+         "layout(push_constant) uniform Push { uint64_t data; uint64_t mem; } pc;\n";
+    g += mem::glsl_helpers(true);
+    g += ""
          "layout(set = 0, binding = 0) uniform texture2D textures[];\n"
          "layout(set = 0, binding = 2) uniform texture2DArray textures_a[];\n"
          "layout(set = 0, binding = 3) uniform texture3D textures_3d[];\n"
@@ -932,11 +936,11 @@ class Translator {
          "uint D(uint i) { return Words(pc.data).w[i]; }\n"
          "uint ld32(uint64_t a) {\n"
          "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
-         "  uint w0 = Words(al).w[0];\n"
+         "  uint w0 = Words(gpa(al)).w[0];\n"
          "  if (sh == 0u) return w0;\n"
-         "  return (w0 >> sh) | (Words(al).w[1] << (32u - sh));\n"
+         "  return (w0 >> sh) | (Words(gpa(al + 4ul)).w[0] << (32u - sh));\n"
          "}\n"
-         "void st32(uint64_t a, uint v) { Words(a & ~uint64_t(3)).w[0] = v; }\n";
+         "void st32(uint64_t a, uint v) { Words(gpw(a & ~uint64_t(3))).w[0] = v; }\n";
     if (uses_fetch_format_)
       // gfx10 buffer formats: (bits per component, components, kind) - unorm,
       // snorm, uint, sint, float; out-of-range reads give (0, 0, 0, 1).
@@ -1591,7 +1595,7 @@ class Translator {
     if (n == "buffer_store_byte" || n == "buffer_store_short" || n == "buffer_store_format_d16_x") {
       const bool byte = n == "buffer_store_byte";
       line(std::format("  if (inb) {{ uint s = uint(a & uint64_t({})) * 8u; uint m = {}u << s;", byte ? 3 : 2, byte ? "0xff" : "0xffff"));
-      line(std::format("    atomicAnd(Words(a & ~uint64_t(3)).w[0], ~m); atomicOr(Words(a & ~uint64_t(3)).w[0], ({} << s) & m); }}", vreg(vdata)));
+      line(std::format("    Words p = Words(gpw(a & ~uint64_t(3))); atomicAnd(p.w[0], ~m); atomicOr(p.w[0], ({} << s) & m); }}", vreg(vdata)));
       line("}");
       return true;
     }
@@ -1613,7 +1617,7 @@ class Translator {
         {"buffer_atomic_cmpswap", ""}};
     for (const auto& [k, f] : kAtomics) {
       if (n != k) continue;
-      const std::string place = "Words(a & ~uint64_t(3)).w[0]";
+      const std::string place = "Words(gpw(a & ~uint64_t(3))).w[0]";
       std::string call;
       if (n == "buffer_atomic_sub") call = std::format("atomicAdd({}, uint(-int({})))", place, vreg(vdata));
       else if (n == "buffer_atomic_inc") return fail("buffer_atomic_inc");
@@ -1918,18 +1922,21 @@ class Translator {
                     "layout(set = 0, binding = 3) uniform texture3D textures_3d[];\n"
                     "layout(set = 0, binding = 1) uniform sampler samplers[];\n"
                     "uint D(uint i) { return Words(pc.data).w[i]; }\n"
+                    "%MEM%"
                     "uint ld32(uint64_t a) {\n"
                     "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
-                    "  uint w0 = Words(al).w[0];\n"
+                    "  uint w0 = Words(gpa(al)).w[0];\n"
                     "  if (sh == 0u) return w0;\n"
-                    "  return (w0 >> sh) | (Words(al).w[1] << (32u - sh));\n"
+                    "  return (w0 >> sh) | (Words(gpa(al + 4ul)).w[0] << (32u - sh));\n"
                     "}\n";
-    // Push constants: the vertex stage's per-draw words at offset 0, the pixel stage's at 8.
+    g.replace(g.find("%MEM%"), 5, mem::glsl_helpers(false));
+    // Push constants: the vertex stage's per-draw words at offset 0, the pixel stage's at 8, the
+    // guest memory table at 16.
     const size_t push = g.find("%PUSH%");
     g.replace(push, 6,
               out_.stage == ShaderStage::Vertex
-                  ? "layout(push_constant) uniform Push { uint64_t data; } pc;\n"
-                  : "layout(push_constant) uniform Push { layout(offset = 8) uint64_t data; } pc;\n");
+                  ? "layout(push_constant) uniform Push { uint64_t data; layout(offset = 16) uint64_t mem; } pc;\n"
+                  : "layout(push_constant) uniform Push { layout(offset = 8) uint64_t data; uint64_t mem; } pc;\n");
     if (out_.stage == ShaderStage::Vertex) {
       for (uint32_t k = 0; k < out_.outputs; ++k) g += std::format("layout(location = {}) out vec4 o_{};\n", k, k);
     } else {
