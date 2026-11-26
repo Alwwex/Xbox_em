@@ -19,6 +19,14 @@ void* map_fixed(uint64_t address, size_t size, Prot prot);
 // Maps `size` bytes anywhere, with the start aligned to `alignment` (power of two).
 void* map_anywhere(size_t size, size_t alignment, Prot prot);
 
+// Maps `size` bytes for the guest (VirtualAlloc & co.): on Linux inside an
+// arena below 2^40, as console titles (and their GPU) treat addresses as
+// 40-bit (GTA VI's raytracing refuses buffers with higher addresses); falls
+// back to map_anywhere when the arena is unavailable or full. map_fixed and
+// unmap handle arena ranges too (unmapped ranges return to the arena).
+void* map_guest(size_t size, size_t alignment, Prot prot);
+bool in_guest_arena(uint64_t address);
+
 bool unmap(void* address, size_t size);
 
 // Copies `size` bytes from `address` without faulting if it is not mapped.

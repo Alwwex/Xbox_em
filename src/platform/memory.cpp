@@ -7,6 +7,12 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
+#include <map>
+#include <mutex>
 #endif
 
 namespace xbem::platform {
@@ -62,6 +68,9 @@ bool safe_write(uint64_t address, const void* data, size_t size) {
   return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), data, size, &done) && done == size;
 }
 
+void* map_guest(size_t size, size_t alignment, Prot prot) { return map_anywhere(size, alignment, prot); }
+bool in_guest_arena(uint64_t) { return false; }
+
 bool safe_read(uint64_t address, void* out, size_t size) {
   SIZE_T done = 0;
   return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), out, size, &done) &&
@@ -92,7 +101,120 @@ size_t page_size() {
   return ps;
 }
 
+// ------------------------------------------------------------ guest arena
+//
+// [kArenaStart, kArenaEnd) is reserved once (PROT_NONE, no backing) and
+// handed out first-fit; the kernel's own mappings (host heap, stacks,
+// libraries) live near the top of the 47-bit address space and never get
+// there. Granule 64 KiB, as Windows.
+namespace {
+constexpr uint64_t kArenaStart = 0x10'0000'0000ull;  // 64 GiB: clear of images at 0x1'4000'0000 & co.
+constexpr uint64_t kArenaEnd = 0xff'0000'0000ull;    // below 2^40
+constexpr uint64_t kArenaGranule = 0x10000;
+
+struct Arena {
+  std::mutex mutex;
+  bool tried = false, ok = false;
+  std::map<uint64_t, uint64_t> free;  // start -> size
+};
+Arena& arena() {
+  static Arena a;
+  return a;
+}
+bool arena_ready(Arena& a) {
+  if (!a.tried) {
+    a.tried = true;
+    if (const char* v = std::getenv("XBEM_HIGH_GUEST_MEMORY"); v && *v && *v != '0') return false;
+    void* want = reinterpret_cast<void*>(kArenaStart);
+    void* p = mmap(want, kArenaEnd - kArenaStart, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == want) {
+      a.ok = true;
+      a.free[kArenaStart] = kArenaEnd - kArenaStart;
+    } else if (p != MAP_FAILED) {
+      munmap(p, kArenaEnd - kArenaStart);
+    }
+  }
+  return a.ok;
+}
+// Makes [start, start+size) of the arena accessible memory (fresh zero pages).
+bool arena_commit(uint64_t start, uint64_t size, Prot prot) {
+  void* p = mmap(reinterpret_cast<void*>(start), size, to_native(prot),
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  return p != MAP_FAILED;
+}
+// Removes [start, start+size) from the free list if all of it is free.
+bool arena_take(Arena& a, uint64_t start, uint64_t size) {
+  auto it = a.free.upper_bound(start);
+  if (it == a.free.begin()) return false;
+  --it;
+  const uint64_t fs = it->first, fe = it->first + it->second;
+  if (start < fs || start + size > fe) return false;
+  a.free.erase(it);
+  if (start > fs) a.free[fs] = start - fs;
+  if (start + size < fe) a.free[start + size] = fe - (start + size);
+  return true;
+}
+void arena_give_back(Arena& a, uint64_t start, uint64_t size) {
+  auto next = a.free.lower_bound(start);
+  if (next != a.free.end() && start + size == next->first) {
+    size += next->second;
+    next = a.free.erase(next);
+  }
+  if (next != a.free.begin()) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == start) {
+      prev->second += size;
+      return;
+    }
+  }
+  a.free[start] = size;
+}
+}  // namespace
+
+bool in_guest_arena(uint64_t address) {
+  Arena& a = arena();
+  std::lock_guard lock(a.mutex);
+  return a.ok && address >= kArenaStart && address < kArenaEnd;
+}
+
+void* map_guest(size_t size, size_t alignment, Prot prot) {
+  Arena& a = arena();
+  {
+    std::lock_guard lock(a.mutex);
+    if (arena_ready(a)) {
+      const uint64_t length = align_up(size, page_size());
+      const uint64_t align = std::max<uint64_t>(alignment, kArenaGranule);
+      for (auto it = a.free.begin(); it != a.free.end(); ++it) {
+        const uint64_t start = align_up(it->first, align);
+        if (start + length > it->first + it->second) continue;
+        if (!arena_take(a, start, length)) break;
+        if (!arena_commit(start, length, prot)) {
+          arena_give_back(a, start, length);
+          break;
+        }
+        return reinterpret_cast<void*>(start);
+      }
+    }
+  }
+  return map_anywhere(size, alignment, prot);
+}
+
 void* map_fixed(uint64_t address, size_t size, Prot prot) {
+  {
+    Arena& a = arena();
+    std::lock_guard lock(a.mutex);
+    if (arena_ready(a) && address < kArenaEnd && address + size > kArenaStart) {
+      // Inside the arena: only a range that is entirely free.
+      const uint64_t start = align_down(address, page_size()), length = align_up(address + size, page_size()) - start;
+      if (start < kArenaStart || start + length > kArenaEnd || !arena_take(a, start, length)) return nullptr;
+      if (!arena_commit(start, length, prot)) {
+        arena_give_back(a, start, length);
+        return nullptr;
+      }
+      return reinterpret_cast<void*>(address);
+    }
+  }
   void* want = reinterpret_cast<void*>(address);
   void* p = mmap(want, size, to_native(prot), MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
                  -1, 0);
@@ -122,7 +244,21 @@ void* map_anywhere(size_t size, size_t alignment, Prot prot) {
   return reinterpret_cast<void*>(aligned);
 }
 
-bool unmap(void* address, size_t size) { return munmap(address, size) == 0; }
+bool unmap(void* address, size_t size) {
+  const auto start = reinterpret_cast<uint64_t>(address);
+  {
+    Arena& a = arena();
+    std::lock_guard lock(a.mutex);
+    if (a.ok && start >= kArenaStart && start < kArenaEnd) {
+      const uint64_t length = align_up(start + size, page_size()) - start;
+      void* p = mmap(address, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+      if (p == MAP_FAILED) return false;
+      arena_give_back(a, start, length);
+      return true;
+    }
+  }
+  return munmap(address, size) == 0;
+}
 
 bool protect(void* address, size_t size, Prot prot) { return mprotect(address, size, to_native(prot)) == 0; }
 

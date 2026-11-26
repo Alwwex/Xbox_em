@@ -218,7 +218,7 @@ void* virtual_alloc(void* address, uint64_t size, uint32_t type, uint32_t protec
       p = platform::map_fixed(base, length, prot);
     } else {
       length = platform::align_up(size, ps);
-      p = platform::map_anywhere(length, alignment, prot);
+      p = platform::map_guest(length, alignment, prot);
       base = reinterpret_cast<uint64_t>(p);
     }
     if (!p) {

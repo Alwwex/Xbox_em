@@ -1020,12 +1020,45 @@ void XBEM_GUEST_ABI list_dispatch(ProbeObject* self, uint32_t x, uint32_t y, uin
   record_command(self, 14, args);
   probe_log(self, 14, std::format("Dispatch({}, {}, {})", x, y, z), XBEM_RETURN_ADDRESS());
 }
+// 148 (console): transient memory for the list - (size, alignment) -> CPU
+// pointer, which is also the GPU address (unified memory). XboxBvhBuilder
+// writes its build inputs there ("D3D12 XDXR Error: Failed to allocate upload
+// buffer" when it gets null). Served from one ring: lists execute when they
+// are submitted, long before the ring comes round again.
+constexpr uint64_t kTransientRingSize = 256ull << 20;
+std::mutex g_transient_mutex;
+uint8_t* g_transient_ring = nullptr;
+uint64_t g_transient_head = 0;
+
+uint64_t XBEM_GUEST_ABI list_allocate_transient(ProbeObject* self, uint64_t size, uint64_t alignment) {
+  const uint64_t args[6] = {size, alignment};
+  record_command(self, 148, args);
+  uint64_t result = 0;
+  if (size && size <= kTransientRingSize / 4) {
+    const uint64_t align = alignment && !(alignment & (alignment - 1)) && alignment <= 0x10000 ? alignment : 256;
+    std::lock_guard lock(g_transient_mutex);
+    if (!g_transient_ring)
+      g_transient_ring = static_cast<uint8_t*>(
+          virtual_alloc(nullptr, kTransientRingSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));
+    if (g_transient_ring) {
+      uint64_t at = platform::align_up(g_transient_head, align);
+      if (at + size > kTransientRingSize) at = 0;
+      g_transient_head = at + size;
+      result = reinterpret_cast<uint64_t>(g_transient_ring + at);
+    }
+  }
+  probe_log(self, 148, std::format("AllocateTransient({:#x} bytes, align {:#x}) -> {:#x}", size, alignment, result),
+            XBEM_RETURN_ADDRESS());
+  return result;
+}
+
 template <int... Slots>
 ProbeVtable make_command_list_vtable(std::integer_sequence<int, Slots...>) {
   ProbeVtable v = make_vtable({{Slots + 9, fn(&list_method<Slots + 9>)}...});
   v[12] = fn(&list_draw_instanced);
   v[13] = fn(&list_draw_indexed_instanced);
   v[14] = fn(&list_dispatch);
+  v[148] = fn(&list_allocate_transient);
   return v;
 }
 // Slots 9-159 are recorded (0-8: IUnknown, private data, name, device).
@@ -1247,7 +1280,7 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   uint64_t memory = 0, memory_size = 0;
   std::memcpy(&memory, raw + 16, 8);
   std::memcpy(&memory_size, raw + 24, 8);
-  const bool title_memory = memory && memory_size >= bytes && memory_size < (1ull << 40) &&
+  const bool title_memory = memory && memory_size >= bytes && memory_size < (1ull << 32) &&
                             is_allocated_memory(memory) && is_allocated_memory(memory + bytes - 1) &&
                             !in_calling_thread_stack(memory) && !in_calling_thread_stack(memory + bytes - 1);
   if (!title_memory) memory = 0;

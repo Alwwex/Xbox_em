@@ -163,6 +163,21 @@ static void test_xmem(void) {
   CHECK(XMemFreePhysicalPages(1, pages) >= 0);
   CHECK(VirtualFree(va, 0, MEM_RELEASE));
 
+  /* Guest memory lies below 2^40, as on the console (40-bit GPU addresses);
+   * released memory is handed out again, zeroed. */
+  {
+    uint8_t* a = VirtualAlloc(0, 0x30000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(a && (uint64_t)(uintptr_t)a < (1ull << 40) && ((uintptr_t)a & 0xffff) == 0);
+    uint8_t* big = XMemVirtualAlloc(0, 0x40000000, MEM_RESERVE | 0x20000000, 0x3, PAGE_READWRITE);
+    CHECK(big && (uint64_t)(uintptr_t)big + 0x40000000 <= (1ull << 40));
+    a[0x2ffff] = 0x5a;
+    CHECK(VirtualFree(a, 0, MEM_RELEASE));
+    uint8_t* again = VirtualAlloc(a, 0x30000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(again == a && again[0x2ffff] == 0);
+    CHECK(VirtualFree(again, 0, MEM_RELEASE));
+    CHECK(VirtualFree(big, 0, MEM_RELEASE));
+  }
+
   /* The title's layout, (flags, &count, pages), frees exactly those pages; a
      call naming pages that are not allocated frees nothing - freeing pages in
      use would hand them to another allocation, which overwrites them. */
@@ -1451,6 +1466,18 @@ static void test_headless_d3d12(void) {
   const uint64_t rtv_handle = start + 2 * 32;
   ((OmSetFn)VT(list)[50])(list, 1, &rtv_handle, 0, 0);
   ((DrawFn)VT(list)[12])(list, 3, 1, 0, 0);
+  /* 148: transient memory for the list (XboxBvhBuilder's upload buffers):
+   * writable, aligned, below 2^40, distinct allocations */
+  {
+    typedef uint8_t* (*TransientFn)(void*, uint64_t, uint64_t);
+    uint8_t* t1 = ((TransientFn)VT(list)[148])(list, 0x280, 0x10);
+    uint8_t* t2 = ((TransientFn)VT(list)[148])(list, 0x100, 0x100);
+    CHECK(t1 && t2 && ((uintptr_t)t1 & 0xf) == 0 && ((uintptr_t)t2 & 0xff) == 0);
+    CHECK(t2 >= t1 + 0x280 && (uint64_t)(uintptr_t)t2 < (1ull << 40));
+    t1[0x27f] = 1;
+    t2[0xff] = 2;
+    CHECK(t1[0x27f] == 1 && ((TransientFn)VT(list)[148])(list, 0, 0x10) == 0);
+  }
   /* GPU memory writes the list makes when it executes (as GTA VI's frame
    * labels): 71 (address, 32-bit value, 0, 0) and 72 (address, 0, 0, 1) - a
    * 64-bit timestamp. Nothing is written while recording. */
