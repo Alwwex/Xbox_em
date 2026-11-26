@@ -147,6 +147,16 @@ the UI samples via ps 736a6b6841007e1e). Needed:
 Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
 slot-57 pipelines, MRT.
 
+## LOADING STALL = OUT OF RAM (found 2026-11-26)
+
+During the story load the WSL VM (7.7 GB) runs out of memory: at 240 s
+422 MB available, at 270 s 187 MB and ~1 GB swapped; xbem RSS ~6 GB, the
+main thread in state D -> the title's 30 s loading watchdog fires. The
+console gives the title 13.5 GB. Fix applied: C:\Users\alexa\.wslconfig
+(memory=12GB, swap=16GB; needs `wsl --shutdown` on Windows), xbem's read
+cache default lowered to 128 MB. Next: rerun the press script after the WSL
+restart and check that loading gets past ~300 s.
+
 ## WHERE WORK STOPPED (2026-11-26) - read first
 
 - Story loading (after Confirm at ~197 s with the press script) ends in the

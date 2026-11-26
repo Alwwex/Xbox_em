@@ -49,7 +49,7 @@ struct Cache {
     if (configured) return;
     configured = true;
     const char* v = std::getenv("XBEM_READ_CACHE_MB");
-    budget = (v ? std::strtoull(v, nullptr, 10) : 512ull) << 20;
+    budget = (v ? std::strtoull(v, nullptr, 10) : 128ull) << 20;
   }
 };
 

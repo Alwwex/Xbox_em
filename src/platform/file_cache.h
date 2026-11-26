@@ -7,7 +7,7 @@
 // stream thousands of small reads (DirectStorage requests, ReadFile on .rpf
 // archives); GTA VI's story load issued them faster than 9P answered and its
 // loading watchdog fired. Reads go through 256 KiB blocks kept in an LRU cache
-// (XBEM_READ_CACHE_MB, default 512; 0 disables it).
+// (XBEM_READ_CACHE_MB, default 128; 0 disables it).
 
 #include <cstddef>
 #include <cstdint>
