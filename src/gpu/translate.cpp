@@ -433,6 +433,21 @@ class Translator {
         else if (n.ends_with("x8")) words = 8;
         else if (n.ends_with("x16")) words = 16;
         if (!starts(n, "s_load_dword") && !starts(n, "s_buffer_load_dword")) return fail("");
+        if (gpu_load_.count(k)) {
+          const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
+          const uint32_t imm = w1 & 0x1fffff;
+          std::string so;
+          if (!src(soffset, insn, so)) return false;
+          const bool buffer = starts(n, "s_buffer");
+          // s_load: a 64-bit address; s_buffer_load: a V# (48-bit base, records in dword 2).
+          line(std::format("{{ uint off = ({} + {:#x}u) & ~3u; uint64_t a = packUint2x32(uvec2({}, {})) + uint64_t(off);", so,
+                           imm, sreg(sbase), buffer ? std::format("{} & 0xffffu", sreg(sbase + 1)) : sreg(sbase + 1)));
+          for (int i = 0; i < words; ++i)
+            line(buffer ? std::format("  {} = off + {}u < {} ? ld32(a + {}ul) : 0u;", sreg(sdata + i), i * 4 + 3, sreg(sbase + 2), i * 4)
+                        : std::format("  {} = ld32(a + {}ul);", sreg(sdata + i), i * 4));
+          line("}");
+          return true;
+        }
         if (gpu_smem_.count(k)) {
           const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
           const uint32_t imm = w1 & 0x1fffff;
@@ -768,15 +783,18 @@ class Translator {
         if (starts(n, "s_load") || starts(n, "s_buffer_load")) {
           const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
           const bool buffer = starts(n, "s_buffer");
-          for (uint32_t x = sbase; x < sbase + (buffer ? 4 : 2); ++x)
-            if (!is_known(x, false)) return fail("constant or descriptor load from an address only the GPU knows");
-          if (soffset != kNull && !is_known(soffset, false)) {
-            // A buffer load at a GPU-side offset: the GPU reads the buffer itself.
-            if (!buffer) return fail("constant load at an offset only the GPU knows");
-            gpu_smem_.insert(k);
-          }
+          bool base_known = true;
+          for (uint32_t x = sbase; x < sbase + (buffer ? 4 : 2); ++x) base_known = base_known && is_known(x, false);
+          const bool offset_known = soffset == kNull || is_known(soffset, false);
+          // Loads whose address the CPU cannot compute run on the GPU (which
+          // reads guest memory through its copy): a buffer load at a GPU-side
+          // offset reads through a CPU-resolved Buffer slot, anything else
+          // from the SGPR values themselves.
+          if (!base_known) gpu_load_.insert(k);
+          else if (!offset_known) (buffer ? gpu_smem_ : gpu_load_).insert(k);
         }
-        for (uint32_t x = d; x < d + c && x < 128; ++x) known[x] = !loopy[x] && !gpu_smem_.count(k);
+        for (uint32_t x = d; x < d + c && x < 128; ++x)
+          known[x] = !loopy[x] && !gpu_smem_.count(k) && !gpu_load_.count(k);
         continue;
       }
       if (i.format == Format::Sop1 || i.format == Format::Sop2 || i.format == Format::Sopk || i.format == Format::Sopc) {
@@ -808,7 +826,13 @@ class Translator {
         const uint32_t srsrc = ((w1 >> 16) & 0x1f) * 4;
         const uint32_t words = i.format == Format::Mimg ? 8 : 4;
         for (uint32_t x = srsrc; x < srsrc + words; ++x)
-          if (!is_known(x, false)) return fail("descriptor in SGPRs only the GPU knows");
+          if (!is_known(x, false)) {
+            // A buffer descriptor only the GPU knows holds a guest address
+            // the GPU can use as it is.
+            if (i.format == Format::Mimg) return fail("descriptor in SGPRs only the GPU knows");
+            gpu_desc_.insert(k);
+            break;
+          }
         if (i.format == Format::Mimg && starts(n, "image_sample")) {
           const uint32_t ssamp = ((w1 >> 21) & 0x1f) * 4;
           for (uint32_t x = ssamp; x < ssamp + 4; ++x)
@@ -1521,21 +1545,34 @@ class Translator {
   }
 
   // Buffer address arithmetic common to MUBUF and MTBUF.
-  bool buffer_address(const rdna2::Instruction& insn, std::string& slot, std::string& addr, std::string& bound) {
+  // `dword3`: the descriptor's dword 3 (format, swizzles). The descriptor is
+  // a CPU-resolved Buffer slot, or (gpu_desc_) the V# in the SGPRs.
+  bool buffer_address(const rdna2::Instruction& insn, std::string& dword3, std::string& addr, std::string& bound) {
     const uint32_t w0 = insn.words[0], w1 = insn.words[1];
     const uint32_t offset = w0 & 0xfff, offen = (w0 >> 12) & 1, idxen = (w0 >> 13) & 1;
     const uint32_t vaddr = w1 & 0xff, srsrc = ((w1 >> 16) & 0x1f) * 4, soffset = (w1 >> 24) & 0xff;
-    const uint32_t base = add_slot(SlotKind::Buffer, srsrc, 5);
-    slot = std::to_string(base);
+    std::string lo, hi, stride, records;
+    if (gpu_desc_.count(index_)) {
+      lo = sreg(srsrc);
+      hi = std::format("({} & 0xffffu)", sreg(srsrc + 1));
+      stride = std::format("(({} >> 16) & 0x3fffu)", sreg(srsrc + 1));
+      records = sreg(srsrc + 2);
+      dword3 = sreg(srsrc + 3);
+    } else {
+      const uint32_t base = add_slot(SlotKind::Buffer, srsrc, 5);
+      lo = std::format("D({}u)", base);
+      hi = std::format("D({}u)", base + 1);
+      stride = std::format("D({}u)", base + 2);
+      records = std::format("D({}u)", base + 3);
+      dword3 = std::format("D({}u)", base + 4);
+    }
     std::string so;
     if (!src(soffset, insn, so)) return false;
     std::string index = idxen ? vreg(vaddr) : "0u";
     std::string voff = offen ? vreg(vaddr + idxen) : "0u";
-    addr = std::format("(packUint2x32(uvec2(D({0}), D({0} + 1u))) + uint64_t({1}) * uint64_t(D({0} + 2u)) + "
-                       "uint64_t({2} + {3} + {4}u))",
-                       base, index, voff, so, offset);
-    bound = idxen ? std::format("({} < D({} + 3u))", index, base)
-                  : std::format("({} + {} + {}u < D({} + 3u))", voff, so, offset, base);
+    addr = std::format("(packUint2x32(uvec2({}, {})) + uint64_t({}) * uint64_t({}) + uint64_t({} + {} + {}u))", lo, hi,
+                       index, stride, voff, so, offset);
+    bound = idxen ? std::format("({} < {})", index, records) : std::format("({} + {} + {}u < {})", voff, so, offset, records);
     return true;
   }
 
@@ -1549,7 +1586,7 @@ class Translator {
       std::string slot, addr, bound;
       if (!buffer_address(insn, slot, addr, bound)) return false;
       line("{");
-      line(std::format("  uvec4 t = fetch_format({}, (D({} + 4u) >> 12) & 0x7fu, {});", addr, slot, bound));
+      line(std::format("  uvec4 t = fetch_format({}, ({} >> 12) & 0x7fu, {});", addr, slot, bound));
       for (int k = 0; k < comps; ++k) line(std::format("  {} = t.{};", vreg(vdata + k), "xyzw"[k]));
       line("}");
       uses_fetch_format_ = true;
@@ -1979,7 +2016,9 @@ class Translator {
   const bool wave_;
   uint32_t max_sgpr_ = 0;
   std::vector<std::string> post_;  // wave mode: statements after the active-lane guard (ballots)
-  std::set<uint32_t> gpu_smem_;     // wave mode: s_buffer_load instructions the GPU performs
+  std::set<uint32_t> gpu_smem_;     // wave mode: s_buffer_load instructions the GPU performs (Buffer slot)
+  std::set<uint32_t> gpu_load_;     // wave mode: SMEM loads the GPU performs from the SGPR values
+  std::set<uint32_t> gpu_desc_;     // wave mode: MUBUF/MTBUF with a descriptor only the GPU knows
   bool uses_fetch_format_ = false;
   bool dpp_ = false;
   uint32_t lds_words_ = 0;
