@@ -28,7 +28,9 @@
 // call site and fail the way the caller checks for (E_NOTIMPL for HRESULT
 // callers, otherwise 0/NULL).
 
+#include <array>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <map>
 #include <mutex>
@@ -38,6 +40,7 @@
 #include "hle/heap.h"
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
+#include "platform/memory.h"
 
 namespace xbem::hle {
 namespace {
@@ -278,6 +281,9 @@ HRESULT XBEM_GUEST_ABI hle_AcpHalCreate(void** hal) {
 struct XApuQueue {
   void* shared = nullptr;
   uint32_t shared_bytes = 0;
+  // Results waiting to be dequeued (0x40 bytes each: +0 type, +4 id).
+  std::mutex mutex;
+  std::deque<std::array<uint8_t, 0x40>> results;
 };
 
 HRESULT XBEM_GUEST_ABI hle_XApuConnect(const uint8_t* params, uint64_t* shared, void** handle) {
@@ -309,20 +315,47 @@ HRESULT XBEM_GUEST_ABI hle_XApuDisconnect(void* handle) {
   return S_OK;
 }
 
+// Commands are (type, id, ...) records. GTA VI (fn 0x144eaa840) moves its
+// per-id state on results of the same shape: type 1 (start) acknowledged
+// takes an entry from state 1 to 4, type 2 (stop) frees it. Nothing is
+// played, so every command of type 1 or 2 is acknowledged at once with a
+// result echoing its type and id; without them the title's entries stayed
+// waiting forever.
 HRESULT XBEM_GUEST_ABI hle_XApuEnqueueCommand(void* handle, const void* command, uint64_t flags) {
-  XBEM_LOG_CALL("xapu", "S_OK (ignored)", reinterpret_cast<uint64_t>(handle), reinterpret_cast<uint64_t>(command),
-                flags);
-  return handle ? S_OK : E_INVALIDARG;
+  XBEM_LOG_CALL("xapu", "S_OK (acknowledged)", reinterpret_cast<uint64_t>(handle),
+                reinterpret_cast<uint64_t>(command), flags);
+  if (!handle || !command) return E_INVALIDARG;
+  auto* queue = static_cast<XApuQueue*>(handle);
+  uint32_t head[2] = {};
+  if (!platform::safe_read(reinterpret_cast<uint64_t>(command), head, sizeof head)) return E_INVALIDARG;
+  if (head[0] == 1 || head[0] == 2) {
+    std::array<uint8_t, 0x40> r{};
+    std::memcpy(r.data(), head, sizeof head);
+    std::lock_guard lock(queue->mutex);
+    queue->results.push_back(r);
+  }
+  return S_OK;
 }
 
 uint32_t XBEM_GUEST_ABI hle_XApuGetResultCount(void* handle, uint64_t kind) {
-  XBEM_LOG_CALL("xapu", "0", reinterpret_cast<uint64_t>(handle), kind);
-  return 0;
+  if (!handle) return 0;
+  auto* queue = static_cast<XApuQueue*>(handle);
+  std::lock_guard lock(queue->mutex);
+  return static_cast<uint32_t>(queue->results.size());
 }
 
 HRESULT XBEM_GUEST_ABI hle_XApuDequeueResult(void* handle, void* result) {
-  XBEM_LOG_CALL("xapu", "E_FAIL (no results)", reinterpret_cast<uint64_t>(handle), reinterpret_cast<uint64_t>(result));
-  return E_FAIL;
+  if (!handle || !result) return E_INVALIDARG;
+  auto* queue = static_cast<XApuQueue*>(handle);
+  std::array<uint8_t, 0x40> r;
+  {
+    std::lock_guard lock(queue->mutex);
+    if (queue->results.empty()) return E_FAIL;
+    r = queue->results.front();
+    queue->results.pop_front();
+  }
+  if (!platform::safe_write(reinterpret_cast<uint64_t>(result), r.data(), r.size())) return E_POINTER;
+  return S_OK;
 }
 
 XBEM_DISCOVERY_FAIL("chad", XDspActivate)

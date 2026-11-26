@@ -92,6 +92,7 @@ IMP HRESULT AcpHalCreate(void** hal);
 IMP HRESULT XApuConnect(const void* params, uint64_t* shared, void** handle);
 IMP HRESULT XApuEnqueueCommand(void* handle, const void* command, uint32_t flags);
 IMP uint32_t XApuGetResultCount(void* handle, uint32_t kind);
+IMP HRESULT XApuDequeueResult(void* handle, void* result);
 IMP HRESULT XApuDisconnect(void* handle);
 
 /* combase (through kernelx.dll) */
@@ -624,8 +625,13 @@ static void test_audio(void) {
   void* queue = 0;
   CHECK(XApuConnect(params, shared, &queue) == 0 && queue && shared[0] && shared[1] == 0x104000);
   ((uint8_t*)(uintptr_t)shared[0])[0x103fff] = 1;
-  const uint32_t command[16] = {1};
-  CHECK(XApuEnqueueCommand(queue, command, 0) == 0 && XApuGetResultCount(queue, 0) == 0);
+  /* Commands of type 1 / 2 are acknowledged with a result of the same type and id. */
+  const uint32_t command[16] = {1, 7};
+  uint32_t result[16] = {0};
+  CHECK(XApuGetResultCount(queue, 0) == 0 && XApuDequeueResult(queue, result) < 0);
+  CHECK(XApuEnqueueCommand(queue, command, 0) == 0 && XApuGetResultCount(queue, 0) == 1);
+  CHECK(XApuDequeueResult(queue, result) == 0 && result[0] == 1 && result[1] == 7);
+  CHECK(XApuGetResultCount(queue, 0) == 0);
   CHECK(XApuDisconnect(queue) == 0);
 }
 
