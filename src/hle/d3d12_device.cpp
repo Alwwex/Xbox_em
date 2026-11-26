@@ -1516,10 +1516,12 @@ HRESULT XBEM_GUEST_ABI device_create_compute_pso_x(ProbeObject* self, const uint
 HRESULT XBEM_GUEST_ABI device_deserialize_compute_pso_x(ProbeObject* self, const uint8_t* desc, const void*,
                                                         void** out) {
   uint64_t code[2] = {};
-  if (desc && platform::safe_read(reinterpret_cast<uint64_t>(desc) + 0x28, code, 16)) capture_shader("cs-native", code[0], code[1]);
+  uint64_t hash = 0;
+  if (desc && platform::safe_read(reinterpret_cast<uint64_t>(desc) + 0x28, code, 16))
+    hash = capture_shader("cs-native", code[0], code[1]);
   probe_log(self, 67, std::format("DeserializeComputePipelineStateX(code {:#x}, {} bytes)", code[0], code[1]),
             XBEM_RETURN_ADDRESS());
-  return create_into(make_probe_object(child_name("pso")), out);
+  return create_into(make_probe_object(std::format("{} (cs {:016x})", child_name("pso"), hash)), out);
 }
 
 // 76 texture creation: CreateCommittedResource's arguments; the desc's layout

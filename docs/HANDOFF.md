@@ -122,6 +122,31 @@ Fixed on the way (all with guest tests):
 - Command list slots 71 (label write: address, 32-bit value) and 72
   (timestamp write) are now performed at ExecuteCommandLists.
 
+## Renderer status (2026-11-26, later)
+
+Menus: 0 skipped draws (uniform forward branches, s_bfm & co., 2D-array/3D
+textures, strips, DXIL clear PSO). Swizzled textures (RDNA2, addrlib in
+third_party/addrlib, src/gpu/swizzle.*) are de-swizzled on upload; the mode
+is dword 15 of the console resource description. Icons still missing in the
+menus are empty in memory (their chunks are DirectStorage formats 2/14,
+probably BCPack - undocumented, not decoded).
+
+Next big renderer step - compute shaders (Dispatch is recorded, never run).
+Every UI frame starts with them (pso names now carry the code hash, e.g.
+`d3d12.pso#53595 (cs 07e3ae7e43d91de3)` builds the 33^3 colour-grading LUT
+the UI samples via ps 736a6b6841007e1e). Needed:
+1. Translator compute stage: workgroup id in user SGPRs after the root
+   table (that shader: s5 table pointer, s6-s8 group id), local ids in
+   v0-v2, image_store/buffer_store, LDS (ds_*), s_barrier.
+2. Per-lane control flow: exec masks (s_and_saveexec, v_cmpx,
+   s_andn2_wrexec), s_cbranch_vccz/execz as per-lane conditions, loops.
+   2680 compute shaders were dumped; most use these.
+3. Renderer: compute pipelines, SetComputeRoot*, UAV images as storage
+   images (results must land in the VkImages later sampled), UAV buffers
+   (GPU-resident or written back to guest memory).
+Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
+slot-57 pipelines, MRT.
+
 ## WHERE WORK STOPPED (2026-11-26) - read first
 
 - Story loading (after Confirm at ~197 s with the press script) ends in the
