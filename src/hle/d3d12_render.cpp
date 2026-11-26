@@ -285,6 +285,7 @@ class Renderer {
   void execute(const std::vector<RecordedCommand>& commands) {
     std::lock_guard lock(mutex_);
     begin();
+    resolve_descriptor_misses();
     for (const RecordedCommand& c : commands) command(c);
     end_rendering();
     submit();
@@ -295,8 +296,10 @@ class Renderer {
     if (const uint64_t n = presents_ + 1; n >= 64 && (n & (n - 1)) == 0 && memory_.ready()) {
       const auto& m = memory_.stats();
       XBEM_INFO("gpu", "guest memory copy at present {}: {} pages resident ({} MiB), {} uploaded, {} refreshed, "
-                "{} written back, {} evicted, {} unmapped, {} misses ({} dropped)", n, m.resident, m.resident >> 4,
-                m.uploaded, m.refreshed, m.written_back, m.evicted, m.unmapped, m.misses, m.misses_dropped);
+                "{} written back, {} evicted, {} unmapped, {} misses ({} dropped); {} image descriptors looked up on the "
+                "GPU ({} misses, {} table resets)", n, m.resident, m.resident >> 4, m.uploaded, m.refreshed,
+                m.written_back, m.evicted, m.unmapped, m.misses, m.misses_dropped, descriptors_, descriptor_misses_,
+                descriptor_table_resets_);
     }
     if (!display_) return;
     GpuImage& g = *display_;
@@ -368,6 +371,51 @@ class Renderer {
     }
     ring_offset_ = at + size;
     return at;
+  }
+
+  // Image descriptors shaders looked up on the GPU and did not find (see
+  // desc_lookup in gpu/guest_memory_layout.h): resolved like a slot and
+  // added to the table, so later submissions find them.
+  void resolve_descriptor_misses() {
+    if (!memory_.ready()) return;
+    using namespace gpu::mem;
+    uint32_t* t = memory_.table_words();
+    const uint32_t n = std::min(t[kDescMissWord], kMaxDescMisses);
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t* m = t + kDescMissWord + 1 + i * kDescMissWords;
+      const uint32_t kind = m[0];
+      if (kind != kDescTexture && kind != kDescImage) continue;
+      uint32_t out[4] = {0, 0x00010001, 0, 0};
+      Tokens tokens;
+      tokens.windows = &windows_;
+      resolve(kind == kDescTexture ? gpu::SlotKind::Texture : gpu::SlotKind::Image, m + 1, out, tokens);
+      insert_descriptor(kind, m + 1, out);
+    }
+    descriptor_misses_ += n;
+    t[kDescMissWord] = 0;
+    std::memset(t + kDescMissedWord, 0, kDescMissedBits / 8);
+  }
+
+  void insert_descriptor(uint32_t kind, const uint32_t* words, const uint32_t* value) {
+    using namespace gpu::mem;
+    uint32_t* t = memory_.table_words();
+    const uint32_t h = desc_hash(kind, words);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t* e = t + kDescWord + ((h + i) & (kDescEntries - 1)) * kDescEntryWords;
+        const bool same = e[0] == kind && std::memcmp(e + 1, words, 32) == 0;
+        if (e[0] && !same) continue;
+        if (!e[0]) ++descriptors_;
+        std::memcpy(e + 1, words, 32);
+        std::memcpy(e + 9, value, 16);
+        e[0] = kind;
+        return;
+      }
+      // A full chain: start the table over (entries come back as misses).
+      std::memset(t + kDescWord, 0, uint64_t{kDescEntries} * kDescEntryWords * 4);
+      descriptors_ = 0;
+      ++descriptor_table_resets_;
+    }
   }
 
   void transition(VkImage image, VkImageAspectFlags aspect) {
@@ -1468,6 +1516,7 @@ class Renderer {
   Core core_;
   Buffer ring_;
   gpu::vk::GuestMemory memory_;
+  uint64_t descriptors_ = 0, descriptor_misses_ = 0, descriptor_table_resets_ = 0;
   std::vector<HeapWindow> windows_;
   uint64_t next_window_ = kWindowStart;
   VkDeviceSize ring_offset_ = 0;

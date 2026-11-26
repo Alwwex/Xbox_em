@@ -350,6 +350,20 @@ class Translator {
       line(std::format("  if (lane_on()) {} = src_on ? val : 0u; }}", vreg(vdst)));
       return true;
     }
+    if (n == "v_permlane16_b32" || n == "v_permlanex16_b32") {
+      // Lane i of each row of 16 reads lane sel[i] of its row (x16: of the
+      // other row); sel[0..7] are nibbles of src1, sel[8..15] of src2.
+      // op_sel: bit 0 fetch inactive lanes too, bit 1 bound control.
+      std::string s0, s1, s2;
+      if (!src(v.src[0], insn, s0) || !src(v.src[1], insn, s1) || !src(v.src[2], insn, s2)) return false;
+      const bool fi = v.opsel & 1, bc = (v.opsel >> 1) & 1;
+      line(std::format("{{ uint i = lane & 15u; uint sel = i < 8u ? ({} >> (i * 4u)) & 15u : ({} >> ((i - 8u) * 4u)) & 15u;", s1, s2));
+      line(std::format("  uint from = ((lane & ~15u) ^ {}u) | sel; uint val = subgroupShuffle({}, from & 31u);",
+                       n == "v_permlanex16_b32" ? 16 : 0, s0));
+      line(std::format("  bool on = {} || ((exec_lo >> (from & 31u)) & 1u) != 0u;", fi ? "true" : "false"));
+      line(std::format("  if (lane_on()) {} = on ? val : {}; }}", vreg(v.dst), bc ? "0u" : vreg(v.dst)));
+      return true;
+    }
     if (starts(n, "v_cmp") || n.find("_co_") != std::string_view::npos) line("cmpv = false;");
     // DPP16: the source operand comes from another lane of the row (a
     // shuffle, so outside the lane guard).
@@ -742,6 +756,9 @@ class Translator {
           else if (n == "v_readfirstlane_b32") d = (w0 >> 17) & 0xff, count = 1;
           else if (i.format == Format::Vop3 && starts(n, "v_cmp")) d = (w0 >> 8) & 0x7f, count = 2;
           break;
+        case Format::Vopc:  // SDWA: an SGPR destination when SD is set
+          if ((w0 & 0x1ff) == 0xf9 && ((i.words[1] >> 15) & 1)) d = (i.words[1] >> 8) & 0x7f, count = 1;
+          break;
         default: break;
       }
     };
@@ -829,14 +846,18 @@ class Translator {
           if (!is_known(x, false)) {
             // A buffer descriptor only the GPU knows holds a guest address
             // the GPU can use as it is.
-            if (i.format == Format::Mimg) return fail("descriptor in SGPRs only the GPU knows");
+            // An image descriptor only the GPU knows is looked up in the
+            // renderer's table of descriptors (desc_lookup).
             gpu_desc_.insert(k);
             break;
           }
-        if (i.format == Format::Mimg && starts(n, "image_sample")) {
+        if (i.format == Format::Mimg && (starts(n, "image_sample") || starts(n, "image_gather"))) {
           const uint32_t ssamp = ((w1 >> 21) & 0x1f) * 4;
           for (uint32_t x = ssamp; x < ssamp + 4; ++x)
-            if (!is_known(x, false)) return fail("sampler in SGPRs only the GPU knows");
+            if (!is_known(x, false)) {
+              gpu_samp_.insert(k);  // the shader derives the sampler from the S# itself
+              break;
+            }
         }
         continue;
       }
@@ -1144,8 +1165,12 @@ class Translator {
     const bool is_float = (n.find("_f32") != std::string_view::npos || n.find("_f16") != std::string_view::npos) &&
                           !(starts(n, "v_cvt_f32_") && (n.ends_with("_u32") || n.ends_with("_i32") || n.find("ubyte") != std::string_view::npos)) &&
                           !(starts(n, "v_cvt_f16_") && (n.ends_with("_u16") || n.ends_with("_i16")));
+    // A half-precision operation reads its operand from the selected word;
+    // v_cmp_class's second operand is an integer mask.
+    const bool f16_source = n.ends_with("_f16");
     for (int k = 0; k < (insn.format == Format::Vop1 ? 1 : 2); ++k) {
-      if (is_float && v.sel[k] != 6) return fail("SDWA sub-dword float operand");
+      const bool float_operand = is_float && !(k == 1 && starts(n, "v_cmp_class"));
+      if (float_operand && !f16_source && v.sel[k] != 6) return fail("SDWA sub-dword float operand");
       std::string u;
       if (!src(v.src[k], insn, u)) return false;
       const uint32_t sel = v.sel[k];
@@ -1159,7 +1184,7 @@ class Translator {
       v.src[k] = kSdwaSrc0 + k;
     }
     if (insn.format == Format::Vopc) {
-      if (v.sdst != kVccLo) return fail("SDWA compare into an SGPR pair");
+      if (v.sdst != kVccLo && !wave_) return fail("SDWA compare into an SGPR pair");
       return emit_valu_op(insn, v);
     }
     if (v.dst_sel == 6) return emit_valu_op(insn, v);
@@ -1359,7 +1384,8 @@ class Translator {
       if (sub) line(std::format("{{ uint64_t w = uint64_t({}) - uint64_t({}) - uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
       else line(std::format("{{ uint64_t w = uint64_t({}) + uint64_t({}) + uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
       const uint32_t sdst = insn.format == Format::Vop3 ? v.sdst : kVccLo;
-      post_.push_back(std::format("{} = subgroupBallot(cmpv).x; {} = 0u;", sreg(sdst), sreg(sdst + 1)));
+      if (sdst == kVccLo) post_.push_back("vcc_lo = subgroupBallot(cmpv).x; vcc_hi = 0u;");
+      else post_.push_back(std::format("{} = subgroupBallot(cmpv).x;", sreg(sdst)));  // wave32: one SGPR
       return true;
     }
     // 64-bit shifts (result in a VGPR pair)
@@ -1453,18 +1479,29 @@ class Translator {
       line(std::format("{} = {};", vreg(v.dst), fresult(v, e)));
       return true;
     }
-    if (n == "v_cmp_class_f32" || n == "v_cmpx_class_f32") {
+    if (n == "v_cmp_class_f32" || n == "v_cmpx_class_f32" || n == "v_cmp_class_f16" || n == "v_cmpx_class_f16") {
       // class mask: 0 sNaN 1 qNaN 2 -inf 3 -normal 4 -denorm 5 -0 6 +0 7 +denorm 8 +normal 9 +inf
-      if (!fsrc(v, 0, insn, a) || !src(v.src[1], insn, b)) return false;
-      line(std::format("{{ float x = {}; uint m = {}; uint u = floatBitsToUint(x); bool neg = (u >> 31) != 0u; uint cls;", a, b));
-      line("  if (isnan(x)) cls = (u & 0x400000u) != 0u ? 1u : 0u; else if (isinf(x)) cls = neg ? 2u : 9u;");
-      line("  else if (x == 0.0) cls = neg ? 5u : 6u; else if ((u & 0x7f800000u) == 0u) cls = neg ? 4u : 7u; else cls = neg ? 3u : 8u;");
+      if (n.ends_with("_f16")) {
+        // From the half's bits (abs / neg act on the sign bit).
+        if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
+        std::string h = std::format("({} & 0xffffu)", a);
+        if (v.abs & 1) h = std::format("({} & 0x7fffu)", h);
+        if (v.neg & 1) h = std::format("({} ^ 0x8000u)", h);
+        line(std::format("{{ uint h = {}; uint m = {}; bool neg = (h >> 15) != 0u; uint e = (h >> 10) & 31u, f = h & 0x3ffu; uint cls;", h, b));
+        line("  if (e == 31u) cls = f != 0u ? ((f & 0x200u) != 0u ? 1u : 0u) : (neg ? 2u : 9u);");
+        line("  else if (e == 0u) cls = f == 0u ? (neg ? 5u : 6u) : (neg ? 4u : 7u); else cls = neg ? 3u : 8u;");
+      } else {
+        if (!fsrc(v, 0, insn, a) || !src(v.src[1], insn, b)) return false;
+        line(std::format("{{ float x = {}; uint m = {}; uint u = floatBitsToUint(x); bool neg = (u >> 31) != 0u; uint cls;", a, b));
+        line("  if (isnan(x)) cls = (u & 0x400000u) != 0u ? 1u : 0u; else if (isinf(x)) cls = neg ? 2u : 9u;");
+        line("  else if (x == 0.0) cls = neg ? 5u : 6u; else if ((u & 0x7f800000u) == 0u) cls = neg ? 4u : 7u; else cls = neg ? 3u : 8u;");
+      }
       if (wave_) {
         line("  cmpv = ((m >> cls) & 1u) != 0u; }");
         const std::string ballot = "subgroupBallot(cmpv).x";
-        if (n == "v_cmpx_class_f32") post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
-        else if (insn.format == Format::Vop3 && v.sdst != kVccLo)
-          post_.push_back(std::format("{} = {}; {} = 0u;", sreg(v.sdst), ballot, sreg(v.sdst + 1)));
+        if (starts(n, "v_cmpx_")) post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
+        else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo)
+          post_.push_back(std::format("{} = {};", sreg(v.sdst), ballot));
         else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
       } else {
         line("  vcc = ((m >> cls) & 1u) != 0u; }");
@@ -1526,8 +1563,8 @@ class Translator {
       line(std::format("cmpv = {};", e));
       const std::string ballot = "subgroupBallot(cmpv).x";
       if (to_exec) post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
-      else if (insn.format == Format::Vop3 && v.sdst != kVccLo)
-        post_.push_back(std::format("{} = {}; {} = 0u;", sreg(v.sdst), ballot, sreg(v.sdst + 1)));
+      else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo)
+        post_.push_back(std::format("{} = {};", sreg(v.sdst), ballot));
       else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
       return true;
     }
@@ -1692,6 +1729,20 @@ class Translator {
     const Fmt* fmt = nullptr;
     for (const Fmt& f : kFormats)
       if (f.id == format) fmt = &f;
+    static const std::set<uint32_t> kFetchFormats = {1,  2,  5,  6,  7,  8,  11, 12, 13, 14, 15, 18, 19,
+                                                     20, 21, 22, 23, 24, 27, 28, 29, 56, 57, 60, 61, 62,
+                                                     63, 64, 65, 66, 69, 70, 71, 72, 73, 74, 75, 76, 77};
+    if (wave_ && kFetchFormats.count(format)) {
+      // Every gfx10 format through the typed-load helper.
+      std::string d3, addr, bound;
+      if (!buffer_address(insn, d3, addr, bound)) return false;
+      line("{");
+      line(std::format("  uvec4 t = fetch_format({}, {}u, {});", addr, format, bound));
+      for (int k = 0; k < comps; ++k) line(std::format("  {} = t.{};", vreg(vdata + k), "xyzw"[k]));
+      line("}");
+      uses_fetch_format_ = true;
+      return true;
+    }
     if (!fmt) return fail(std::format("buffer format {}", format));
     std::string slot, addr, bound;
     if (!buffer_address(insn, slot, addr, bound)) return false;
@@ -1734,6 +1785,22 @@ class Translator {
     return true;
   }
 
+  // An image's Texture / Image slot words as a uvec4 expression: the
+  // CPU-resolved slot, or (gpu_desc_) a lookup of the descriptor in the SGPRs.
+  std::string image_words(SlotKind kind, uint32_t srsrc) {
+    if (gpu_desc_.count(index_)) {
+      const std::string v = std::format("dq{}", temp_++);
+      std::string w[8];
+      for (int k = 0; k < 8; ++k) w[k] = sreg(srsrc + k);
+      line(std::format("uvec4 {} = desc_lookup({}u, uvec4({}, {}, {}, {}), uvec4({}, {}, {}, {}));", v,
+                       kind == SlotKind::Texture ? mem::kDescTexture : mem::kDescImage, w[0], w[1], w[2], w[3], w[4],
+                       w[5], w[6], w[7]));
+      return v;
+    }
+    const uint32_t slot = add_slot(kind, srsrc, 4);
+    return std::format("uvec4(D({}u), D({}u), D({}u), D({}u))", slot, slot + 1, slot + 2, slot + 3);
+  }
+
   bool emit_mimg(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
     const uint32_t w0 = insn.words[0], w1 = insn.words[1];
@@ -1761,11 +1828,12 @@ class Translator {
     };
     if (wave_ && (n == "image_store" || n == "image_store_mip")) {
       // UAV writes: storage images by the same dimension.
-      const uint32_t img = add_slot(SlotKind::Image, srsrc, 4);
+      if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image_store dimension {}", dim));
+      const std::string img = image_words(SlotKind::Image, srsrc);
       std::string target, coord;
-      if (dim == 1) target = std::format("images[nonuniformEXT(D({}))]", img + 1), coord = std::format("ivec2(int({}), int({}))", A(0), A(1));
-      else if (dim == 2) target = std::format("images_3d[nonuniformEXT(D({}))]", img + 3), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
-      else if (dim == 5) target = std::format("images_a[nonuniformEXT(D({}))]", img + 2), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
+      if (dim == 1) target = std::format("images[nonuniformEXT({}.y)]", img), coord = std::format("ivec2(int({}), int({}))", A(0), A(1));
+      else if (dim == 2) target = std::format("images_3d[nonuniformEXT({}.w)]", img), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
+      else if (dim == 5) target = std::format("images_a[nonuniformEXT({}.z)]", img), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
       else return fail(std::format("image_store dimension {}", dim));
       std::string comps[4] = {"0.0", "0.0", "0.0", "1.0"};
       uint32_t r = vdata;
@@ -1777,16 +1845,20 @@ class Translator {
     // dim: 1 2D, 2 3D, 5 2D array (others not yet). The texture slot holds
     // the image's index in each bindless array: 2D, 2D array, 3D.
     if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image dimension {}", dim));
-    const uint32_t tex = add_slot(SlotKind::Texture, srsrc, 4);
+    const std::string tex = image_words(SlotKind::Texture, srsrc);
     const char* type = dim == 1 ? "sampler2D" : dim == 2 ? "sampler3D" : "sampler2DArray";
     const std::string array =
-        dim == 1 ? std::format("textures[nonuniformEXT(D({}))]", tex)
-        : dim == 2 ? std::format("textures_3d[nonuniformEXT(D({}))]", tex + 3)
-                   : std::format("textures_a[nonuniformEXT(D({}))]", tex + 2);
+        dim == 1 ? std::format("textures[nonuniformEXT({}.x)]", tex)
+        : dim == 2 ? std::format("textures_3d[nonuniformEXT({}.w)]", tex)
+                   : std::format("textures_a[nonuniformEXT({}.z)]", tex);
+    const auto sampler_index = [&]() {
+      if (gpu_samp_.count(index_)) return std::format("sampler_of({}, {})", sreg(ssamp), sreg(ssamp + 2));
+      return std::format("D({}u)", add_slot(SlotKind::Sampler, ssamp, 1));
+    };
     const int coords = dim == 1 ? 2 : 3;
     std::string value;
     if (n == "image_sample" || n == "image_sample_lz" || n == "image_sample_l" || n == "image_sample_b") {
-      const uint32_t smp = add_slot(SlotKind::Sampler, ssamp, 1);
+      const std::string smp = sampler_index();
       // image_sample_b takes the bias before the coordinates, _l the lod after.
       const uint32_t c = n == "image_sample_b" ? 1 : 0;
       std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(c), A(c + 1));
@@ -1794,17 +1866,17 @@ class Translator {
         coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(c + 2))
                           : std::format(", uintBitsToFloat({})", A(c + 2));
       coord = std::format("vec{}({})", coords, coord);
-      const std::string sampler = std::format("{}({}, samplers[nonuniformEXT(D({}))])", type, array, smp);
+      const std::string sampler = std::format("{}({}, samplers[nonuniformEXT({})])", type, array, smp);
       if (n == "image_sample_lz") value = std::format("textureLod({}, {}, 0.0)", sampler, coord);
       else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, A(c + coords));
       else value = std::format("texture({}, {})", sampler, coord);
     } else if (n == "image_gather4_lz" || n == "image_gather4" || n == "image_gather4_l") {
-      const uint32_t smp = add_slot(SlotKind::Sampler, ssamp, 1);
+      const std::string smp = sampler_index();
       std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(0), A(1));
       if (coords == 3) coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(2)) : std::format(", uintBitsToFloat({})", A(2));
       const int comp = dmask & 1 ? 0 : dmask & 2 ? 1 : dmask & 4 ? 2 : 3;
       if (dim == 2) return fail("gather from a 3D image");
-      value = std::format("textureGather({}({}, samplers[nonuniformEXT(D({}))]), vec{}({}), {})", type, array, smp, coords,
+      value = std::format("textureGather({}({}, samplers[nonuniformEXT({})]), vec{}({}), {})", type, array, smp, coords,
                           coord, comp);
       line("{");
       line(std::format("  vec4 t = {};", value));
@@ -2018,7 +2090,9 @@ class Translator {
   std::vector<std::string> post_;  // wave mode: statements after the active-lane guard (ballots)
   std::set<uint32_t> gpu_smem_;     // wave mode: s_buffer_load instructions the GPU performs (Buffer slot)
   std::set<uint32_t> gpu_load_;     // wave mode: SMEM loads the GPU performs from the SGPR values
-  std::set<uint32_t> gpu_desc_;     // wave mode: MUBUF/MTBUF with a descriptor only the GPU knows
+  std::set<uint32_t> gpu_desc_;     // wave mode: MUBUF/MTBUF/MIMG with a descriptor only the GPU knows
+  std::set<uint32_t> gpu_samp_;     // wave mode: MIMG with a sampler only the GPU knows
+  uint32_t temp_ = 0;               // names of GLSL temporaries
   bool uses_fetch_format_ = false;
   bool dpp_ = false;
   uint32_t lds_words_ = 0;

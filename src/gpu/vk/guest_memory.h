@@ -31,6 +31,9 @@ class GuestMemory {
   bool ready() const { return table_.mapped != nullptr; }
   // The table's device address (the shaders' pc.mem).
   VkDeviceAddress table_address() const { return table_.address; }
+  // The table itself (layout in gpu/guest_memory_layout.h), for the parts the
+  // renderer keeps (the descriptor table).
+  uint32_t* table_words() const { return words(); }
 
   // Start of a submission: guest writes and remappings since the last one.
   void begin_submission();

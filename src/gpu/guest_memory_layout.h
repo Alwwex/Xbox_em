@@ -13,6 +13,14 @@
 //                             them in after the submission: demand paging
 //                             with a delay of one submission)
 //   kMissedWord..             1 bit per guest page: already in the miss list
+//   kDescWord..               image descriptors shaders read on the GPU ->
+//                             bindless indices: a hash table of 16-word
+//                             entries (kind, the 8 descriptor words, the 4
+//                             words a CPU-resolved slot would hold)
+//   kDescMissWord..           count, then descriptors not in the table (kind
+//                             + 8 words; the renderer adds them after the
+//                             submission), kDescMissedWord.. 1 bit per hash
+//                             so a descriptor is listed once
 //
 // Pool page n lives at chunk[n >> 12] + (n & 0xfff) * 64 KiB; page 0 is a
 // scratch page that every unmapped address reaches (reads garbage, writes
@@ -33,7 +41,22 @@ constexpr uint32_t kWrittenWord = kLeafWord + kMaxLeaves * kLeafEntries;
 constexpr uint32_t kMissWord = kWrittenWord + kMaxChunks * kChunkPages / 2;
 constexpr uint32_t kMaxMisses = 16384;
 constexpr uint32_t kMissedWord = kMissWord + 1 + kMaxMisses;
-constexpr uint32_t kTableWords = kMissedWord + (1u << 24) / 32;
+constexpr uint32_t kDescWord = kMissedWord + (1u << 24) / 32;
+constexpr uint32_t kDescEntries = 16384, kDescEntryWords = 16;
+constexpr uint32_t kDescMissWord = kDescWord + kDescEntries * kDescEntryWords;
+constexpr uint32_t kMaxDescMisses = 1024, kDescMissWords = 9;
+constexpr uint32_t kDescMissedWord = kDescMissWord + 1 + kMaxDescMisses * kDescMissWords;
+constexpr uint32_t kDescMissedBits = 1u << 16;
+constexpr uint32_t kTableWords = kDescMissedWord + kDescMissedBits / 32;
+// Descriptor kinds in the table (as gpu::SlotKind's Texture / Image).
+constexpr uint32_t kDescTexture = 1, kDescImage = 2;
+
+// The table's hash of a descriptor (the same in GLSL below).
+inline uint32_t desc_hash(uint32_t kind, const uint32_t* w) {
+  uint32_t h = kind * 0x9e3779b9u;
+  for (int i = 0; i < 8; ++i) h = (h ^ w[i]) * 0x01000193u;
+  return h ^ (h >> 16);
+}
 constexpr uint64_t kDirect = 1ull << 63;
 
 // GLSL: gpa(va) translates a guest address for reading; with `writes` also
@@ -59,6 +82,41 @@ inline std::string glsl_helpers(bool writes) {
          "  }\n"
          "  uint c = (idx >> 12) * 2u;\n"
          "  return packUint2x32(uvec2(t.w[c], t.w[c + 1u])) + (uint64_t(idx & 0xfffu) << 16) + (va & uint64_t(0xffff));\n"
+         "}\n"
+         "uint desc_hash(uint kind, uvec4 a, uvec4 b) {\n"
+         "  uint h = kind * 0x9e3779b9u;\n"
+         "  h = (h ^ a.x) * 0x01000193u; h = (h ^ a.y) * 0x01000193u; h = (h ^ a.z) * 0x01000193u; h = (h ^ a.w) * 0x01000193u;\n"
+         "  h = (h ^ b.x) * 0x01000193u; h = (h ^ b.y) * 0x01000193u; h = (h ^ b.z) * 0x01000193u; h = (h ^ b.w) * 0x01000193u;\n"
+         "  return h ^ (h >> 16);\n"
+         "}\n"
+         // An image descriptor's bindless indices (what its Texture / Image
+         // slot would hold); unknown ones are reported and read as index 0.
+         "uvec4 desc_lookup(uint kind, uvec4 a, uvec4 b) {\n"
+         "  MemT t = MemT(pc.mem);\n"
+         "  uint h = desc_hash(kind, a, b);\n"
+         "  for (uint i = 0u; i < 8u; ++i) {\n"
+         "    uint e = " + n(kDescWord) + " + ((h + i) & " + n(kDescEntries - 1) + ") * " + n(kDescEntryWords) + ";\n"
+         "    uint tag = t.w[e];\n"
+         "    if (tag == 0u) break;\n"
+         "    if (tag == kind && t.w[e + 1u] == a.x && t.w[e + 2u] == a.y && t.w[e + 3u] == a.z && t.w[e + 4u] == a.w &&\n"
+         "        t.w[e + 5u] == b.x && t.w[e + 6u] == b.y && t.w[e + 7u] == b.z && t.w[e + 8u] == b.w)\n"
+         "      return uvec4(t.w[e + 9u], t.w[e + 10u], t.w[e + 11u], t.w[e + 12u]);\n"
+         "  }\n"
+         "  uint bit = 1u << (h & 31u), at = " + n(kDescMissedWord) + " + ((h >> 5) & " + n(kDescMissedBits / 32 - 1) + ");\n"
+         "  if ((t.w[at] & bit) == 0u && (atomicOr(t.w[at], bit) & bit) == 0u) {\n"
+         "    uint k = atomicAdd(t.w[" + n(kDescMissWord) + "], 1u);\n"
+         "    if (k < " + n(kMaxDescMisses) + ") {\n"
+         "      uint m = " + n(kDescMissWord + 1) + " + k * " + n(kDescMissWords) + ";\n"
+         "      t.w[m] = kind; t.w[m + 1u] = a.x; t.w[m + 2u] = a.y; t.w[m + 3u] = a.z; t.w[m + 4u] = a.w;\n"
+         "      t.w[m + 5u] = b.x; t.w[m + 6u] = b.y; t.w[m + 7u] = b.z; t.w[m + 8u] = b.w;\n"
+         "    }\n"
+         "  }\n"
+         "  return uvec4(0u, 0x00010001u, 0u, 0u);\n"
+         "}\n"
+         // A sampler slot's word from an S# (see the renderer's resolve()).
+         "uint sampler_of(uint w0, uint w2) {\n"
+         "  uint clamp = w0 & 7u;\n"
+         "  return (((w2 >> 20) & 3u) != 0u ? 1u : 0u) | (clamp == 0u ? 2u : 0u) | (clamp == 1u ? 4u : 0u);\n"
          "}\n"
          "uint64_t gpa(uint64_t va) {\n"
          "  if ((va >> 63) != uint64_t(0)) return va & ~(uint64_t(1) << 63);\n"

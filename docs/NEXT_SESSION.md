@@ -1,8 +1,8 @@
-# Context for the next session (written by Claude for itself, 2026-11-26)
+# Context for the next session (written by Claude for itself, 2026-11-26, late)
 
-Read this, then `docs/HANDOFF.md` (sections "COMPUTE SHADERS (2026-11-26,
-night)" and "WHERE WORK STOPPED (2026-11-26, evening)"). Reply to the owner in
-Czech; code, comments and commits in English.
+Read this, then `docs/HANDOFF.md` (section "GPU GUEST MEMORY MIRROR
+(2026-11-26, late)" first). Reply to the owner in Czech; code, comments and
+commits in English.
 
 ## Owner's rules (unchanged)
 
@@ -15,40 +15,46 @@ Czech; code, comments and commits in English.
   ending `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Branch `claude/practical-keller-vrwp1m`, no pull request unless asked,
   license GPL-3.0-or-later. Pushing works (`git push`).
-- The owner was not happy with how the previous session worked. Ask what to
-  change if it is not clear, keep replies short, report progress regularly,
-  and do not run long chains of 6-minute game runs without telling them.
+- Keep replies short, report progress regularly, ask when the direction is
+  unclear, and do not run long chains of 6-minute game runs without telling
+  the owner.
 
 ## Where things stand
 
-- GTA VI (`/mnt/d/GTAVI/GTAVI`) boots, menus render, the story load
-  completes and the loading screen shows (black + an invisible spinner whose
-  texture is a BCPack chunk). The heavy scene after it (compute-heavy, ~7 fps)
-  was reached only once in ~7 runs; the cause is unknown.
-- Press script (run ~400 s, one run takes ~7 minutes):
-  `P="A@45,A@95,A@105,A@115,A@125,A@135,A@150,DOWN@158,A@161,DOWN@168,DOWN@170,A@172,A@185,DOWN@188,A@191,DOWN@194,A@197"`
-  `./build/bin/xbem run /mnt/d/GTAVI/GTAVI --continue-after-breakpoint --press "$P" > ~/xbem-runs/run.log 2>&1`
-- Fixed this session: DirectStorage on worker threads (load stall /
-  watchdog), descriptor heaps never on the caller's stack, safe DirectStorage
-  writes, guest memory below 2^40 (raytracing), command list slot 148,
-  undecodable compression formats delivered as zeros.
-- Compute shaders: wave32 translator (`src/gpu/translate.cpp`, wave mode)
-  and renderer dispatch (`src/hle/d3d12_render.cpp`). Coverage tool:
-  `./build/bin/xbem gpu-translate --coverage ~/xbem-runs/shaders6 --validate`
-  -> 662 / 2680 translate, all valid GLSL.
+- The owner chose "path 2" (GPU-visible guest memory). Literal Vulkan-backed
+  guest memory is impossible on WSL (see HANDOFF), so it was built as a GPU
+  mirror of guest pages (Xenia-style), which the owner approved.
+- Done this session (all committed and pushed):
+  1. `src/platform/page_tracker.*`: backing ids per guest page + write
+     detection (userfaultfd async WP + PAGEMAP_SCAN, unprivileged).
+  2. `src/gpu/vk/guest_memory.*` + `src/gpu/guest_memory_layout.h`: pool of
+     64 KiB pages, page table, refresh of CPU writes, write-back of GPU
+     writes, demand paging (miss list), heap windows (aliases).
+  3. Translator: every buffer address goes through `gpa()/gpw()`; SMEM loads
+     and buffer descriptors only the GPU knows run on the GPU; image
+     descriptors only the GPU knows go through `desc_lookup()` (hash table,
+     misses resolved by the renderer at the next submission); samplers from
+     S# on the GPU; SDWA v_cmp_class, v_cmp_class_f16, wave32 compare-to-SGPR
+     fix, all MTBUF formats via fetch_format, v_permlane16/x16.
+  4. Descriptor heaps get stable GPU addresses in [2 GiB, 4 GiB).
+- Compute coverage: 1052 / 2680 (39.3 %), all valid GLSL
+  (`./build/bin/xbem gpu-translate --coverage ~/xbem-runs/shaders6 --validate`,
+  ~90 s).
+- Menus still render (`--press A@45 --screenshot ~/xbem-runs/gm.ppm@95`).
+  The new paths (misses, GPU descriptor lookups, write-back) have NOT been
+  exercised in the heavy scene yet - only menus were run.
 
-## Open decision (ask the owner first)
+## Next steps (suggested order)
 
-~1300 compute shaders choose descriptors at run time (bindless). The GPU cannot
-read guest memory (dzn has no VK_EXT_external_memory_host). Options:
-1. CPU scans descriptor table windows, uploads referenced buffers, GPU gets a
-   guest-VA -> device-address lookup and descriptor -> bindless-index table.
-2. Rebuild the memory model so GPU-visible guest memory is Vulkan memory.
-Recommendation was (1). Alternative first step: find why the heavy scene is
-reached so rarely (compare a run that gets there with one that stalls).
-
-## Other open items
-
-- Occasional crashes: watchdog (main loop stopped 30 s, e.g. during
-  `--screenshot` in the load), null deref at +0x4da62a6 (~270 s).
-- Compression formats 2 and 14 (BCPack?) are undocumented: delivered as zeros.
+1. Run the full press script (HANDOFF "How far the title gets") to the
+   loading screen / heavy scene and read the "guest memory copy at present N"
+   log lines: misses, descriptor lookups, budget, evictions. Fix what breaks.
+   Tell the owner before starting (one run takes ~7 minutes).
+2. Coverage: image_sample_c_lz (476, depth compare samplers), v_cubema_f32
+   (332) + v_cubetc/sc, v_cmpx_class_f32 with SDWA on f32 (215), s_getpc_b64
+   (118), image_load_mip (89), v_bfm_b32 (44).
+3. Textures looked up on the GPU are uploaded once and never refreshed
+   (the CPU does not see their use) - add a "used" mark in the descriptor
+   table entries and refresh used textures.
+4. Performance: the pool is host-visible (system RAM over PCIe); move to
+   VRAM with staging copies if the GPU side is too slow.

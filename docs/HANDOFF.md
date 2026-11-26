@@ -147,6 +147,46 @@ the UI samples via ps 736a6b6841007e1e). Needed:
 Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
 slot-57 pipelines, MRT.
 
+## GPU GUEST MEMORY MIRROR (2026-11-26, late) - read first
+
+Why a mirror: on WSL, dzn cannot import host memory (D3D12
+OpenExistingHeapFromAddress1 returns E_NOTIMPL - tested with a patched Mesa,
+patch reverted), dzn's own host-visible memory is a kernel-made shmem mapping
+that can be moved (mremap) but not aliased (mremap old_len=0 -> EFAULT,
+/proc/self/map_files -> EPERM), and GTA VI maps the same physical pages at
+several addresses >65k times (~7 GB in use). So guest memory stays as it is
+and the GPU keeps copies of the pages it uses.
+
+- `src/platform/page_tracker.*`: platform/memory.cpp reports every mapping;
+  page id = 64 KiB VA (anonymous) or kSharedId | offset in the physical
+  memfd (aliases share an id). Watched pages are write-protected with
+  userfaultfd (async WP, UFFD_USER_MODE_ONLY, no privileges) and scanned with
+  PAGEMAP_SCAN (atomic read+re-arm; syscall writes are caught too).
+  write_shared/discard_shared report physical writes. XBEM_NO_WRITE_TRACKING=1
+  = everything counts as written every time.
+- `src/gpu/vk/guest_memory.*`: pool of 64 KiB pages in host-visible Vulkan
+  memory (256 MiB chunks, budget XBEM_GPU_MEMORY_MB, default 2048, LRU
+  eviction), page table + extras in one buffer (layout and GLSL helpers in
+  `src/gpu/guest_memory_layout.h`). begin_submission: remaps + guest writes
+  -> refresh; end_submission: miss list -> require pages (demand paging, one
+  submission late), GPU-written 4 KiB parts -> write back to guest memory.
+  alias(): descriptor heap windows.
+- Renderer (`d3d12_render.cpp`): Buffer slots hold guest addresses (bit 63 =
+  direct device address for data copied into the ring), push constants:
+  graphics +16, compute +8 = table address. Bound descriptor heaps get
+  windows in [2 GiB, 4 GiB) (shaders build table pointers as (s5, 0)).
+  resolve_descriptor_misses(): image descriptors shaders looked up on the GPU
+  (desc_lookup) and missed are resolved like slots and added to the hash
+  table at the start of the next execute.
+- Translator: gpa()/gpw() on every buffer access; gpu_load_ (SMEM from GPU
+  values), gpu_desc_ (MUBUF/MTBUF/MIMG descriptors in GPU SGPRs), gpu_samp_
+  (sampler from S#). Coverage 1052 / 2680 (39.3 %), all valid GLSL.
+- Log line at power-of-two presents: "guest memory copy at present N: ...".
+- Not yet tested: the heavy scene with these paths. Known gaps: textures
+  found via desc_lookup are never refreshed; pool is system memory (slow GPU
+  reads); a page written by both CPU and GPU in one submission keeps the GPU
+  parts.
+
 ## LOADING STALL = OUT OF RAM (found 2026-11-26)
 
 During the story load the WSL VM (7.7 GB) runs out of memory: at 240 s
