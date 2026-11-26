@@ -82,3 +82,58 @@ TEST(scalar_run_bitfield_mask) {
   CHECK(run_scalar(t, run, words));
   CHECK_EQ(words[0], 0xf00u);
 }
+
+namespace {
+TranslatedShader translate_cs(const std::vector<uint32_t>& words, uint32_t user_sgprs) {
+  std::vector<uint8_t> code(words.size() * 4);
+  std::memcpy(code.data(), words.data(), code.size());
+  ComputeInfo info;
+  info.local_size[0] = 64;
+  info.user_sgprs = user_sgprs;
+  info.tgid[1] = info.tgid[2] = false;
+  return translate_shader(code.data(), code.size(), ShaderStage::Compute, &info);
+}
+}  // namespace
+
+TEST(translate_compute_divergent_branch) {
+  // v_cmp_gt_u32 vcc, 4, v0 ; s_and_saveexec_b32 s0, vcc_lo ; s_cbranch_execz +1 ;
+  // v_mov_b32 v1, 1.0 ; s_or_b32 exec_lo, exec_lo, s0 ; s_endpgm
+  const TranslatedShader t =
+      translate_cs({0x7d880084, 0xbe803c6a, 0xbf880001, 0x7e0202f2, 0x887e007e, kEndpgm}, 0);
+  CHECK(t.ok);
+  CHECK(has(t, "local_size_x = 64"));
+  CHECK(has(t, "vcc_lo = subgroupBallot(cmpv).x;"));         // the compare becomes a lane mask
+  CHECK(has(t, "exec_lo = (vcc_lo & exec_lo) & wave_lanes;")); // saveexec narrows exec
+  CHECK(has(t, "if (exec_lo == 0u) { blk = 2u; break; }"));   // execz skips the block
+  CHECK(has(t, "if (lane_on()) {"));                          // vector work only in active lanes
+  CHECK(has(t, "s0 = gl_WorkGroupID.x;"));                    // no user data: the group id is s0 (then the saved exec)
+  CHECK(has(t, "{ uint r = exec_lo | s0; scc = r != 0u; exec_lo = r; }"));  // exec restored after the block
+  CHECK(has(t, "v0 = gl_LocalInvocationID.x;"));
+}
+
+TEST(translate_compute_smem_comes_from_the_cpu) {
+  // s_load_dwordx2 s[2:3], s[0:1], 0x10 ; v_mov_b32 v0, s2 ; s_endpgm  (2 user SGPRs)
+  const TranslatedShader t = translate_cs({0xf4040080, 0xfa000010, 0x7e000202, kEndpgm}, 2);
+  CHECK(t.ok);
+  CHECK(has(t, "s2 = gl_WorkGroupID.x;"));  // the group id after the 2 user SGPRs (the load overwrites it)
+  CHECK(has(t, "s0 = D(0);"));
+  ScalarRun run;
+  run.sgpr[0] = 0x1000;
+  run.sgpr[1] = 0;
+  uint64_t asked = 0;
+  run.read = [&](uint64_t address, void* out, size_t size) {
+    asked = address;
+    const uint32_t v[2] = {0xaabbccdd, 0x11223344};
+    std::memcpy(out, v, std::min<size_t>(size, 8));
+    return true;
+  };
+  run.resolve = [](SlotKind, const uint32_t*, uint32_t*) {};
+  std::vector<uint32_t> words;
+  CHECK(run_scalar(t, run, words));
+  CHECK_EQ(asked, 0x1010u);
+  // slots: s0, s1 (user data), then the two loaded words
+  CHECK_EQ(words.size(), 4u);
+  CHECK_EQ(words[0], 0x1000u);
+  CHECK_EQ(words[2], 0xaabbccddu);
+  CHECK_EQ(words[3], 0x11223344u);
+}

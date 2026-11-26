@@ -42,6 +42,15 @@ struct GraphicsPipeline {
   uint8_t blend[0x148] = {};          // its D3D12_BLEND_DESC
 };
 
+// A console compute pipeline (device slot 67, DeserializeComputePipelineStateX):
+// root signature (+0x00), register state (+0x08: launch state, 0x1c bytes),
+// more state (+0x18), RDNA2 code (+0x28), metadata (+0x38).
+struct ComputePipeline {
+  uint64_t root_signature = 0;
+  std::vector<uint8_t> state_a, state_b, code, meta;
+  uint64_t cs_hash = 0;
+};
+
 struct D3d12Counters {
   uint64_t frames, command_lists, draws, dispatches;
 };

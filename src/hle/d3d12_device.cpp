@@ -1467,6 +1467,7 @@ HRESULT XBEM_GUEST_ABI device_create_command_queue_x(ProbeObject* self, const ui
 
 // 62 CreateComputePipelineState(desc, w2, w3, riid, ppv) with a PC compute desc.
 const ProbeVtable g_graphics_pso_vtable = make_vtable({});
+const ProbeVtable g_compute_pso_vtable = make_vtable({});
 
 std::vector<uint8_t> copy_guest(uint64_t p, uint64_t size) {
   std::vector<uint8_t> out;
@@ -1568,9 +1569,37 @@ HRESULT XBEM_GUEST_ABI device_deserialize_compute_pso_x(ProbeObject* self, const
   uint64_t hash = 0;
   if (desc && platform::safe_read(reinterpret_cast<uint64_t>(desc) + 0x28, code, 16))
     hash = capture_shader("cs-native", code[0], code[1]);
+  uint64_t d[12] = {};
+  if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
+  // The other (pointer, size) pairs, as for graphics pipelines: register
+  // state and metadata (for --dump-shaders).
+  capture_shader("cs-state-a", d[1], d[2]);
+  capture_shader("cs-state-b", d[3], d[4]);
+  capture_shader("cs-meta", d[7], d[8]);
+  auto* pso = new ComputePipeline;
+  pso->root_signature = d[0];
+  pso->state_a = copy_guest(d[1], d[2]);
+  pso->state_b = copy_guest(d[3], d[4]);
+  pso->code = copy_guest(code[0], code[1]);
+  pso->meta = copy_guest(d[7], d[8]);
+  pso->cs_hash = hash;
+  // --dump-shaders: the launch state next to the code, named by the code's hash.
+  if (const fs::path& dir = proc().options().dump_shaders_dir; !dir.empty() && hash && !pso->state_a.empty()) {
+    const fs::path file = dir / std::format("cs-info_{:016x}.bin", hash);
+    std::error_code ec;
+    if (!fs::exists(file, ec))
+      std::ofstream(file, std::ios::binary)
+          .write(reinterpret_cast<const char*>(pso->state_a.data()), static_cast<std::streamsize>(pso->state_a.size()));
+  }
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 4) {
+    std::string w;
+    for (uint64_t v : d) w += std::format(" {:016x}", v);
+    XBEM_INFO("d3d12", "DeserializeComputePipelineStateX desc:{}", w);
+  }
   probe_log(self, 67, std::format("DeserializeComputePipelineStateX(code {:#x}, {} bytes)", code[0], code[1]),
             XBEM_RETURN_ADDRESS());
-  return create_into(make_probe_object(std::format("{} (cs {:016x})", child_name("pso"), hash)), out);
+  return create_into(make_probe_object(std::format("{} (cs {:016x})", child_name("pso"), hash), &g_compute_pso_vtable, pso), out);
 }
 
 // 76 texture creation: CreateCommittedResource's arguments; the desc's layout
@@ -1779,6 +1808,11 @@ GraphicsPipeline* graphics_pipeline_of(uint64_t p) {
   if (!is_probe_object(p)) return nullptr;
   auto* o = reinterpret_cast<ProbeObject*>(p);
   return o->vtable == g_graphics_pso_vtable.data() ? static_cast<GraphicsPipeline*>(o->state) : nullptr;
+}
+ComputePipeline* compute_pipeline_of(uint64_t p) {
+  if (!is_probe_object(p)) return nullptr;
+  auto* o = reinterpret_cast<ProbeObject*>(p);
+  return o->vtable == g_compute_pso_vtable.data() ? static_cast<ComputePipeline*>(o->state) : nullptr;
 }
 const gpu::RootSignature* root_signature_of(uint64_t p) {
   if (!is_probe_object(p)) return nullptr;

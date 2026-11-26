@@ -28,13 +28,28 @@
 
 namespace xbem::gpu {
 
-enum class ShaderStage { Vertex, Pixel };
+enum class ShaderStage { Vertex, Pixel, Compute };
+
+// A compute shader's launch state (COMPUTE_PGM_RSRC2 and the thread group
+// size from the pipeline's register state): which SGPRs and VGPRs the
+// hardware initialises.
+struct ComputeInfo {
+  uint32_t local_size[3] = {1, 1, 1};
+  uint32_t user_sgprs = 0;           // s0.. hold user data (root parameters from s4)
+  bool tgid[3] = {true, true, true};  // workgroup id x/y/z in the SGPRs after the user data
+  bool tg_size = false;              // then the thread group info SGPR
+  uint32_t tidig_comps = 2;          // local ids: v0 = x, v1 = y (>= 1), v2 = z (>= 2)
+  uint32_t lds_bytes = 0;
+  // From the console's compute register state (desc+0x08, 0x1c bytes).
+  static ComputeInfo from_state(const uint8_t* state, size_t size);
+};
 
 // What the per-draw slots of a translated shader hold.
 enum class SlotKind : uint8_t {
   Sgpr,     // 1 word: an SGPR's value at that point of the program
   Buffer,   // 4 words: device address (lo, hi), stride, size limit (records)
   Texture,  // 4 words: bindless 2D index, image info (width | height << 16), 2D array index, 3D index
+  Image,    // 4 words: storage image bindless indices (1D/buffer, 2D, 2D array, 3D) for image_store/_load on UAVs
   Sampler,  // 1 word: bindless sampler index
   Blocks,   // 1 word: bit n set when the scalar run executed basic block n (uniform branches)
 };
@@ -66,12 +81,15 @@ struct TranslatedShader {
   uint32_t outputs = 0;      // vertex: params exported (locations 0..outputs-1)
   uint32_t inputs = 0;       // pixel: attributes read (locations 0..inputs-1)
   uint32_t color_targets = 0;  // pixel: mrt exports (bit mask)
+  ComputeInfo compute;         // compute: launch state
   Program program;
 };
 
 // Decodes `code` (a captured blob: three metadata words + s_inst_prefetch are
-// skipped as instructions like any other) and translates it.
-TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage);
+// skipped as instructions like any other) and translates it. Compute shaders
+// need `compute` and are translated with wave semantics (see translate.cpp).
+TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage,
+                                  const ComputeInfo* compute = nullptr);
 
 // The scalar part of a draw. `read` fetches guest memory for SMEM loads
 // (returns false for unreadable addresses: zeros are loaded); `resolve`

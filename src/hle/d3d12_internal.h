@@ -70,6 +70,7 @@ void render_present();
 // Typed objects (null when `p` is not one).
 ResourceState* resource_of(uint64_t p);
 GraphicsPipeline* graphics_pipeline_of(uint64_t p);
+ComputePipeline* compute_pipeline_of(uint64_t p);
 const gpu::RootSignature* root_signature_of(uint64_t p);
 bool is_probe_object(uint64_t p);
 

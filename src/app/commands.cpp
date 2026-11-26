@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <unistd.h>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -405,21 +408,97 @@ int cmd_gpu(const Args&) {
 #endif
 }
 
+// Translation coverage of every compute shader in a --dump-shaders directory
+// (cs-native_<hash>.bin, launch state in cs-info_<hash>.bin): failures grouped
+// by reason, optionally with glslangValidator on the successful ones.
+int gpu_translate_coverage(const std::filesystem::path& dir, bool validate) {
+  namespace fs = std::filesystem;
+  std::map<std::string, int> reasons;
+  std::map<std::string, std::string> example;
+  int total = 0, ok = 0, valid = 0, invalid = 0;
+  const fs::path tmp = fs::temp_directory_path() / std::format("xbem-cov-{}", static_cast<long>(::getpid()));
+  if (validate) fs::create_directories(tmp);
+  for (const auto& e : fs::directory_iterator(dir)) {
+    const std::string name = e.path().filename().string();
+    if (!name.starts_with("cs-native_") || !name.ends_with(".bin")) continue;
+    ++total;
+    const std::string hash = name.substr(10, name.size() - 14);
+    const auto bytes = read_file(e.path());
+    gpu::ComputeInfo info;
+    info.user_sgprs = 8;
+    if (const fs::path inf = dir / std::format("cs-info_{}.bin", hash); fs::exists(inf)) {
+      const auto st = read_file(inf);
+      info = gpu::ComputeInfo::from_state(st.data(), st.size());
+    }
+    const auto shader = gpu::translate_shader(bytes.data(), bytes.size(), gpu::ShaderStage::Compute, &info);
+    if (!shader.ok) {
+      // group by the instruction mnemonic (after "+0x..: ") and the reason in parentheses
+      std::string key = shader.error;
+      if (const size_t c = key.find(": "); c != std::string::npos) {
+        std::string rest = key.substr(c + 2);
+        const size_t sp = rest.find(' ');
+        const size_t paren = rest.find(" (");
+        key = rest.substr(0, sp) + (paren != std::string::npos ? rest.substr(paren) : "");
+      }
+      if (!reasons[key]++) example[key] = name;
+      continue;
+    }
+    ++ok;
+    if (validate) {
+      const fs::path g = tmp / "s.comp";
+      std::ofstream(g) << shader.glsl;
+      const std::string cmd = std::format("glslangValidator --target-env vulkan1.2 -o {} {} > {} 2>&1", (tmp / "s.spv").string(),
+                                          g.string(), (tmp / "log.txt").string());
+      if (std::system(cmd.c_str()) == 0) ++valid;
+      else {
+        ++invalid;
+        if (invalid <= 3) {
+          fs::copy_file(g, tmp / std::format("invalid_{}.comp", hash), fs::copy_options::overwrite_existing);
+          out("invalid GLSL: {} (kept in {})\n", name, (tmp / std::format("invalid_{}.comp", hash)).string());
+          std::ifstream log(tmp / "log.txt");
+          std::string l;
+          for (int i = 0; i < 6 && std::getline(log, l); ++i) out("    {}\n", l);
+        }
+      }
+    }
+  }
+  std::vector<std::pair<int, std::string>> sorted;
+  for (const auto& [k, n] : reasons) sorted.emplace_back(n, k);
+  std::sort(sorted.rbegin(), sorted.rend());
+  out("{} compute shaders: {} translated ({:.1f}%)", total, ok, total ? 100.0 * ok / total : 0.0);
+  if (validate) out(", {} valid GLSL, {} invalid", valid, invalid);
+  out("\nfailures by reason:\n");
+  for (size_t i = 0; i < sorted.size() && i < 60; ++i)
+    out("  {:5}  {}   (e.g. {})\n", sorted[i].first, sorted[i].second, example[sorted[i].second]);
+  return 0;
+}
+
 int cmd_gpu_translate(const Args& args) {
-  if (args.size() < 2 || (args[1] != "vs" && args[1] != "ps")) {
-    out("usage: xbem gpu-translate <shader.bin> vs|ps\n");
+  if (args.size() >= 2 && args[0] == "--coverage")
+    return gpu_translate_coverage(args[1], args.size() >= 3 && args[2] == "--validate");
+  if (args.size() < 2 || (args[1] != "vs" && args[1] != "ps" && args[1] != "cs")) {
+    out("usage: xbem gpu-translate <shader.bin> vs|ps|cs [cs-info.bin]\n"
+        "       xbem gpu-translate --coverage <dump dir> [--validate]\n");
     return 2;
   }
   const auto bytes = read_file(args[0]);
-  const auto shader = gpu::translate_shader(bytes.data(), bytes.size(),
-                                            args[1] == "vs" ? gpu::ShaderStage::Vertex : gpu::ShaderStage::Pixel);
+  gpu::ComputeInfo info;
+  info.user_sgprs = 8;
+  if (args.size() >= 3) {
+    const auto st = read_file(args[2]);
+    info = gpu::ComputeInfo::from_state(st.data(), st.size());
+  }
+  const gpu::ShaderStage stage = args[1] == "vs" ? gpu::ShaderStage::Vertex
+                                 : args[1] == "ps" ? gpu::ShaderStage::Pixel
+                                                   : gpu::ShaderStage::Compute;
+  const auto shader = gpu::translate_shader(bytes.data(), bytes.size(), stage, stage == gpu::ShaderStage::Compute ? &info : nullptr);
   if (!shader.ok) {
     out("translation failed: {}\n", shader.error);
     return 1;
   }
   out("{}", shader.glsl);
   out("// {} slots, {} words:", shader.slots.size(), shader.slot_words);
-  static const char* kKinds[] = {"sgpr", "buffer", "texture", "sampler", "blocks"};
+  static const char* kKinds[] = {"sgpr", "buffer", "texture", "image", "sampler", "blocks"};
   for (const auto& s : shader.slots) out(" {}@{}:s{}", kKinds[static_cast<int>(s.kind)], s.instruction, s.sgpr);
   out("\n");
   return 0;

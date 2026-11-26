@@ -145,9 +145,11 @@ uint32_t branch_target(const DecodedInstruction& d) {
 
 // ------------------------------------------------------------ translation
 
+bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool& stop);
+
 class Translator {
  public:
-  Translator(TranslatedShader& out) : out_(out) {}
+  Translator(TranslatedShader& out) : out_(out), wave_(out.stage == ShaderStage::Compute) {}
 
   // Basic blocks: split at branch targets and after branches. Only forward
   // branches (no loops); each block's code runs when the scalar run (which
@@ -179,6 +181,7 @@ class Translator {
 
   bool run() {
     body_.reserve(8192);
+    if (wave_) return run_wave();
     if (!split_blocks()) return false;
     uint32_t mask_slot = 0, open_block = ~0u;
     if (blocks_ > 1) {
@@ -219,6 +222,725 @@ class Translator {
     return true;
   }
 
+  // ---------------------------------------------------------- wave mode
+  //
+  // Compute shaders: each shader invocation is one lane of a wave32 (the
+  // Vulkan subgroup, 32 wide on the target device). Scalar instructions run
+  // in every lane on the same values, so SGPRs, scc, vcc and exec are
+  // ordinary variables that agree across the wave; vector instructions are
+  // guarded by the lane's exec bit; lane-crossing operations (compares into
+  // masks, readlane) use subgroup operations outside the guards, where all
+  // invocations are converged. Control flow is a block-dispatch loop, which
+  // is uniform per wave - loops and divergent branches (exec masking) work.
+  // Only memory the GPU cannot reach comes from the CPU: user SGPRs and
+  // SMEM results (constants, descriptors) are per-dispatch slots, which needs
+  // their addresses to be known on the CPU (see known_sgprs()).
+  bool run_wave() {
+    auto& insns = out_.program.instructions;
+    if (!known_sgprs()) return false;
+    std::map<uint32_t, uint32_t> block_at;  // pc -> block
+    std::set<uint32_t> leaders{0};
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      const std::string_view n = name_of(insns[k].insn);
+      if (is_branch(insns[k].insn)) leaders.insert(branch_target(insns[k]));
+      if ((is_branch(insns[k].insn) || n == "s_endpgm") && k + 1 < insns.size()) leaders.insert(insns[k + 1].pc);
+    }
+    uint32_t next = 0;
+    for (uint32_t pc : leaders) block_at[pc] = next++;
+    const auto block_of = [&](uint32_t pc, uint32_t& b) {
+      const auto it = block_at.find(pc);
+      if (it == block_at.end()) return false;
+      b = it->second;
+      return true;
+    };
+    // User SGPRs come from the dispatch.
+    for (uint32_t k = 0; k < out_.compute.user_sgprs && k < 32; ++k) {
+      index_ = 0;
+      line(std::format("{} = D({});", sreg(k), add_slot(SlotKind::Sgpr, k, 1)));
+    }
+    uint32_t r = out_.compute.user_sgprs;
+    for (int k = 0; k < 3; ++k)
+      if (out_.compute.tgid[k]) line(std::format("{} = gl_WorkGroupID.{};", sreg(r++), "xyz"[k]));
+    if (out_.compute.tg_size) line(std::format("{} = gl_NumSubgroups | (gl_SubgroupID << 6);", sreg(r++)));
+    line("uint blk = 0u;");
+    line("while (blk != 0xffffffffu) {");
+    line("switch (blk) {");
+    bool open = false;
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      index_ = k;
+      const rdna2::Instruction& insn = insns[k].insn;
+      const std::string_view n = name_of(insn);
+      if (block_at.count(insns[k].pc)) {
+        if (open) line(std::format("blk = {}u; break; }}", block_at[insns[k].pc]));
+        line(std::format("case {}u: {{", block_at[insns[k].pc]));
+        open = true;
+      }
+      if (!open) continue;  // unreachable code after an unconditional transfer
+      if (is_branch(insn)) {
+        uint32_t target;
+        if (!block_of(branch_target(insns[k]), target)) return fail("branch target outside the program");
+        std::string cond;
+        if (n == "s_branch") cond = "true";
+        else if (n == "s_cbranch_scc0") cond = "!scc";
+        else if (n == "s_cbranch_scc1") cond = "scc";
+        else if (n == "s_cbranch_vccz") cond = "vcc_lo == 0u";
+        else if (n == "s_cbranch_vccnz") cond = "vcc_lo != 0u";
+        else if (n == "s_cbranch_execz") cond = "exec_lo == 0u";
+        else if (n == "s_cbranch_execnz") cond = "exec_lo != 0u";
+        else return fail("");
+        if (cond == "true") {
+          line(std::format("blk = {}u; break; }}", target));
+          open = false;
+        } else {
+          line(std::format("if ({}) {{ blk = {}u; break; }}", cond, target));
+        }
+        continue;
+      }
+      if (n == "s_endpgm") {
+        line("blk = 0xffffffffu; break; }");
+        open = false;
+        continue;
+      }
+      if (is_scalar(insn.format)) {
+        if (!emit_scalar_wave(insn, k)) return false;
+        continue;
+      }
+      if (!emit_vector_wave(insn)) return false;
+    }
+    if (open) line("blk = 0xffffffffu; break; }");
+    line("default: blk = 0xffffffffu; break;");
+    line("}");
+    line("}");
+    finish_wave();
+    return true;
+  }
+
+  // Vector instructions: lane-crossing ones first, then the guarded rest.
+  bool emit_vector_wave(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const Vop v = vop_fields(insn);
+    std::string a, b;
+    if (n == "v_readlane_b32") {
+      if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
+      line(std::format("{} = subgroupShuffle({}, {} & 31u);", sreg(v.dst), a, b));
+      return true;
+    }
+    if (n == "v_readfirstlane_b32") {
+      const uint32_t dst = (insn.words[0] >> 17) & 0xff;
+      if (!src(insn.words[0] & 0x1ff, insn, a)) return false;
+      line(std::format("{} = subgroupShuffle({}, exec_lo == 0u ? 0u : uint(findLSB(exec_lo)));", sreg(dst), a));
+      return true;
+    }
+    if (n == "v_writelane_b32") {
+      if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
+      line(std::format("if (lane == ({} & 31u)) {} = {};", b, vreg(v.dst), a));
+      return true;
+    }
+    if (n == "ds_bpermute_b32" || n == "ds_permute_b32") {
+      const uint32_t w1 = insn.words[1];
+      const uint32_t addr = w1 & 0xff, data0 = (w1 >> 8) & 0xff, vdst = (w1 >> 24) & 0xff;
+      const uint32_t offset = insn.words[0] & 0xffff;
+      if (n == "ds_permute_b32") return fail("ds_permute_b32");
+      // bpermute: each active lane reads lane (addr + offset) / 4 (inactive sources read as 0).
+      line(std::format("{{ uint src_lane = (({} + {}u) >> 2) & 31u; uint val = subgroupShuffle({}, src_lane);"
+                       " bool src_on = ((exec_lo >> src_lane) & 1u) != 0u;",
+                       vreg(addr), offset, vreg(data0)));
+      line(std::format("  if (lane_on()) {} = src_on ? val : 0u; }}", vreg(vdst)));
+      return true;
+    }
+    if (starts(n, "v_cmp")) line("cmpv = false;");
+    line("if (lane_on()) {");
+    post_.clear();
+    bool ok;
+    switch (insn.format) {
+      case Format::Ds: ok = emit_ds(insn); break;
+      case Format::Mubuf: ok = emit_mubuf(insn); break;
+      case Format::Mtbuf: ok = emit_mtbuf(insn); break;
+      case Format::Mimg: ok = emit_mimg(insn); break;
+      default: ok = emit(insn); break;
+    }
+    if (!ok) return false;
+    line("}");
+    for (const std::string& p : post_) line(p);
+    post_.clear();
+    return true;
+  }
+
+  // A 64-bit scalar operand as a uint64_t expression (inline constants sign-extend).
+  bool src64(uint32_t s, const rdna2::Instruction& insn, std::string& e) {
+    uint32_t c;
+    if (s == kLiteral) return e = std::format("uint64_t({:#x}u)", insn.literal), true;
+    if (inline_constant(s, c)) {
+      if (s >= 240) return fail("64-bit float inline constant");
+      return e = std::format("uint64_t(int64_t(int({:#x}u)))", c), true;
+    }
+    if (s == kScc) return e = "uint64_t(scc)", true;
+    if (s < 106 || s == kVccLo || s == kExecLo) {
+      e = std::format("packUint2x32(uvec2({}, {}))", sreg(s), sreg(s + 1));
+      return true;
+    }
+    if (s == kNull) return e = "uint64_t(0)", true;
+    return fail(std::format("64-bit operand {}", s));
+  }
+  void set64(uint32_t d, const std::string& value) {
+    line(std::format("{{ uvec2 t64 = unpackUint2x32({}); {} = t64.x; {} = t64.y; }}", value, sreg(d), sreg(d + 1)));
+  }
+
+  bool emit_scalar_wave(const rdna2::Instruction& insn, uint32_t k) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], w1 = insn.words[1];
+    std::string a, b;
+    switch (insn.format) {
+      case Format::Sopp: {
+        if (n == "s_barrier") line("barrier();");
+        // waits, hints, messages, priorities: nothing to do
+        return true;
+      }
+      case Format::Smem: {
+        const uint32_t sdata = (w0 >> 6) & 0x7f;
+        if (n == "s_dcache_inv" || n == "s_gl1_inv" || n == "s_dcache_wb") return true;
+        if (n == "s_memtime" || n == "s_memrealtime") {
+          line(std::format("{} = 0u; {} = 0u;", sreg(sdata), sreg(sdata + 1)));
+          return true;
+        }
+        int words = 1;
+        if (n.ends_with("x2")) words = 2;
+        else if (n.ends_with("x4")) words = 4;
+        else if (n.ends_with("x8")) words = 8;
+        else if (n.ends_with("x16")) words = 16;
+        if (!starts(n, "s_load_dword") && !starts(n, "s_buffer_load_dword")) return fail("");
+        if (gpu_smem_.count(k)) {
+          const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
+          const uint32_t imm = w1 & 0x1fffff;
+          const uint32_t buf = add_slot(SlotKind::Buffer, sbase, 4);
+          std::string so;
+          if (!src(soffset, insn, so)) return false;
+          line(std::format("{{ uint off = ({} + {:#x}u) & ~3u; uint64_t a = packUint2x32(uvec2(D({}), D({} + 1u))) + uint64_t(off);",
+                           so, imm, buf, buf));
+          for (int i = 0; i < words; ++i)
+            line(std::format("  {} = off + {}u < D({} + 3u) ? ld32(a + {}ul) : 0u;", sreg(sdata + i), i * 4 + 3, buf, i * 4));
+          line("}");
+          return true;
+        }
+        // The CPU performs the load (its address is known there): the words
+        // come in as slots captured right after this instruction.
+        index_ = k + 1;
+        for (int i = 0; i < words; ++i)
+          line(std::format("{} = D({});", sreg(sdata + i), add_slot(SlotKind::Sgpr, sdata + i, 1)));
+        index_ = k;
+        return true;
+      }
+      case Format::Sopk: {
+        const uint32_t dst = (w0 >> 16) & 0x7f;
+        const int32_t imm = static_cast<int16_t>(w0 & 0xffff);
+        const std::string d = sreg(dst);
+        const std::string si = std::format("int({})", imm), ui = std::format("{:#x}u", static_cast<uint32_t>(w0 & 0xffff));
+        if (n == "s_movk_i32") line(std::format("{} = uint({});", d, si));
+        else if (n == "s_cmovk_i32") line(std::format("if (scc) {} = uint({});", d, si));
+        else if (n == "s_addk_i32")
+          line(std::format("{{ int o = int({0}); int r = o + {1}; scc = ((o >= 0) == ({1} >= 0)) && ((r >= 0) != (o >= 0)); {0} = uint(r); }}", d, si));
+        else if (n == "s_mulk_i32") line(std::format("{0} = uint(int({0}) * {1});", d, si));
+        else if (starts(n, "s_cmpk_")) {
+          static const std::pair<std::string_view, const char*> kOps[] = {
+              {"eq", "=="}, {"lg", "!="}, {"gt", ">"}, {"ge", ">="}, {"lt", "<"}, {"le", "<="}};
+          const std::string_view rest = n.substr(7);
+          const std::string_view op = rest.substr(0, 2), type = rest.substr(3);
+          const char* c = nullptr;
+          for (const auto& [kk, o] : kOps)
+            if (op == kk) c = o;
+          if (!c) return fail("");
+          if (type == "i32") line(std::format("scc = int({}) {} {};", d, c, si));
+          else line(std::format("scc = {} {} {};", d, c, ui));
+        } else if (n == "s_getreg_b32") line(std::format("{} = 0u;", d));
+        else if (n == "s_setreg_b32" || n == "s_setreg_imm32_b32" || n == "s_waitcnt_vscnt" || n == "s_waitcnt_vmcnt" ||
+                 n == "s_waitcnt_expcnt" || n == "s_waitcnt_lgkmcnt" || n == "s_version")
+          ;
+        else return fail("");
+        return true;
+      }
+      case Format::Sopc: {
+        const uint32_t s0 = w0 & 0xff, s1 = (w0 >> 8) & 0xff;
+        if (n == "s_cmp_eq_u64" || n == "s_cmp_lg_u64") {
+          if (!src64(s0, insn, a) || !src64(s1, insn, b)) return false;
+          line(std::format("scc = {} {} {};", a, n == "s_cmp_eq_u64" ? "==" : "!=", b));
+          return true;
+        }
+        if (n == "s_bitcmp0_b64" || n == "s_bitcmp1_b64") {
+          if (!src64(s0, insn, a) || !src(s1, insn, b)) return false;
+          line(std::format("scc = (({} >> ({} & 63u)) & uint64_t(1)) {} uint64_t(0);", a, b, n == "s_bitcmp1_b64" ? "!=" : "=="));
+          return true;
+        }
+        if (!src(s0, insn, a) || !src(s1, insn, b)) return false;
+        static const std::pair<std::string_view, const char*> kOps[] = {
+            {"eq", "=="}, {"lg", "!="}, {"gt", ">"}, {"ge", ">="}, {"lt", "<"}, {"le", "<="}};
+        if (n == "s_bitcmp0_b32" || n == "s_bitcmp1_b32") {
+          line(std::format("scc = (({} >> ({} & 31u)) & 1u) {} 0u;", a, b, n == "s_bitcmp1_b32" ? "!=" : "=="));
+          return true;
+        }
+        if (!starts(n, "s_cmp_")) return fail("");
+        const std::string_view op = n.substr(6, 2), type = n.substr(9);
+        const char* c = nullptr;
+        for (const auto& [kk, o] : kOps)
+          if (op == kk) c = o;
+        if (!c) return fail("");
+        if (type == "i32") line(std::format("scc = int({}) {} int({});", a, c, b));
+        else line(std::format("scc = {} {} {};", a, c, b));
+        return true;
+      }
+      case Format::Sop1: return emit_sop1_wave(insn);
+      case Format::Sop2: return emit_sop2_wave(insn);
+      default: return fail("");
+    }
+  }
+
+  bool emit_sop1_wave(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], dst = (w0 >> 16) & 0x7f, s0 = w0 & 0xff;
+    const std::string d = sreg(dst);
+    std::string a;
+    // exec manipulation: (and|or|xor|andn1|andn2|orn1|orn2|nand|nor|xnor)_saveexec, (andn1|andn2)_wrexec
+    if (n.find("_saveexec_") != std::string_view::npos || n.find("_wrexec_") != std::string_view::npos) {
+      if (!src(s0, insn, a)) return false;
+      const std::string_view op = n.substr(2, n.find('_', 2) - 2);
+      std::string e;
+      if (op == "and") e = std::format("{} & exec_lo", a);
+      else if (op == "or") e = std::format("{} | exec_lo", a);
+      else if (op == "xor") e = std::format("{} ^ exec_lo", a);
+      else if (op == "andn1") e = std::format("~{} & exec_lo", a);
+      else if (op == "andn2") e = std::format("{} & ~exec_lo", a);
+      else if (op == "orn1") e = std::format("~{} | exec_lo", a);
+      else if (op == "orn2") e = std::format("{} | ~exec_lo", a);
+      else if (op == "nand") e = std::format("~({} & exec_lo)", a);
+      else if (op == "nor") e = std::format("~({} | exec_lo)", a);
+      else if (op == "xnor") e = std::format("~({} ^ exec_lo)", a);
+      else return fail("");
+      const bool wide = n.ends_with("_b64");
+      if (n.find("_wrexec_") != std::string_view::npos) {
+        line(std::format("exec_lo = ({}) & wave_lanes; scc = exec_lo != 0u; {} = exec_lo;", e, d));
+      } else {
+        line(std::format("{{ uint old = exec_lo; exec_lo = ({}) & wave_lanes; scc = exec_lo != 0u; {} = old; }}", e, d));
+      }
+      if (wide) line(std::format("{} = 0u;", sreg(dst + 1)));
+      return true;
+    }
+    if (n.ends_with("_b64") && n != "s_bcnt1_i32_b64" && n != "s_bcnt0_i32_b64" && n != "s_ff1_i32_b64" &&
+        n != "s_ff0_i32_b64" && n != "s_flbit_i32_b64") {
+      if (!src64(s0, insn, a)) return false;
+      if (n == "s_mov_b64") return set64(dst, a), true;
+      if (n == "s_cmov_b64") return line("if (scc) {"), set64(dst, a), line("}"), true;
+      if (n == "s_not_b64") return line(std::format("{{ uint64_t r = ~{}; scc = r != uint64_t(0);", a)), set64(dst, "r"), line("}"), true;
+      if (n == "s_wqm_b64") {
+        line(std::format("{{ uvec2 m = unpackUint2x32({}); uvec2 q = m | (m >> 1u) | (m >> 2u) | (m >> 3u); q &= uvec2(0x11111111u); q *= 15u;", a));
+        line("  scc = any(notEqual(q, uvec2(0u)));");
+        set64(dst, "packUint2x32(q)");
+        line("}");
+        return true;
+      }
+      if (n == "s_brev_b64") {
+        line(std::format("{{ uvec2 m = unpackUint2x32({});", a));
+        set64(dst, "packUint2x32(uvec2(bitfieldReverse(m.y), bitfieldReverse(m.x)))");
+        line("}");
+        return true;
+      }
+      return fail("");
+    }
+    if (!src(s0, insn, a)) return false;
+    if (n == "s_mov_b32") line(std::format("{} = {};", d, a));
+    else if (n == "s_cmov_b32") line(std::format("if (scc) {} = {};", d, a));
+    else if (n == "s_not_b32") line(std::format("{0} = ~{1}; scc = {0} != 0u;", d, a));
+    else if (n == "s_wqm_b32")
+      line(std::format("{{ uint m = {1}; uint q = (m | (m >> 1u) | (m >> 2u) | (m >> 3u)) & 0x11111111u; {0} = q * 15u; scc = {0} != 0u; }}", d, a));
+    else if (n == "s_brev_b32") line(std::format("{} = bitfieldReverse({});", d, a));
+    else if (n == "s_bcnt0_i32_b32") line(std::format("{0} = uint(32 - bitCount({1})); scc = {0} != 0u;", d, a));
+    else if (n == "s_bcnt1_i32_b32") line(std::format("{0} = uint(bitCount({1})); scc = {0} != 0u;", d, a));
+    else if (n == "s_bcnt1_i32_b64") {
+      std::string a64;
+      if (!src64(s0, insn, a64)) return false;
+      line(std::format("{{ uvec2 m = unpackUint2x32({1}); {0} = uint(bitCount(m.x) + bitCount(m.y)); scc = {0} != 0u; }}", d, a64));
+    } else if (n == "s_ff1_i32_b32") line(std::format("{} = uint(findLSB({}));", d, a));
+    else if (n == "s_ff0_i32_b32") line(std::format("{} = uint(findLSB(~{}));", d, a));
+    else if (n == "s_ff1_i32_b64") {
+      std::string a64;
+      if (!src64(s0, insn, a64)) return false;
+      line(std::format("{{ uvec2 m = unpackUint2x32({1}); {0} = m.x != 0u ? uint(findLSB(m.x)) : m.y != 0u ? uint(findLSB(m.y)) + 32u : 0xffffffffu; }}", d, a64));
+    } else if (n == "s_flbit_i32_b32") line(std::format("{{ uint m = {1}; {0} = m == 0u ? 0xffffffffu : uint(31 - findMSB(m)); }}", d, a));
+    else if (n == "s_flbit_i32") line(std::format("{{ int m = int({1}); {0} = (m == 0 || m == -1) ? 0xffffffffu : uint(31 - findMSB(m)); }}", d, a));
+    else if (n == "s_sext_i32_i8") line(std::format("{} = uint(bitfieldExtract(int({}), 0, 8));", d, a));
+    else if (n == "s_sext_i32_i16") line(std::format("{} = uint(bitfieldExtract(int({}), 0, 16));", d, a));
+    else if (n == "s_bitset0_b32") line(std::format("{0} &= ~(1u << ({1} & 31u));", d, a));
+    else if (n == "s_bitset1_b32") line(std::format("{0} |= 1u << ({1} & 31u);", d, a));
+    else if (n == "s_abs_i32") line(std::format("{0} = uint(abs(int({1}))); scc = {0} != 0u;", d, a));
+    else if (n == "s_quadmask_b32")
+      line(std::format("{{ uint m = {1}, r = 0u; for (int i = 0; i < 8; ++i) if (((m >> (i * 4)) & 15u) != 0u) r |= 1u << i; {0} = r; scc = r != 0u; }}", d, a));
+    else return fail("");
+    return true;
+  }
+
+  bool emit_sop2_wave(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], dst = (w0 >> 16) & 0x7f, s0 = w0 & 0xff, s1 = (w0 >> 8) & 0xff;
+    std::string a, b;
+    const std::string d = sreg(dst);
+    if (n.ends_with("_b64") || n.ends_with("_u64") || n.ends_with("_i64")) {
+      if (n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_bfe_u64" || n == "s_bfe_i64") {
+        if (!src64(s0, insn, a) || !src(s1, insn, b)) return false;
+        std::string e;
+        if (n == "s_lshl_b64") e = std::format("{} << ({} & 63u)", a, b);
+        else if (n == "s_lshr_b64") e = std::format("{} >> ({} & 63u)", a, b);
+        else if (n == "s_ashr_i64") e = std::format("uint64_t(int64_t({}) >> ({} & 63u))", a, b);
+        else return fail("");
+        line(std::format("{{ uint64_t r = {}; scc = r != uint64_t(0);", e));
+        set64(dst, "r");
+        line("}");
+        return true;
+      }
+      if (n == "s_bfm_b64") {
+        if (!src(s0, insn, a) || !src(s1, insn, b)) return false;
+        line(std::format("{{ uint w = {} & 63u; uint64_t r = (w == 0u ? uint64_t(0) : (uint64_t(0xffffffffffffffffUL) >> (64u - w))) << ({} & 63u);", a, b));
+        set64(dst, "r");
+        line("}");
+        return true;
+      }
+      if (!src64(s0, insn, a) || !src64(s1, insn, b)) return false;
+      std::string e;
+      bool sets_scc = true;
+      if (n == "s_and_b64") e = std::format("{} & {}", a, b);
+      else if (n == "s_or_b64") e = std::format("{} | {}", a, b);
+      else if (n == "s_xor_b64") e = std::format("{} ^ {}", a, b);
+      else if (n == "s_andn2_b64") e = std::format("{} & ~{}", a, b);
+      else if (n == "s_orn2_b64") e = std::format("{} | ~{}", a, b);
+      else if (n == "s_nand_b64") e = std::format("~({} & {})", a, b);
+      else if (n == "s_nor_b64") e = std::format("~({} | {})", a, b);
+      else if (n == "s_xnor_b64") e = std::format("~({} ^ {})", a, b);
+      else if (n == "s_cselect_b64") e = std::format("scc ? {} : {}", a, b), sets_scc = false;
+      else return fail("");
+      line(std::format("{{ uint64_t r = {};{}", e, sets_scc ? " scc = r != uint64_t(0);" : ""));
+      set64(dst, "r");
+      line("}");
+      return true;
+    }
+    if (!src(s0, insn, a) || !src(s1, insn, b)) return false;
+    // Results go through a temporary: the destination may be a source.
+    std::string e, scc;
+    if (n == "s_add_u32") e = std::format("{} + {}", a, b), scc = std::format("r < {}", a);
+    else if (n == "s_addc_u32") e = std::format("{} + {} + uint(scc)", a, b), scc = std::format("(uint64_t({}) + uint64_t({}) + uint64_t(scc)) > uint64_t(0xffffffffu)", a, b);
+    else if (n == "s_sub_u32") e = std::format("{} - {}", a, b), scc = std::format("{} > {}", b, a);
+    else if (n == "s_subb_u32") e = std::format("{} - {} - uint(scc)", a, b), scc = std::format("uint64_t({}) + uint64_t(scc) > uint64_t({})", b, a);
+    else if (n == "s_add_i32") e = std::format("uint(int({}) + int({}))", a, b), scc = std::format("((int({0}) >= 0) == (int({1}) >= 0)) && ((int(r) >= 0) != (int({0}) >= 0))", a, b);
+    else if (n == "s_sub_i32") e = std::format("uint(int({}) - int({}))", a, b), scc = std::format("((int({0}) >= 0) != (int({1}) >= 0)) && ((int(r) >= 0) != (int({0}) >= 0))", a, b);
+    else if (n == "s_mul_i32") e = std::format("uint(int({}) * int({}))", a, b);
+    else if (n == "s_mul_hi_u32") e = std::format("uint((uint64_t({}) * uint64_t({})) >> 32)", a, b);
+    else if (n == "s_mul_hi_i32") e = std::format("uint((int64_t(int({})) * int64_t(int({}))) >> 32)", a, b);
+    else if (n == "s_and_b32") e = std::format("{} & {}", a, b), scc = "r != 0u";
+    else if (n == "s_or_b32") e = std::format("{} | {}", a, b), scc = "r != 0u";
+    else if (n == "s_xor_b32") e = std::format("{} ^ {}", a, b), scc = "r != 0u";
+    else if (n == "s_andn2_b32") e = std::format("{} & ~{}", a, b), scc = "r != 0u";
+    else if (n == "s_orn2_b32") e = std::format("{} | ~{}", a, b), scc = "r != 0u";
+    else if (n == "s_nand_b32") e = std::format("~({} & {})", a, b), scc = "r != 0u";
+    else if (n == "s_nor_b32") e = std::format("~({} | {})", a, b), scc = "r != 0u";
+    else if (n == "s_xnor_b32") e = std::format("~({} ^ {})", a, b), scc = "r != 0u";
+    else if (n == "s_lshl_b32") e = std::format("{} << ({} & 31u)", a, b), scc = "r != 0u";
+    else if (n == "s_lshr_b32") e = std::format("{} >> ({} & 31u)", a, b), scc = "r != 0u";
+    else if (n == "s_ashr_i32") e = std::format("uint(int({}) >> int({} & 31u))", a, b), scc = "r != 0u";
+    else if (n == "s_min_u32") e = std::format("min({}, {})", a, b), scc = std::format("{} < {}", a, b);
+    else if (n == "s_max_u32") e = std::format("max({}, {})", a, b), scc = std::format("{} > {}", a, b);
+    else if (n == "s_min_i32") e = std::format("uint(min(int({}), int({})))", a, b), scc = std::format("int({}) < int({})", a, b);
+    else if (n == "s_max_i32") e = std::format("uint(max(int({}), int({})))", a, b), scc = std::format("int({}) > int({})", a, b);
+    else if (n == "s_cselect_b32") e = std::format("scc ? {} : {}", a, b);
+    else if (n == "s_bfm_b32") e = std::format("bitfieldInsert(0u, 0xffffffffu, int({1} & 31u), int({0} & 31u))", a, b);
+    else if (n == "s_bfe_u32")
+      e = std::format("(({1} >> 16) & 0x7fu) == 0u ? 0u : bitfieldExtract({0}, int({1} & 31u), int(min((({1} >> 16) & 0x7fu), 32u - ({1} & 31u))))", a, b), scc = "r != 0u";
+    else if (n == "s_bfe_i32")
+      e = std::format("(({1} >> 16) & 0x7fu) == 0u ? 0u : uint(bitfieldExtract(int({0}), int({1} & 31u), int(min((({1} >> 16) & 0x7fu), 32u - ({1} & 31u)))))", a, b), scc = "r != 0u";
+    else if (n == "s_lshl1_add_u32" || n == "s_lshl2_add_u32" || n == "s_lshl3_add_u32" || n == "s_lshl4_add_u32") {
+      const int sh = n[6] - '0';
+      e = std::format("({} << {}u) + {}", a, sh, b);
+      scc = std::format("(uint64_t({}) << {}) + uint64_t({}) > uint64_t(0xffffffffu)", a, sh, b);
+    } else if (n == "s_pack_ll_b32_b16") e = std::format("({} & 0xffffu) | ({} << 16)", a, b);
+    else if (n == "s_pack_lh_b32_b16") e = std::format("({} & 0xffffu) | ({} & 0xffff0000u)", a, b);
+    else if (n == "s_pack_hh_b32_b16") e = std::format("({} >> 16) | ({} & 0xffff0000u)", a, b);
+    else if (n == "s_absdiff_i32") e = std::format("uint(abs(int({}) - int({})))", a, b), scc = "r != 0u";
+    else return fail("");
+    line(std::format("{{ uint r = {};{} {} = r; }}", e, scc.empty() ? "" : std::format(" scc = {};", scc), d));
+    return true;
+  }
+
+  // Which SGPRs the CPU can know (in program order, ignoring branches):
+  // user SGPRs, constants, SMEM results and scalar arithmetic on known
+  // values - nothing derived from lane data (compares, readlane), the
+  // workgroup id or exec, and at a loop's head nothing the loop writes
+  // (values carried round the loop; values the body computes from known
+  // inputs are the same every iteration). SMEM addresses and
+  // the descriptors of vector memory instructions must be known: the CPU
+  // performs those loads and turns descriptors into bindless indices.
+  bool known_sgprs() {
+    auto& insns = out_.program.instructions;
+    std::array<bool, 128> known{};
+    std::map<uint32_t, std::array<bool, 128>> loop_writes;  // loop head pc -> SGPRs the loop writes
+    const auto scalar_dsts = [](const rdna2::Instruction& i, uint32_t& d, uint32_t& count) {
+      const std::string_view n = name_of(i);
+      const uint32_t w0 = i.words[0];
+      count = 0;
+      switch (i.format) {
+        case Format::Sop1: case Format::Sop2:
+          d = (w0 >> 16) & 0x7f;
+          count = (n.ends_with("_b64") || n.ends_with("_u64") || n.ends_with("_i64")) &&
+                          !starts(n, "s_bcnt") && !starts(n, "s_ff") && !starts(n, "s_flbit") && !starts(n, "s_bitcmp")
+                      ? 2 : 1;
+          break;
+        case Format::Sopk:
+          d = (w0 >> 16) & 0x7f;
+          count = starts(n, "s_cmpk_") ? 0 : 1;
+          break;
+        case Format::Smem: {
+          d = (w0 >> 6) & 0x7f;
+          count = n.ends_with("x16") ? 16 : n.ends_with("x8") ? 8 : n.ends_with("x4") ? 4 : n.ends_with("x2") ? 2 : 1;
+          if (!starts(n, "s_load") && !starts(n, "s_buffer_load")) count = starts(n, "s_mem") ? 2 : 0;
+          break;
+        }
+        case Format::Vop3: case Format::Vop1:
+          if (n == "v_readlane_b32") d = i.words[0] & 0xff, count = 1;
+          else if (n == "v_readfirstlane_b32") d = (w0 >> 17) & 0xff, count = 1;
+          else if (i.format == Format::Vop3 && starts(n, "v_cmp")) d = (w0 >> 8) & 0x7f, count = 2;
+          break;
+        default: break;
+      }
+    };
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      if (!is_branch(insns[k].insn)) continue;
+      const uint32_t target = branch_target(insns[k]);
+      if (target > insns[k].pc) continue;
+      auto& w = loop_writes[target];
+      for (uint32_t j = 0; j <= k; ++j) {
+        if (insns[j].pc < target) continue;
+        uint32_t d, c;
+        scalar_dsts(insns[j].insn, d, c);
+        for (uint32_t x = d; x < d + c && x < 128; ++x) w[x] = true;
+      }
+    }
+    std::array<bool, 128> loopy{};  // (nothing is unknown merely for being written in a loop)
+    for (uint32_t k = 0; k < out_.compute.user_sgprs && k < 128; ++k) known[k] = true;
+    bool scc_known = false;
+    const auto is_known = [&](uint32_t s, bool wide) {
+      uint32_t c;
+      if (s == kLiteral || inline_constant(s, c) || s == kNull) return true;
+      if (s == kScc) return scc_known;
+      if (s >= 128) return false;
+      return known[s] && (!wide || (s + 1 < 128 && known[s + 1]));
+    };
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      index_ = k;
+      if (const auto it = loop_writes.find(insns[k].pc); it != loop_writes.end()) {
+        for (uint32_t x = 0; x < 128; ++x)
+          if (it->second[x]) known[x] = false;
+        scc_known = false;
+      }
+      const rdna2::Instruction& i = insns[k].insn;
+      const std::string_view n = name_of(i);
+      const uint32_t w0 = i.words[0], w1 = i.words[1];
+      if (i.format == Format::Smem) {
+        uint32_t d, c;
+        scalar_dsts(i, d, c);
+        if (starts(n, "s_load") || starts(n, "s_buffer_load")) {
+          const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
+          const bool buffer = starts(n, "s_buffer");
+          for (uint32_t x = sbase; x < sbase + (buffer ? 4 : 2); ++x)
+            if (!is_known(x, false)) return fail("constant or descriptor load from an address only the GPU knows");
+          if (soffset != kNull && !is_known(soffset, false)) {
+            // A buffer load at a GPU-side offset: the GPU reads the buffer itself.
+            if (!buffer) return fail("constant load at an offset only the GPU knows");
+            gpu_smem_.insert(k);
+          }
+        }
+        for (uint32_t x = d; x < d + c && x < 128; ++x) known[x] = !loopy[x] && !gpu_smem_.count(k);
+        continue;
+      }
+      if (i.format == Format::Sop1 || i.format == Format::Sop2 || i.format == Format::Sopk || i.format == Format::Sopc) {
+        const bool wide = n.ends_with("_b64") || n.ends_with("_u64") || n.ends_with("_i64");
+        bool in = true;
+        if (i.format == Format::Sop1) in = is_known(w0 & 0xff, wide && !starts(n, "s_bcnt") && !starts(n, "s_ff"));
+        else if (i.format == Format::Sop2 || i.format == Format::Sopc) {
+          const bool shift = starts(n, "s_lshl_b64") || starts(n, "s_lshr_b64") || starts(n, "s_ashr_i64") || starts(n, "s_bitcmp");
+          in = is_known(w0 & 0xff, wide) && is_known((w0 >> 8) & 0xff, wide && !shift);
+        } else if (i.format == Format::Sopk && n != "s_movk_i32") in = is_known((w0 >> 16) & 0x7f, false);
+        if (n.find("cselect") != std::string_view::npos || n == "s_addc_u32" || n == "s_subb_u32" || starts(n, "s_cmov"))
+          in = in && scc_known;
+        if (n.find("exec") != std::string_view::npos) in = false;
+        // Only what the CPU interpreter evaluates.
+        ScalarRun probe;
+        probe.read = [](uint64_t, void*, size_t) { return false; };
+        bool pscc = false, pstop = false;
+        if (!scalar_step(i, probe, pscc, pstop)) in = false;
+        uint32_t d, c;
+        scalar_dsts(i, d, c);
+        for (uint32_t x = d; x < d + c && x < 128; ++x) known[x] = in && !loopy[x];
+        if (i.format == Format::Sopc || n.find("cmpk") != std::string_view::npos ||
+            (i.format != Format::Sopk && n != "s_mov_b32" && n != "s_mov_b64" && n != "s_cselect_b32" && n != "s_cselect_b64" &&
+             n != "s_brev_b32" && n != "s_movk_i32" && n != "s_mul_i32"))
+          scc_known = in;
+        continue;
+      }
+      if (i.format == Format::Mubuf || i.format == Format::Mtbuf || i.format == Format::Mimg) {
+        const uint32_t srsrc = ((w1 >> 16) & 0x1f) * 4;
+        const uint32_t words = i.format == Format::Mimg ? 8 : 4;
+        for (uint32_t x = srsrc; x < srsrc + words; ++x)
+          if (!is_known(x, false)) return fail("descriptor in SGPRs only the GPU knows");
+        if (i.format == Format::Mimg && starts(n, "image_sample")) {
+          const uint32_t ssamp = ((w1 >> 21) & 0x1f) * 4;
+          for (uint32_t x = ssamp; x < ssamp + 4; ++x)
+            if (!is_known(x, false)) return fail("sampler in SGPRs only the GPU knows");
+        }
+        continue;
+      }
+      uint32_t d, c;
+      scalar_dsts(i, d, c);
+      for (uint32_t x = d; x < d + c && x < 128; ++x) known[x] = false;
+    }
+    index_ = 0;
+    return true;
+  }
+
+  // LDS (ds_*): one shared uint array; addresses are byte offsets.
+  bool emit_ds(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], w1 = insn.words[1];
+    const uint32_t offset0 = w0 & 0xff, offset1 = (w0 >> 8) & 0xff, offset = w0 & 0xffff;
+    const uint32_t addr = w1 & 0xff, data0 = (w1 >> 8) & 0xff, data1 = (w1 >> 16) & 0xff, vdst = (w1 >> 24) & 0xff;
+    const std::string A = vreg(addr);
+    lds_words_ = std::max<uint32_t>(lds_words_, 1);
+    const auto at = [&](uint32_t off, const std::string& extra = "") {
+      return std::format("lds[(({} + {}u{}) >> 2) & LDS_MASK]", A, off, extra);
+    };
+    const auto two = [&](uint32_t scale, int words, bool write) {
+      for (int w = 0; w < words; ++w) {
+        const std::string lo = std::format(" + {}u", w * 4);
+        if (write) {
+          line(std::format("{} = {};", at(offset0 * scale, lo), vreg(data0 + w)));
+        } else {
+          line(std::format("{} = {};", vreg(vdst + w), at(offset0 * scale, lo)));
+        }
+      }
+      for (int w = 0; w < words; ++w) {
+        const std::string lo = std::format(" + {}u", w * 4);
+        if (write) line(std::format("{} = {};", at(offset1 * scale, lo), vreg(data1 + w)));
+        else line(std::format("{} = {};", vreg(vdst + words + w), at(offset1 * scale, lo)));
+      }
+      return true;
+    };
+    if (n == "ds_read_b32") return line(std::format("{} = {};", vreg(vdst), at(offset))), true;
+    if (n == "ds_read_b64" || n == "ds_read_b96" || n == "ds_read_b128") {
+      const int words = n == "ds_read_b64" ? 2 : n == "ds_read_b96" ? 3 : 4;
+      for (int w = 0; w < words; ++w) line(std::format("{} = {};", vreg(vdst + w), at(offset, std::format(" + {}u", w * 4))));
+      return true;
+    }
+    if (n == "ds_write_b32") return line(std::format("{} = {};", at(offset), vreg(data0))), true;
+    if (n == "ds_write_b64" || n == "ds_write_b96" || n == "ds_write_b128") {
+      const int words = n == "ds_write_b64" ? 2 : n == "ds_write_b96" ? 3 : 4;
+      for (int w = 0; w < words; ++w) line(std::format("{} = {};", at(offset, std::format(" + {}u", w * 4)), vreg(data0 + w)));
+      return true;
+    }
+    if (n == "ds_write_b8") return line(std::format("{{ uint i = ({} + {}u); uint s = (i & 3u) * 8u; atomicAnd(lds[(i >> 2) & LDS_MASK], ~(0xffu << s)); atomicOr(lds[(i >> 2) & LDS_MASK], ({} & 0xffu) << s); }}", A, offset, vreg(data0))), true;
+    if (n == "ds_write_b16") return line(std::format("{{ uint i = ({} + {}u); uint s = (i & 2u) * 8u; atomicAnd(lds[(i >> 2) & LDS_MASK], ~(0xffffu << s)); atomicOr(lds[(i >> 2) & LDS_MASK], ({} & 0xffffu) << s); }}", A, offset, vreg(data0))), true;
+    if (n == "ds_read_u8" || n == "ds_read_u16" || n == "ds_read_i8" || n == "ds_read_i16") {
+      const int bits = n.ends_with("8") ? 8 : 16;
+      const bool sign = n[8] == 'i';
+      line(std::format("{{ uint i = ({} + {}u); uint w = lds[(i >> 2) & LDS_MASK]; {} = {}; }}", A, offset, vreg(vdst),
+                       sign ? std::format("uint(bitfieldExtract(int(w), int((i & 3u) * 8u), {}))", bits)
+                            : std::format("bitfieldExtract(w, int((i & 3u) * 8u), {})", bits)));
+      return true;
+    }
+    if (n == "ds_read2_b32") return two(4, 1, false);
+    if (n == "ds_read2_b64") return two(8, 2, false);
+    if (n == "ds_read2st64_b32") return two(256, 1, false);
+    if (n == "ds_read2st64_b64") return two(512, 2, false);
+    if (n == "ds_write2_b32") return two(4, 1, true);
+    if (n == "ds_write2_b64") return two(8, 2, true);
+    if (n == "ds_write2st64_b32") return two(256, 1, true);
+    if (n == "ds_write2st64_b64") return two(512, 2, true);
+    // atomics: ds_<op>_u32 / _rtn_u32
+    static const std::pair<std::string_view, const char*> kAtomics[] = {
+        {"add", "atomicAdd"}, {"sub", ""}, {"min_u32", "atomicMin"}, {"max_u32", "atomicMax"},
+        {"min_i32", ""}, {"max_i32", ""}, {"and", "atomicAnd"}, {"or", "atomicOr"}, {"xor", "atomicXor"},
+        {"wrxchg", "atomicExchange"}};
+    std::string_view rest = n.substr(3);
+    const bool rtn = rest.find("_rtn") != std::string_view::npos;
+    std::string op(rest.substr(0, rest.find('_')));
+    if (op == "min" || op == "max") op += std::string(rest.substr(rest.size() - 4));
+    for (const auto& [k, f] : kAtomics) {
+      if (op != k) continue;
+      const std::string place = at(offset);
+      std::string call;
+      if (op == "sub") call = std::format("atomicAdd({}, uint(-int({})))", place, vreg(data0));
+      else if (op == "min_i32" || op == "max_i32") return fail("signed LDS min/max");
+      else call = std::format("{}({}, {})", f, place, vreg(data0));
+      if (rtn || op == "wrxchg") line(std::format("{} = {};", vreg(vdst), call));
+      else line(call + ";");
+      return true;
+    }
+    if (n == "ds_cmpst_rtn_b32" || n == "ds_cmpst_b32") {
+      line(std::format("{{ uint r = atomicCompSwap({}, {}, {});{} }}", at(offset), vreg(data0), vreg(data1),
+                       n == "ds_cmpst_rtn_b32" ? std::format(" {} = r;", vreg(vdst)) : ""));
+      return true;
+    }
+    if (n == "ds_nop") return true;
+    return fail("");
+  }
+
+  void finish_wave() {
+    const ComputeInfo& c = out_.compute;
+    std::string g = "#version 460\n"
+                    "#extension GL_EXT_buffer_reference : require\n"
+                    "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n"
+                    "#extension GL_EXT_nonuniform_qualifier : require\n"
+                    "#extension GL_KHR_shader_subgroup_basic : require\n"
+                    "#extension GL_KHR_shader_subgroup_ballot : require\n"
+                    "#extension GL_KHR_shader_subgroup_shuffle : require\n"
+                    "#extension GL_EXT_shader_image_load_formatted : enable\n";
+    g += std::format("layout(local_size_x = {}, local_size_y = {}, local_size_z = {}) in;\n", c.local_size[0],
+                     c.local_size[1], c.local_size[2]);
+    g += "layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };\n"
+         "layout(push_constant) uniform Push { uint64_t data; } pc;\n"
+         "layout(set = 0, binding = 0) uniform texture2D textures[];\n"
+         "layout(set = 0, binding = 2) uniform texture2DArray textures_a[];\n"
+         "layout(set = 0, binding = 3) uniform texture3D textures_3d[];\n"
+         "layout(set = 0, binding = 1) uniform sampler samplers[];\n"
+         "layout(set = 0, binding = 4) uniform image2D images[];\n"
+         "layout(set = 0, binding = 5) uniform image2DArray images_a[];\n"
+         "layout(set = 0, binding = 6) uniform image3D images_3d[];\n"
+         "layout(set = 0, binding = 7) uniform image1D images_1d[];\n"
+         "uint D(uint i) { return Words(pc.data).w[i]; }\n"
+         "uint ld32(uint64_t a) {\n"
+         "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
+         "  uint w0 = Words(al).w[0];\n"
+         "  if (sh == 0u) return w0;\n"
+         "  return (w0 >> sh) | (Words(al).w[1] << (32u - sh));\n"
+         "}\n"
+         "void st32(uint64_t a, uint v) { Words(a & ~uint64_t(3)).w[0] = v; }\n";
+    if (lds_words_) {
+      const uint32_t words = std::min<uint32_t>(std::max<uint32_t>(c.lds_bytes / 4, 1024), 8192);
+      uint32_t pow2 = 1;
+      while (pow2 < words) pow2 <<= 1;
+      g += std::format("#define LDS_MASK {}u\nshared uint lds[{}];\n", pow2 - 1, pow2);
+    }
+    g += "uint lane;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes;\nbool scc, cmpv;\n";
+    for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("uint s{};\n", k);
+    const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 3);
+    for (uint32_t k = 0; k < vgprs; ++k) g += std::format("uint v{};\n", k);
+    g += "bool lane_on() { return ((exec_lo >> lane) & 1u) != 0u; }\n";
+    g += "void main() {\n"
+         "  lane = gl_SubgroupInvocationID;\n"
+         "  wave_lanes = subgroupBallot(true).x;\n"
+         "  exec_lo = wave_lanes; exec_hi = 0u; vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false;\n";
+    for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("  s{} = 0u;\n", k);
+    for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{} = 0u;\n", k);
+    g += "  v0 = gl_LocalInvocationID.x;\n";
+    if (c.tidig_comps >= 1) g += "  v1 = gl_LocalInvocationID.y;\n";
+    if (c.tidig_comps >= 2) g += "  v2 = gl_LocalInvocationID.z;\n";
+    g += body_;
+    g += "}\n";
+    out_.glsl = std::move(g);
+  }
+
  private:
   bool fail(std::string_view what) {
     const auto& d = out_.program.instructions[index_];
@@ -238,6 +960,21 @@ class Translator {
     max_vgpr_ = std::max(max_vgpr_, n + 1);
     return std::format("v{}", n);
   }
+  // Wave mode: SGPRs are shader variables (every lane computes the same value).
+  std::string sreg(uint32_t n) {
+    if (n >= 106) {
+      if (n == kVccLo) return "vcc_lo";
+      if (n == kVccHi) return "vcc_hi";
+      if (n == kExecLo) return "exec_lo";
+      if (n == kExecHi) return "exec_hi";
+      if (n == kM0) return "m0";
+      return "sink";
+    }
+    max_sgpr_ = std::max(max_sgpr_, n + 1);
+    return std::format("s{}", n);
+  }
+  // Wave mode: is this lane's bit set in a 32-bit lane mask?
+  static std::string lane_bit(const std::string& mask) { return std::format("(((({}) >> lane) & 1u) != 0u)", mask); }
 
   // A source operand as a uint expression.
   bool src(uint32_t s, const rdna2::Instruction& insn, std::string& e) {
@@ -246,6 +983,21 @@ class Translator {
     if (s >= 256) return e = vreg(s - 256), true;
     if (s == kLiteral) return e = std::format("{:#x}u", insn.literal), true;
     if (inline_constant(s, c)) return e = std::format("{:#x}u", c), true;
+    if (wave_) {
+      if (s < 106) return e = sreg(s), true;
+      switch (s) {
+        case kVccLo: return e = "vcc_lo", true;
+        case kVccHi: return e = "vcc_hi", true;
+        case kExecLo: return e = "exec_lo", true;
+        case kExecHi: return e = "exec_hi", true;
+        case kM0: return e = "m0", true;
+        case kNull: return e = "0u", true;
+        case kScc: return e = "uint(scc)", true;
+        case 251: return e = "uint(vcc_lo == 0u)", true;   // src_vccz
+        case 252: return e = "uint(exec_lo == 0u)", true;  // src_execz
+        default: return fail(std::format("operand {}", s));
+      }
+    }
     if (s == kVccLo) return e = "(vcc ? 1u : 0u)", true;
     if (s < 106 && dyn_[s]) return e = std::format("sd{}", s), true;
     if (is_sgpr_operand(s) && s != kNull) {
@@ -290,7 +1042,10 @@ class Translator {
     Vop v = vop_fields(insn);
     if (!v.sdwa) return emit_valu_op(insn, v);
     const std::string_view n = name_of(insn);
-    const bool is_float = n.find("_f32") != std::string_view::npos || n.find("_f16") != std::string_view::npos;
+    // Float sources (a conversion from an integer reads an integer).
+    const bool is_float = (n.find("_f32") != std::string_view::npos || n.find("_f16") != std::string_view::npos) &&
+                          !(starts(n, "v_cvt_f32_") && (n.ends_with("_u32") || n.ends_with("_i32") || n.find("ubyte") != std::string_view::npos)) &&
+                          !(starts(n, "v_cvt_f16_") && (n.ends_with("_u16") || n.ends_with("_i16")));
     for (int k = 0; k < (insn.format == Format::Vop1 ? 1 : 2); ++k) {
       if (is_float && v.sel[k] != 6) return fail("SDWA sub-dword float operand");
       std::string u;
@@ -373,6 +1128,12 @@ class Translator {
     }
     if (n == "v_add_nc_u32" || n == "v_add_u32") return u2("{} + {}");
     if (n == "v_sub_nc_u32") return u2("{} - {}");
+    if (n == "v_subrev_nc_u32") return u2("{1} - {0}");
+    if (n == "v_swap_b32" && wave_) {
+      if (!src(v.src[0], insn, a)) return false;
+      line(std::format("{{ uint t = {}; {} = {}; {} = t; }}", vreg(v.dst), vreg(v.dst), a, a));
+      return true;
+    }
     if (n == "v_and_b32") return u2("{} & {}");
     if (n == "v_or_b32") return u2("{} | {}");
     if (n == "v_xor_b32") return u2("{} ^ {}");
@@ -387,7 +1148,17 @@ class Translator {
       if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
       if (n == "v_cndmask_b32") {
         std::string cond = "vcc";
-        if (insn.format == Format::Vop3) {
+        if (wave_) {
+          std::string m = "vcc_lo";
+          if (insn.format == Format::Vop3 && !src(v.src[2], insn, m)) return false;
+          cond = lane_bit(m);
+          if (insn.format == Format::Vop3) {  // VOP3 abs/neg on the float sources
+            if (v.neg & 1) a = std::format("({} ^ 0x80000000u)", a);
+            if (v.neg & 2) b = std::format("({} ^ 0x80000000u)", b);
+            if (v.abs & 1) a = std::format("({} & 0x7fffffffu)", a);
+            if (v.abs & 2) b = std::format("({} & 0x7fffffffu)", b);
+          }
+        } else if (insn.format == Format::Vop3) {
           if (v.src[2] != kVccLo) return fail("v_cndmask with a condition other than vcc");
         }
         line(std::format("{} = {} ? {} : {};", vreg(v.dst), cond, b, a));
@@ -473,22 +1244,135 @@ class Translator {
       }
       return true;
     }
-    // compares into vcc
-    if (starts(n, "v_cmp_")) {
+    // 64-bit shifts (result in a VGPR pair)
+    if (n == "v_lshrrev_b64" || n == "v_lshlrev_b64" || n == "v_ashrrev_i64") {
+      std::string lo, hi;
+      if (!src(v.src[0], insn, a)) return false;
+      if (v.src[1] >= 256) {
+        lo = vreg(v.src[1] - 256), hi = vreg(v.src[1] - 255);
+      } else if (wave_ && v.src[1] < 106) {
+        lo = sreg(v.src[1]), hi = sreg(v.src[1] + 1);
+      } else {
+        uint32_t cst;
+        if (v.src[1] == kLiteral) lo = std::format("{:#x}u", insn.literal), hi = "0u";
+        else if (inline_constant(v.src[1], cst)) lo = std::format("{:#x}u", cst), hi = (cst >> 31) ? "0xffffffffu" : "0u";
+        else return fail("64-bit shift operand");
+      }
+      const std::string x = std::format("packUint2x32(uvec2({}, {}))", lo, hi);
+      const std::string e = n == "v_lshrrev_b64" ? std::format("{} >> ({} & 63u)", x, a)
+                            : n == "v_lshlrev_b64" ? std::format("{} << ({} & 63u)", x, a)
+                                                   : std::format("uint64_t(int64_t({}) >> ({} & 63u))", x, a);
+      line(std::format("{{ uvec2 r = unpackUint2x32({}); {} = r.x; {} = r.y; }}", e, vreg(v.dst), vreg(v.dst + 1)));
+      return true;
+    }
+    if (n == "v_mul_lo_u32" || n == "v_mul_lo_i32") return u2("{} * {}");
+    if (n == "v_mul_hi_u32") return u2("uint((uint64_t({}) * uint64_t({})) >> 32)");
+    if (n == "v_mul_hi_i32") return u2("uint((int64_t(int({})) * int64_t(int({}))) >> 32)");
+    if (n == "v_mul_i32_i24") return u2("uint(bitfieldExtract(int({}), 0, 24) * bitfieldExtract(int({}), 0, 24))");
+    if (n == "v_max_i32") return u2("uint(max(int({}), int({})))");
+    if (n == "v_min_i32") return u2("uint(min(int({}), int({})))");
+    if (n == "v_not_b32") {
+      if (!src(v.src[0], insn, a)) return false;
+      line(std::format("{} = ~{};", vreg(v.dst), a));
+      return true;
+    }
+    if (n == "v_bfrev_b32" || n == "v_ffbh_u32" || n == "v_ffbl_b32" || n == "v_ffbh_i32" || n == "v_cvt_f32_ubyte0" ||
+        n == "v_cvt_f32_ubyte1" || n == "v_cvt_f32_ubyte2" || n == "v_cvt_f32_ubyte3") {
+      if (!src(v.src[0], insn, a)) return false;
+      std::string e;
+      if (n == "v_bfrev_b32") e = std::format("bitfieldReverse({})", a);
+      else if (n == "v_ffbh_u32") e = std::format("({0}) == 0u ? 0xffffffffu : uint(31 - findMSB({0}))", a);
+      else if (n == "v_ffbl_b32") e = std::format("uint(findLSB({}))", a);
+      else if (n == "v_ffbh_i32") e = std::format("(int({0}) == 0 || int({0}) == -1) ? 0xffffffffu : uint(31 - findMSB(int({0})))", a);
+      else e = fresult(v, std::format("float(({} >> {}u) & 0xffu)", a, (n.back() - '0') * 8));
+      line(std::format("{} = {};", vreg(v.dst), e));
+      return true;
+    }
+    if (n == "v_bcnt_u32_b32") return u2("uint(bitCount({})) + {}");
+    if (n == "v_mbcnt_lo_u32_b32" && wave_) return u2("uint(bitCount({} & ((1u << lane) - 1u))) + {}");
+    if (n == "v_mbcnt_hi_u32_b32" && wave_) return u2("(0u * {}) + {}");  // wave32: no lanes 32-63
+    if (n == "v_add_lshl_u32" || n == "v_lshl_add_u32" || n == "v_bfi_b32" || n == "v_alignbit_b32" ||
+        n == "v_med3_u32" || n == "v_med3_i32" || n == "v_min3_u32" || n == "v_max3_u32" || n == "v_min3_i32" ||
+        n == "v_max3_i32" || n == "v_alignbyte_b32" || n == "v_xad_u32" || n == "v_xor3_b32" || n == "v_bfe_i32" ||
+        n == "v_mad_u32_u16" || n == "v_mad_i32_i24" || n == "v_perm_b32") {
+      if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b) || !src(v.src[2], insn, c)) return false;
+      std::string e;
+      if (n == "v_add_lshl_u32") e = std::format("({} + {}) << ({} & 31u)", a, b, c);
+      else if (n == "v_lshl_add_u32") e = std::format("({} << ({} & 31u)) + {}", a, b, c);
+      else if (n == "v_bfi_b32") e = std::format("({0} & {1}) | (~{0} & {2})", a, b, c);
+      else if (n == "v_alignbit_b32") e = std::format("uint((packUint2x32(uvec2({1}, {0})) >> ({2} & 31u)) & uint64_t(0xffffffffu))", a, b, c);
+      else if (n == "v_alignbyte_b32") e = std::format("uint((packUint2x32(uvec2({1}, {0})) >> (({2} & 3u) * 8u)) & uint64_t(0xffffffffu))", a, b, c);
+      else if (n == "v_med3_u32") e = std::format("max(min({0}, {1}), min(max({0}, {1}), {2}))", a, b, c);
+      else if (n == "v_med3_i32") e = std::format("uint(max(min(int({0}), int({1})), min(max(int({0}), int({1})), int({2}))))", a, b, c);
+      else if (n == "v_min3_u32") e = std::format("min(min({}, {}), {})", a, b, c);
+      else if (n == "v_max3_u32") e = std::format("max(max({}, {}), {})", a, b, c);
+      else if (n == "v_min3_i32") e = std::format("uint(min(min(int({}), int({})), int({})))", a, b, c);
+      else if (n == "v_max3_i32") e = std::format("uint(max(max(int({}), int({})), int({})))", a, b, c);
+      else if (n == "v_xad_u32") e = std::format("({} ^ {}) + {}", a, b, c);
+      else if (n == "v_xor3_b32") e = std::format("{} ^ {} ^ {}", a, b, c);
+      else if (n == "v_bfe_i32") e = std::format("uint(bitfieldExtract(int({}), int({} & 31u), int({} & 31u)))", a, b, c);
+      else if (n == "v_mad_u32_u16") e = std::format("({} & 0xffffu) * ({} & 0xffffu) + {}", a, b, c);
+      else if (n == "v_mad_i32_i24") e = std::format("uint(bitfieldExtract(int({}), 0, 24) * bitfieldExtract(int({}), 0, 24) + int({}))", a, b, c);
+      else {  // v_perm_b32: bytes of {a, b} selected by c
+        line(std::format("{{ uint64_t pb = packUint2x32(uvec2({1}, {0})); uint sel = {2}, r = 0u;", a, b, c));
+        line("  for (uint i = 0u; i < 4u; ++i) { uint q = (sel >> (i * 8u)) & 0xffu; uint byte;");
+        line("    if (q < 8u) byte = uint((pb >> (q * 8u)) & uint64_t(0xffu));");
+        line("    else if (q == 12u) byte = 0u; else if (q > 12u) byte = 0xffu;");
+        line("    else { uint src = uint((pb >> (((q - 8u) * 2u + 1u) * 8u)) & uint64_t(0xffu)); byte = (src & 0x80u) != 0u ? 0xffu : 0u; }");
+        line("    r |= byte << (i * 8u); }");
+        line(std::format("  {} = r; }}", vreg(v.dst)));
+        return true;
+      }
+      line(std::format("{} = {};", vreg(v.dst), e));
+      return true;
+    }
+    if (n == "v_med3_f32" || n == "v_min3_f32" || n == "v_max3_f32") {
+      if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b) || !fsrc(v, 2, insn, c)) return false;
+      std::string e;
+      if (n == "v_med3_f32") e = std::format("max(min({0}, {1}), min(max({0}, {1}), {2}))", a, b, c);
+      else if (n == "v_min3_f32") e = std::format("min(min({}, {}), {})", a, b, c);
+      else e = std::format("max(max({}, {}), {})", a, b, c);
+      line(std::format("{} = {};", vreg(v.dst), fresult(v, e)));
+      return true;
+    }
+    if (n == "v_cmp_class_f32" || n == "v_cmpx_class_f32") {
+      // class mask: 0 sNaN 1 qNaN 2 -inf 3 -normal 4 -denorm 5 -0 6 +0 7 +denorm 8 +normal 9 +inf
+      if (!fsrc(v, 0, insn, a) || !src(v.src[1], insn, b)) return false;
+      line(std::format("{{ float x = {}; uint m = {}; uint u = floatBitsToUint(x); bool neg = (u >> 31) != 0u; uint cls;", a, b));
+      line("  if (isnan(x)) cls = (u & 0x400000u) != 0u ? 1u : 0u; else if (isinf(x)) cls = neg ? 2u : 9u;");
+      line("  else if (x == 0.0) cls = neg ? 5u : 6u; else if ((u & 0x7f800000u) == 0u) cls = neg ? 4u : 7u; else cls = neg ? 3u : 8u;");
+      if (wave_) {
+        line("  cmpv = ((m >> cls) & 1u) != 0u; }");
+        const std::string ballot = "subgroupBallot(cmpv).x";
+        if (n == "v_cmpx_class_f32") post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
+        else if (insn.format == Format::Vop3 && v.sdst != kVccLo)
+          post_.push_back(std::format("{} = {}; {} = 0u;", sreg(v.sdst), ballot, sreg(v.sdst + 1)));
+        else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
+      } else {
+        line("  vcc = ((m >> cls) & 1u) != 0u; }");
+      }
+      return true;
+    }
+    // compares into vcc (wave mode: also into an SGPR pair, and v_cmpx into exec)
+    if (starts(n, "v_cmp_") || (wave_ && starts(n, "v_cmpx_"))) {
+      const bool to_exec = starts(n, "v_cmpx_");
       static const std::pair<std::string_view, const char*> kOps[] = {
           {"eq", "=="}, {"lg", "!="}, {"neq", "!="}, {"ne", "!="}, {"lt", "<"},
           {"le", "<="}, {"gt", ">"}, {"ge", ">="}, {"nlt", ">="}, {"nle", ">"},
           {"ngt", "<="}, {"nge", "<"}};
-      const std::string_view rest = n.substr(6);
+      const std::string_view rest = n.substr(to_exec ? 7 : 6);
       const size_t us = rest.find('_');
       if (us == std::string_view::npos) return fail("");
       const std::string_view op = rest.substr(0, us), type = rest.substr(us + 1);
       const char* cmp = nullptr;
       for (const auto& [k, o] : kOps)
         if (op == k) cmp = o;
-      if (!cmp) return fail("");
-      if (insn.format == Format::Vop3 && v.sdst != kVccLo) return fail("compare into an SGPR pair");
-      if (type == "f32") {
+      if (!cmp && op != "f" && op != "t" && op != "tru") return fail("");
+      if (!wave_ && insn.format == Format::Vop3 && v.sdst != kVccLo) return fail("compare into an SGPR pair");
+      if (op == "f" || op == "t" || op == "tru") {
+        a = b = "0u";
+        cmp = op == "f" ? "!=" : "==";
+      } else if (type == "f32") {
         if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b)) return false;
       } else if (type == "u32" || type == "i32") {
         if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
@@ -496,10 +1380,37 @@ class Translator {
           a = std::format("int({})", a);
           b = std::format("int({})", b);
         }
+      } else if (type == "u16" || type == "i16") {
+        if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
+        a = type == "u16" ? std::format("({} & 0xffffu)", a) : std::format("bitfieldExtract(int({}), 0, 16)", a);
+        b = type == "u16" ? std::format("({} & 0xffffu)", b) : std::format("bitfieldExtract(int({}), 0, 16)", b);
+      } else if (type == "f16") {
+        std::string ua, ub;
+        if (!src(v.src[0], insn, ua) || !src(v.src[1], insn, ub)) return false;
+        a = std::format("unpackHalf2x16({}).x", ua);
+        b = std::format("unpackHalf2x16({}).x", ub);
+        if (v.abs & 1) a = std::format("abs({})", a);
+        if (v.abs & 2) b = std::format("abs({})", b);
+        if (v.neg & 1) a = std::format("(-{})", a);
+        if (v.neg & 2) b = std::format("(-{})", b);
       } else {
         return fail("");
       }
-      line(std::format("vcc = {} {} {};", a, cmp, b));
+      // The n* forms (nlt, nge, ...) are true for unordered operands.
+      const bool unordered = op.size() > 1 && op[0] == 'n' && op != "ne" && op != "neq";
+      std::string e = std::format("{} {} {}", a, cmp, b);
+      if (op == "neq" && type == "f32") e = std::format("!({} == {})", a, b);
+      else if (unordered) e = std::format("!({} {} {})", a, std::string_view(cmp) == ">=" ? "<" : std::string_view(cmp) == ">" ? "<=" : std::string_view(cmp) == "<=" ? ">" : ">=", b);
+      if (!wave_) {
+        line(std::format("vcc = {};", e));
+        return true;
+      }
+      line(std::format("cmpv = {};", e));
+      const std::string ballot = "subgroupBallot(cmpv).x";
+      if (to_exec) post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
+      else if (insn.format == Format::Vop3 && v.sdst != kVccLo)
+        post_.push_back(std::format("{} = {}; {} = 0u;", sreg(v.sdst), ballot, sreg(v.sdst + 1)));
+      else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
       return true;
     }
     return fail("");
@@ -536,6 +1447,7 @@ class Translator {
 
   bool emit_mubuf(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
+    if (wave_ && (starts(n, "buffer_store") || starts(n, "buffer_atomic"))) return emit_mubuf_write(insn);
     int words = 0;
     if (n == "buffer_load_dword") words = 1;
     else if (n == "buffer_load_dwordx2") words = 2;
@@ -551,6 +1463,65 @@ class Translator {
       line(std::format("  {} = inb ? ld32(a + {}ul) : 0u;", vreg(vdata + k), k * 4));
     line("}");
     return true;
+  }
+
+  // Wave mode: buffer stores and atomics (32-bit words through the buffer's
+  // device address; the bound check uses the descriptor's size).
+  bool emit_mubuf_write(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t vdata = (insn.words[1] >> 8) & 0xff;
+    const bool glc = (insn.words[0] >> 14) & 1;
+    std::string slot, addr, bound;
+    if (!buffer_address(insn, slot, addr, bound)) return false;
+    line("{");
+    line(std::format("  uint64_t a = {}; bool inb = {};", addr, bound));
+    int words = 0;
+    if (n == "buffer_store_dword" || n == "buffer_store_format_x") words = 1;
+    else if (n == "buffer_store_dwordx2" || n == "buffer_store_format_xy") words = 2;
+    else if (n == "buffer_store_dwordx3" || n == "buffer_store_format_xyz") words = 3;
+    else if (n == "buffer_store_dwordx4" || n == "buffer_store_format_xyzw") words = 4;
+    if (words) {
+      for (int k = 0; k < words; ++k) line(std::format("  if (inb) st32(a + {}ul, {});", k * 4, vreg(vdata + k)));
+      line("}");
+      return true;
+    }
+    if (n == "buffer_store_byte" || n == "buffer_store_short" || n == "buffer_store_format_d16_x") {
+      const bool byte = n == "buffer_store_byte";
+      line(std::format("  if (inb) {{ uint s = uint(a & uint64_t({})) * 8u; uint m = {}u << s;", byte ? 3 : 2, byte ? "0xff" : "0xffff"));
+      line(std::format("    atomicAnd(Words(a & ~uint64_t(3)).w[0], ~m); atomicOr(Words(a & ~uint64_t(3)).w[0], ({} << s) & m); }}", vreg(vdata)));
+      line("}");
+      return true;
+    }
+    if (n == "buffer_store_format_d16_xy") {
+      line(std::format("  if (inb) st32(a, ({} & 0xffffu) | ({} << 16));", vreg(vdata), vreg(vdata + 1)));
+      line("}");
+      return true;
+    }
+    if (n == "buffer_store_format_d16_xyzw") {
+      line(std::format("  if (inb) {{ st32(a, ({} & 0xffffu) | ({} << 16)); st32(a + 4ul, ({} & 0xffffu) | ({} << 16)); }}",
+                       vreg(vdata), vreg(vdata + 1), vreg(vdata + 2), vreg(vdata + 3)));
+      line("}");
+      return true;
+    }
+    static const std::pair<std::string_view, const char*> kAtomics[] = {
+        {"buffer_atomic_add", "atomicAdd"}, {"buffer_atomic_umin", "atomicMin"}, {"buffer_atomic_umax", "atomicMax"},
+        {"buffer_atomic_and", "atomicAnd"}, {"buffer_atomic_or", "atomicOr"}, {"buffer_atomic_xor", "atomicXor"},
+        {"buffer_atomic_swap", "atomicExchange"}, {"buffer_atomic_sub", ""}, {"buffer_atomic_inc", ""},
+        {"buffer_atomic_cmpswap", ""}};
+    for (const auto& [k, f] : kAtomics) {
+      if (n != k) continue;
+      const std::string place = "Words(a & ~uint64_t(3)).w[0]";
+      std::string call;
+      if (n == "buffer_atomic_sub") call = std::format("atomicAdd({}, uint(-int({})))", place, vreg(vdata));
+      else if (n == "buffer_atomic_inc") return fail("buffer_atomic_inc");
+      else if (n == "buffer_atomic_cmpswap") call = std::format("atomicCompSwap({}, {}, {})", place, vreg(vdata + 1), vreg(vdata));
+      else call = std::format("{}({}, {})", f, place, vreg(vdata));
+      line(std::format("  uint r = inb ? {} : 0u;", call));
+      if (glc) line(std::format("  {} = r;", vreg(vdata)));
+      line("}");
+      return true;
+    }
+    return fail("");
   }
 
   // MTBUF: typed loads (gfx10 unified buffer formats).
@@ -625,7 +1596,29 @@ class Translator {
     const uint32_t dmask = (w0 >> 8) & 0xf, dim = (w0 >> 3) & 7, nsa = (w0 >> 1) & 3;
     const uint32_t vaddr = w1 & 0xff, vdata = (w1 >> 8) & 0xff, srsrc = ((w1 >> 16) & 0x1f) * 4,
                    ssamp = ((w1 >> 21) & 0x1f) * 4;
-    if (nsa) return fail("NSA image addresses");
+    // Address VGPR i: consecutive from vaddr, or listed one per byte after
+    // the two instruction dwords (NSA encoding).
+    const auto A = [&](uint32_t i) {
+      if (!nsa || i == 0) return vreg(vaddr + i);
+      const uint32_t b = i - 1;
+      return vreg((insn.words[2 + b / 4] >> ((b % 4) * 8)) & 0xff);
+    };
+    if (wave_ && (n == "image_store" || n == "image_store_mip")) {
+      // UAV writes: storage images by the same dimension.
+      const uint32_t img = add_slot(SlotKind::Image, srsrc, 4);
+      std::string target, coord;
+      if (dim == 0) target = std::format("images_1d[nonuniformEXT(D({}))]", img), coord = std::format("int({})", A(0));
+      else if (dim == 1) target = std::format("images[nonuniformEXT(D({}))]", img + 1), coord = std::format("ivec2(int({}), int({}))", A(0), A(1));
+      else if (dim == 2) target = std::format("images_3d[nonuniformEXT(D({}))]", img + 3), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
+      else if (dim == 5) target = std::format("images_a[nonuniformEXT(D({}))]", img + 2), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
+      else return fail(std::format("image_store dimension {}", dim));
+      std::string comps[4] = {"0.0", "0.0", "0.0", "1.0"};
+      uint32_t r = vdata;
+      for (int k = 0; k < 4; ++k)
+        if (dmask & (1u << k)) comps[k] = std::format("uintBitsToFloat({})", vreg(r++));
+      line(std::format("imageStore({}, {}, vec4({}, {}, {}, {}));", target, coord, comps[0], comps[1], comps[2], comps[3]));
+      return true;
+    }
     // dim: 1 2D, 2 3D, 5 2D array (others not yet). The texture slot holds
     // the image's index in each bindless array: 2D, 2D array, 3D.
     if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image dimension {}", dim));
@@ -640,19 +1633,19 @@ class Translator {
     if (n == "image_sample" || n == "image_sample_lz" || n == "image_sample_l" || n == "image_sample_b") {
       const uint32_t smp = add_slot(SlotKind::Sampler, ssamp, 1);
       // image_sample_b takes the bias before the coordinates, _l the lod after.
-      const uint32_t c = vaddr + (n == "image_sample_b" ? 1 : 0);
-      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", vreg(c), vreg(c + 1));
+      const uint32_t c = n == "image_sample_b" ? 1 : 0;
+      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(c), A(c + 1));
       if (coords == 3)
-        coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", vreg(c + 2))
-                          : std::format(", uintBitsToFloat({})", vreg(c + 2));
+        coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(c + 2))
+                          : std::format(", uintBitsToFloat({})", A(c + 2));
       coord = std::format("vec{}({})", coords, coord);
       const std::string sampler = std::format("{}({}, samplers[nonuniformEXT(D({}))])", type, array, smp);
       if (n == "image_sample_lz") value = std::format("textureLod({}, {}, 0.0)", sampler, coord);
-      else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, vreg(c + coords));
+      else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, A(c + coords));
       else value = std::format("texture({}, {})", sampler, coord);
     } else if (n == "image_load") {
-      std::string coord = std::format("int({}), int({})", vreg(vaddr), vreg(vaddr + 1));
-      if (coords == 3) coord += std::format(", int({})", vreg(vaddr + 2));
+      std::string coord = std::format("int({}), int({})", A(0), A(1));
+      if (coords == 3) coord += std::format(", int({})", A(2));
       value = std::format("texelFetch({}({}, samplers[0]), ivec{}({}), 0)", type, array, coords, coord);
     } else {
       return fail("");
@@ -849,6 +1842,11 @@ class Translator {
   bool wrote_position_ = false;
   std::set<uint32_t> flat_inputs_;
   std::array<bool, 106> dyn_{};
+  const bool wave_;
+  uint32_t max_sgpr_ = 0;
+  std::vector<std::string> post_;  // wave mode: statements after the active-lane guard (ballots)
+  std::set<uint32_t> gpu_smem_;     // wave mode: s_buffer_load instructions the GPU performs
+  uint32_t lds_words_ = 0;
   uint32_t blocks_ = 1, last_leader_pc_ = 0;  // SGPRs whose value only the GPU knows (from v_readfirstlane_b32)
 };
 
@@ -1034,9 +2032,30 @@ bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool
 
 }  // namespace
 
-TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage) {
+ComputeInfo ComputeInfo::from_state(const uint8_t* state, size_t size) {
+  // 7 dwords: ?, ?, ?, (x | y << 16), z, COMPUTE_PGM_RSRC1, COMPUTE_PGM_RSRC2
+  ComputeInfo c;
+  if (size < 28) return c;
+  uint32_t d[7];
+  std::memcpy(d, state, sizeof d);
+  c.local_size[0] = std::max<uint32_t>(d[3] & 0xffff, 1);
+  c.local_size[1] = std::max<uint32_t>(d[3] >> 16, 1);
+  c.local_size[2] = std::max<uint32_t>(d[4] & 0xffff, 1);
+  const uint32_t rsrc2 = d[6];
+  c.user_sgprs = (rsrc2 >> 1) & 0x1f;
+  c.tgid[0] = (rsrc2 >> 7) & 1;
+  c.tgid[1] = (rsrc2 >> 8) & 1;
+  c.tgid[2] = (rsrc2 >> 9) & 1;
+  c.tg_size = (rsrc2 >> 10) & 1;
+  c.tidig_comps = (rsrc2 >> 11) & 3;
+  c.lds_bytes = ((rsrc2 >> 15) & 0x1ff) * 512;
+  return c;
+}
+
+TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage, const ComputeInfo* compute) {
   TranslatedShader out;
   out.stage = stage;
+  if (compute) out.compute = *compute;
   for (size_t pc = 0; pc + 4 <= size;) {
     rdna2::Instruction insn = rdna2::decode(code + pc, size - pc);
     if (insn.format == rdna2::Format::Invalid) {
@@ -1054,6 +2073,35 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
 
 bool run_scalar(const TranslatedShader& shader, ScalarRun& run, std::vector<uint32_t>& words) {
   words.assign(shader.slot_words, 0);
+  if (shader.stage == ShaderStage::Compute) {
+    // Wave-mode shaders: the scalar program runs once in program order
+    // (branches ignored) for the values the CPU must provide - SMEM results
+    // and descriptors, whose inputs the translator checked are known that
+    // way. Instructions the interpreter cannot evaluate only touch values
+    // the GPU computes itself.
+    bool scc = false, stop = false;
+    const auto& insns = shader.program.instructions;
+    size_t next_slot = 0;
+    std::vector<uint32_t> order(shader.slots.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t x, uint32_t y) { return shader.slots[x].instruction < shader.slots[y].instruction; });
+    for (uint32_t k = 0; k <= insns.size(); ++k) {
+      while (next_slot < order.size() && shader.slots[order[next_slot]].instruction == k) {
+        const Slot& slot = shader.slots[order[next_slot++]];
+        if (slot.kind == SlotKind::Sgpr) words[slot.offset] = run.sgpr[slot.sgpr];
+        else if (slot.kind != SlotKind::Blocks) run.resolve(slot.kind, &run.sgpr[slot.sgpr], &words[slot.offset]);
+      }
+      if (k == insns.size()) break;
+      const rdna2::Instruction& insn = insns[k].insn;
+      if (is_scalar(insn.format) && !is_branch(insn) && !(insn.format == Format::Sopp)) {
+        stop = false;
+        std::string saved = run.error;
+        if (!scalar_step(insn, run, scc, stop)) run.error = saved;  // a GPU-side value: not needed here
+      }
+    }
+    return true;
+  }
   run.sgpr[kExecLo] = run.sgpr[kExecHi] = 0xffffffffu;
   bool scc = false, stop = false;
   const auto& insns = shader.program.instructions;
