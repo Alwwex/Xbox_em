@@ -163,11 +163,14 @@ Commits today: 3c9f6d4 (DirectStorage worker threads), 06ac221 (descriptor
 heaps never on the caller's stack, safe DirectStorage writes), fc8dc56
 (guest memory below 2^40, command list slot 148).
 
-- The story load now completes in good runs: 390+ s at a steady 60 frames/s,
-  ~150 draws + 50 dispatches per second, raytracing setup (XboxBvhBuilder)
-  passes. The display image after the load is BLACK: Bink2 threads run, so
-  the screen is most likely drawn by compute shaders (Bink2 decodes on the
-  GPU) - compute is not executed yet (plan in "Renderer status" below).
+- The story load completes. 200-270 s: the loading screen (black background
+  - its colour constant is 0 - plus a rotating 32x32 BC3 spinner, bindless
+  texture 45, whose data is probably a format-2 chunk delivered as zeros, so
+  it is invisible). From ~270 s (run25) the title renders a HEAVY scene:
+  ~1900 compute dispatches + ~340 draws per second at ~7 frames/s - most
+  likely the first cutscene / the world (GPU-driven rendering). The image is
+  black because compute shaders are not executed. NEXT BIG STEP: compute
+  shaders (plan in "Renderer status" below), then performance.
 - Fixed and understood:
   - Loading stall: DirectStorage ran on the main thread -> worker per queue.
   - Watchdog (fn 0x2215a60): heartbeat [0x1471b6338] written every main-loop
