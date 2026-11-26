@@ -432,6 +432,7 @@ class Translator {
       case Format::Mubuf: ok = emit_mubuf(insn); break;
       case Format::Mtbuf: ok = emit_mtbuf(insn); break;
       case Format::Mimg: ok = emit_mimg(insn); break;
+      case Format::Global: ok = emit_global(insn); break;
       default: ok = emit(insn); break;
     }
     if (!ok) return false;
@@ -611,6 +612,15 @@ class Translator {
         line(std::format("{{ uint old = exec_lo; exec_lo = ({}) & wave_lanes; scc = exec_lo != 0u; {} = old; }}", e, d));
       }
       if (wide) line(std::format("{} = 0u;", sreg(dst + 1)));
+      return true;
+    }
+    if (n == "s_bitreplicate_b64_b32") {
+      // Every bit of the source twice (bit i -> bits 2i and 2i + 1).
+      if (!src(s0, insn, a)) return false;
+      line(std::format("{{ uint x = {}, lo = 0u, hi = 0u;", a));
+      line("  for (uint i = 0u; i < 16u; ++i) { lo |= ((x >> i) & 1u) * (3u << (2u * i)); hi |= ((x >> (i + 16u)) & 1u) * (3u << (2u * i)); }");
+      set64(dst, "packUint2x32(uvec2(lo, hi))");
+      line("}");
       return true;
     }
     if (n.ends_with("_b64") && n != "s_bcnt1_i32_b64" && n != "s_bcnt0_i32_b64" && n != "s_ff1_i32_b64" &&
@@ -907,6 +917,33 @@ class Translator {
   }
 
   // LDS (ds_*): one shared uint array; addresses are byte offsets.
+  // global_load/store_dword[xN]: address = VGPR pair (saddr off) or SGPR
+  // pair + 32-bit VGPR offset, plus a signed 12-bit immediate.
+  bool emit_global(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], w1 = insn.words[1];
+    const int32_t imm = static_cast<int32_t>(w0 << 20) >> 20;
+    const uint32_t addr = w1 & 0xff, data = (w1 >> 8) & 0xff, saddr = (w1 >> 16) & 0x7f, vdst = w1 >> 24;
+    const bool load = starts(n, "global_load_dword"), store = starts(n, "global_store_dword");
+    if (!load && !store) return fail("");
+    const uint32_t words = n.ends_with("x4") ? 4 : n.ends_with("x3") ? 3 : n.ends_with("x2") ? 2 : 1;
+    std::string base;
+    if (saddr == 0x7d || saddr == 0x7f) {
+      base = std::format("packUint2x32(uvec2({}, {}))", vreg(addr), vreg(addr + 1));
+    } else {
+      std::string s;
+      if (!src64(saddr, insn, s)) return false;
+      base = std::format("({} + uint64_t({}))", s, vreg(addr));
+    }
+    line(std::format("{{ uint64_t ga = {} + uint64_t(int64_t({}));", base, imm));
+    for (uint32_t k = 0; k < words; ++k) {
+      if (load) line(std::format("  {} = ld32(ga + {}ul);", vreg(vdst + k), k * 4));
+      else line(std::format("  st32(ga + {}ul, {});", k * 4, vreg(data + k)));
+    }
+    line("}");
+    return true;
+  }
+
   bool emit_ds(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
     const uint32_t w0 = insn.words[0], w1 = insn.words[1];
@@ -1569,7 +1606,7 @@ class Translator {
       static const std::pair<std::string_view, const char*> kOps[] = {
           {"eq", "=="}, {"lg", "!="}, {"neq", "!="}, {"ne", "!="}, {"lt", "<"},
           {"le", "<="}, {"gt", ">"}, {"ge", ">="}, {"nlt", ">="}, {"nle", ">"},
-          {"ngt", "<="}, {"nge", "<"}};
+          {"ngt", "<="}, {"nge", "<"}, {"o", "o"}, {"u", "u"}, {"nlg", "=="}};
       const std::string_view rest = n.substr(to_exec ? 7 : 6);
       const size_t us = rest.find('_');
       if (us == std::string_view::npos) return fail("");
@@ -1590,6 +1627,17 @@ class Translator {
           a = std::format("int({})", a);
           b = std::format("int({})", b);
         }
+      } else if ((type == "u64" || type == "i64") && wave_) {
+        // VGPR pairs or 64-bit scalar operands.
+        const auto wide = [&](uint32_t s, std::string& e) {
+          if (s >= 256) return e = std::format("packUint2x32(uvec2({}, {}))", vreg(s - 256), vreg(s - 255)), true;
+          return src64(s, insn, e);
+        };
+        if (!wide(v.src[0], a) || !wide(v.src[1], b)) return false;
+        if (type == "i64") {
+          a = std::format("int64_t({})", a);
+          b = std::format("int64_t({})", b);
+        }
       } else if (type == "u16" || type == "i16") {
         if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
         a = type == "u16" ? std::format("({} & 0xffffu)", a) : std::format("bitfieldExtract(int({}), 0, 16)", a);
@@ -1609,7 +1657,10 @@ class Translator {
       // The n* forms (nlt, nge, ...) are true for unordered operands.
       const bool unordered = op.size() > 1 && op[0] == 'n' && op != "ne" && op != "neq";
       std::string e = std::format("{} {} {}", a, cmp, b);
-      if (op == "neq" && type == "f32") e = std::format("!({} == {})", a, b);
+      if (op == "o") e = std::format("!isnan({}) && !isnan({})", a, b);
+      else if (op == "u") e = std::format("isnan({}) || isnan({})", a, b);
+      else if (op == "nlg") e = std::format("!({0} < {1} || {0} > {1})", a, b);
+      else if (op == "neq" && type == "f32") e = std::format("!({} == {})", a, b);
       else if (unordered) e = std::format("!({} {} {})", a, std::string_view(cmp) == ">=" ? "<" : std::string_view(cmp) == ">" ? "<=" : std::string_view(cmp) == "<=" ? ">" : ">=", b);
       if (!wave_) {
         line(std::format("vcc = {};", e));
@@ -1995,10 +2046,12 @@ class Translator {
       }
       line("}");
       return true;
-    } else if (n == "image_load") {
+    } else if (n == "image_load" || n == "image_load_mip") {
+      // _mip: the level follows the coordinates.
       std::string coord = std::format("int({}), int({})", A(0), A(1));
       if (coords == 3) coord += std::format(", int({})", A(2));
-      value = std::format("texelFetch({}({}, samplers[0]), ivec{}({}), 0)", type, array, coords, coord);
+      const std::string lod = n == "image_load_mip" ? std::format("int({})", A(coords)) : "0";
+      value = std::format("texelFetch({}({}, samplers[0]), ivec{}({}), {})", type, array, coords, coord, lod);
     } else {
       return fail("");
     }
