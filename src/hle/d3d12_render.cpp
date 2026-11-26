@@ -373,6 +373,19 @@ class Renderer {
     }
     submitted_cs_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
+    // Every ~10 s: how much of the time went into waiting for the GPU.
+    gpu_wait_us_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    ++gpu_submissions_;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats_since_ == std::chrono::steady_clock::time_point{}) stats_since_ = now;
+    if (now - stats_since_ >= std::chrono::seconds(10)) {
+      const auto span = std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_since_).count();
+      XBEM_INFO("gpu", "last {} ms: {} submissions, {} ms waiting for the GPU", span, gpu_submissions_,
+                gpu_wait_us_ / 1000);
+      gpu_wait_us_ = gpu_submissions_ = 0;
+      stats_since_ = now;
+    }
     recording_ = false;
     memory_.end_submission();
     ring_offset_ = 0;
@@ -1556,6 +1569,8 @@ class Renderer {
   // What the command buffer being recorded runs (for slow / failed submissions).
   std::set<uint64_t> submitted_cs_;
   uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0;
+  uint64_t gpu_wait_us_ = 0, gpu_submissions_ = 0;
+  std::chrono::steady_clock::time_point stats_since_{};
   gpu::vk::GuestMemory memory_;
   uint64_t descriptors_ = 0, descriptor_misses_ = 0, descriptor_table_resets_ = 0;
   std::vector<HeapWindow> windows_;

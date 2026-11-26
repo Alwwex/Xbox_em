@@ -20,4 +20,7 @@ namespace xbem::platform {
 // the file cannot be opened.
 int64_t cached_read(const std::string& host_path, uint64_t offset, void* out, size_t n);
 
+// Totals so far: read requests and their bytes (for the status line).
+void file_read_totals(uint64_t& requests, uint64_t& bytes);
+
 }  // namespace xbem::platform

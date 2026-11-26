@@ -20,6 +20,7 @@
 #include "hle/heap.h"
 #include "hle/probe_com.h"
 #include "hle/registry.h"
+#include "platform/file_cache.h"
 #include "platform/crash.h"
 #include "platform/memory.h"
 #include "platform/window.h"
@@ -518,8 +519,10 @@ std::vector<std::string> window_status_lines() {
   lines.push_back(std::format("{} - running for {} s, {} guest threads", main ? main->name : std::string("?"),
                               seconds, p ? p->guest_thread_count() : 0));
   const hle::D3d12Counters c = hle::d3d12_counters();
-  lines.push_back(std::format("frame events {}, command lists {}, draws {}, dispatches {} (recorded, not executed)",
-                              c.frames, c.command_lists, c.draws, c.dispatches));
+  uint64_t read_requests = 0, read_bytes = 0;
+  platform::file_read_totals(read_requests, read_bytes);
+  lines.push_back(std::format("frame events {}, command lists {}, draws {}, dispatches {}; file reads {} ({} MiB)",
+                              c.frames, c.command_lists, c.draws, c.dispatches, read_requests, read_bytes >> 20));
   lines.push_back("GPU: headless D3D12.X - there is no renderer yet, so nothing is drawn");
   lines.push_back("log: the terminal or the file the output goes to; crash reports end the run");
   return lines;

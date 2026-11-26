@@ -94,6 +94,12 @@ int open_file(const std::string& path) { return ::open(path.c_str(), O_RDONLY | 
 
 }  // namespace
 
+void file_read_totals(uint64_t& requests, uint64_t& bytes) {
+  std::lock_guard lock(g_cache.mutex);
+  requests = g_cache.requests;
+  bytes = g_cache.requested;
+}
+
 int64_t cached_read(const std::string& host_path, uint64_t offset, void* out, size_t n) {
   Cache& c = g_cache;
   OpenFile f;
