@@ -55,8 +55,8 @@ struct RecordedCommand {
   std::vector<uint8_t> blob;
 };
 
-// Descriptor heaps: start address (CPU = GPU) and D3D12_DESCRIPTOR_HEAP_TYPE.
-bool descriptor_heap_of(uint64_t p, uint64_t& start, uint32_t& type);
+// Descriptor heaps: start address (CPU = GPU), D3D12_DESCRIPTOR_HEAP_TYPE and size in bytes.
+bool descriptor_heap_of(uint64_t p, uint64_t& start, uint32_t& type, uint64_t* size = nullptr);
 
 // True for textures created as display surfaces (heap flag ALLOW_DISPLAY).
 bool is_display_resource(const ResourceState* r);

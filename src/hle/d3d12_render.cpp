@@ -903,7 +903,11 @@ class Renderer {
           std::memcpy(&heap, c.blob.data() + i, 8);
           uint64_t start;
           uint32_t type;
-          if (descriptor_heap_of(heap, start, type) && type <= 1) state_.heaps[type] = start;
+          uint64_t size = 0;
+          if (descriptor_heap_of(heap, start, type, &size) && type <= 1) {
+            state_.heaps[type] = start;
+            heap_window(start, size);
+          }
         }
         break;
       case 34:
@@ -991,13 +995,59 @@ class Renderer {
   // descriptor tables as 32-bit pointers, constants in place, root
   // descriptors as 64-bit addresses - then the sampler heap's 32-bit pointer
   // when the root signature indexes it directly.
+  //
+  // Shaders build descriptor table addresses from 32 bits, so tables are
+  // given 32-bit addresses: inside a bound descriptor heap its window below
+  // 4 GiB (heap_window: the same address on the CPU and the GPU for the
+  // whole run), anything else a per-draw token from 0x10000000.
+  struct HeapWindow {
+    uint64_t real, size, window;
+  };
+  static constexpr uint64_t kWindowStart = 0x80000000ull, kWindowEnd = 0x100000000ull;
+
+  uint64_t heap_window(uint64_t real, uint64_t size) {
+    for (const HeapWindow& h : windows_)
+      if (h.real == real && h.size >= size) return h.window;
+    const uint64_t window = ((next_window_ + 0xffff) & ~0xffffull) + (real & 0xffff);
+    if (window + size > kWindowEnd) {
+      note("descriptor heap windows below 4 GiB used up - tables get per-draw addresses");
+      return 0;
+    }
+    next_window_ = window + size;
+    windows_.push_back({real, size, window});
+    memory_.alias(window, real, size);
+    XBEM_INFO("gpu", "descriptor heap {:#x} ({} KiB) at GPU address {:#x}", real, size >> 10, window);
+    return window;
+  }
+
   struct Tokens {
+    const std::vector<HeapWindow>* windows = nullptr;
     std::vector<std::pair<uint64_t, uint64_t>> regions;  // host address, size
     uint32_t add(uint64_t host, uint64_t size) {
+      if (windows)
+        for (const HeapWindow& h : *windows)
+          if (host >= h.real && host < h.real + h.size) return static_cast<uint32_t>(h.window + (host - h.real));
       regions.emplace_back(host, size);
       return 0x10000000u + static_cast<uint32_t>(regions.size() - 1) * 0x01000000u;
     }
+    // The memory behind a 32-bit address (0 when it is not one).
+    uint64_t host_of(uint64_t address) const {
+      if (address >= kWindowStart && address < kWindowEnd && windows) {
+        for (const HeapWindow& h : *windows)
+          if (address >= h.window && address < h.window + h.size) return h.real + (address - h.window);
+        return 0;
+      }
+      if (address >= 0x10000000u && address < kWindowStart) {
+        const uint64_t i = (address - 0x10000000u) >> 24;
+        return i < regions.size() ? regions[i].first + (address & 0xffffff) : 0;
+      }
+      return 0;
+    }
     bool read(uint64_t address, void* out, size_t size) const {
+      if (address >= kWindowStart && address < kWindowEnd) {
+        const uint64_t host = host_of(address);
+        return host && platform::safe_read(host, out, size);
+      }
       if (address >= 0x10000000u && address < 0x100000000ull) {
         const uint64_t i = (address - 0x10000000u) >> 24;
         if (i >= regions.size()) return false;
@@ -1057,10 +1107,8 @@ class Renderer {
         const uint32_t stride = (w[1] >> 16) & 0x3fff;
         const uint64_t size = stride ? uint64_t{w[2]} * stride : w[2];
         uint64_t host = base;
-        if (base < 0x100000000ull && base >= 0x10000000u) {
-          const uint64_t i = (base - 0x10000000u) >> 24;
-          if (i < tokens.regions.size()) host = tokens.regions[i].first + (base & 0xffffff);
-        }
+        if (base < 0x100000000ull && base >= 0x10000000u)
+          if (const uint64_t h = tokens.host_of(base)) host = h;
         // Guest memory is read through the GPU's copy (the slot holds the
         // guest address); anything else is copied into the ring.
         const uint64_t limited = std::min<uint64_t>(size, 64ull << 20);
@@ -1197,6 +1245,7 @@ class Renderer {
     }();
     trace_reads_ = trace_reads_vs == p->vs_hash && reads_traced_++ < 2;
     Tokens tokens;
+    tokens.windows = &windows_;
     std::vector<uint32_t> words[2];
     gpu::TranslatedShader* stages[2] = {&vs->shader, &ps->shader};
     for (int k = 0; k < 2; ++k) {
@@ -1342,6 +1391,7 @@ class Renderer {
     if (!pipe) return skip_dispatch("pipeline creation failed");
     end_rendering();
     Tokens tokens;
+    tokens.windows = &windows_;
     gpu::ScalarRun run;
     static const std::vector<uint8_t> no_vb;
     user_sgprs(gpu::ShaderStage::Compute, tokens, run.sgpr, 0, no_vb);
@@ -1418,6 +1468,8 @@ class Renderer {
   Core core_;
   Buffer ring_;
   gpu::vk::GuestMemory memory_;
+  std::vector<HeapWindow> windows_;
+  uint64_t next_window_ = kWindowStart;
   VkDeviceSize ring_offset_ = 0;
   std::map<std::pair<uint64_t, uint64_t>, VkDeviceAddress> uploads_;
   VkCommandPool pool_ = VK_NULL_HANDLE;

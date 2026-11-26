@@ -1782,13 +1782,18 @@ const ProbeVtable g_device_vtable = make_vtable({
 }  // namespace
 
 namespace d3d12 {
-bool descriptor_heap_of(uint64_t p, uint64_t& start, uint32_t& type) {
+bool descriptor_heap_of(uint64_t p, uint64_t& start, uint32_t& type, uint64_t* size) {
   if (!is_probe_object(p)) return false;
   auto* o = reinterpret_cast<ProbeObject*>(p);
   if (o->vtable != g_heap_vtable.data()) return false;
   const auto* h = static_cast<DescriptorHeapState*>(o->state);
   start = h->gpu;
   std::memcpy(&type, h->desc, 4);
+  if (size) {
+    uint32_t count = 0;
+    std::memcpy(&count, h->desc + 4, 4);
+    *size = uint64_t{std::max<uint32_t>(count, 1)} * (type == 1 ? kSamplerDescriptorSize : kDescriptorSize);
+  }
   return true;
 }
 bool is_display_resource(const ResourceState* r) {

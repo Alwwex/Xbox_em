@@ -39,6 +39,11 @@ class GuestMemory {
   bool require(uint64_t va, uint64_t size);
   // The submission has completed: GPU writes go back to guest memory.
   void end_submission();
+  // Makes [window, window + size) show guest memory [real, real + size) on
+  // the GPU (window and real must agree modulo 64 KiB), kept up to date with
+  // remappings of `real`. Descriptor heaps get windows below 4 GiB: the
+  // console's shaders build table addresses from 32 bits.
+  void alias(uint64_t window, uint64_t real, uint64_t size);
 
   struct Stats {
     uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, evicted = 0, unmapped = 0;
@@ -61,6 +66,11 @@ class GuestMemory {
   void release(uint32_t idx);
   void forget_range(uint64_t va, uint64_t size);
   void clear_missed(uint64_t va, uint64_t size);
+  struct Alias {
+    uint64_t window, real, size;
+  };
+  void map_alias(const Alias& a);
+  std::vector<Alias> aliases_;
 
   Core* core_ = nullptr;
   Buffer table_;

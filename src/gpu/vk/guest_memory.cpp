@@ -174,6 +174,29 @@ void GuestMemory::forget_range(uint64_t va, uint64_t size) {
   }
 }
 
+void GuestMemory::alias(uint64_t window, uint64_t real, uint64_t size) {
+  if (!ready() || ((window ^ real) & (kPage - 1))) return;
+  aliases_.push_back({window, real, size});
+  map_alias(aliases_.back());
+}
+
+void GuestMemory::map_alias(const Alias& a) {
+  for (uint64_t w = a.window & ~(kPage - 1); w < a.window + a.size; w += kPage) {
+    const uint64_t r = a.real - (a.window - w);  // the real page's start
+    require(std::max(r, a.real), 1);
+    const uint32_t* re = entry(r, false);
+    if (!re || !*re) continue;
+    uint32_t* we = entry(w, true);
+    if (!we || *we == *re) continue;
+    if (*we) {
+      auto& vas = pages_[*we].vas;
+      vas.erase(std::remove(vas.begin(), vas.end(), w), vas.end());
+    }
+    *we = *re;
+    pages_[*re].vas.push_back(w);
+  }
+}
+
 // Pages of [va, va + size) may be reported as misses again.
 void GuestMemory::clear_missed(uint64_t va, uint64_t size) {
   const uint64_t end = std::min<uint64_t>(va + size, 1ull << 40);
@@ -212,6 +235,7 @@ void GuestMemory::begin_submission() {
     }
     ++stats_.refreshed;
   }
+  for (const Alias& a : aliases_) map_alias(a);
 }
 
 void GuestMemory::end_submission() {
