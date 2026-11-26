@@ -29,6 +29,7 @@ void unregister_dump_thread() {}
 #define _GNU_SOURCE
 #endif
 #include <execinfo.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -204,6 +205,61 @@ void dump_signal_handler(int, siginfo_t*, void* ctx) {
       break;
     }
   g_dump_done.fetch_add(1);
+}
+
+// The host mappings around an address no allocation covers (/proc/self/maps:
+// the one containing it, or the nearest below and above), to tell a freed
+// region from a pointer just past a stack or an allocation.
+void print_host_mappings_near(uint64_t address) {
+#if defined(__linux__)
+  const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char buf[8192];
+  size_t have = 0;
+  char below[160] = {}, above[160] = {}, inside[160] = {};
+  bool done = false;
+  while (!done) {
+    const ssize_t n = ::read(fd, buf + have, sizeof buf - 1 - have);
+    if (n <= 0) break;
+    have += static_cast<size_t>(n);
+    size_t start = 0;
+    for (size_t i = 0; i < have; ++i) {
+      if (buf[i] != '\n') continue;
+      buf[i] = 0;
+      const char* l = buf + start;
+      char* end = nullptr;
+      const uint64_t lo = std::strtoull(l, &end, 16);
+      const uint64_t hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0;
+      const size_t len = std::min<size_t>(std::strlen(l), sizeof below - 1);
+      if (address >= lo && address < hi) {
+        std::memcpy(inside, l, len);
+        inside[len] = 0;
+      } else if (hi <= address) {
+        std::memcpy(below, l, len);
+        below[len] = 0;
+      } else if (lo > address && !above[0]) {
+        std::memcpy(above, l, len);
+        above[len] = 0;
+        done = true;
+        break;
+      }
+      start = i + 1;
+    }
+    if (start < have) std::memmove(buf, buf + start, have - start);
+    have -= start;
+    if (have >= sizeof buf - 1) have = 0;  // an overlong line: drop it
+  }
+  ::close(fd);
+  write_str("Host mappings near the fault address:\n");
+  for (const char* m : {below, inside, above}) {
+    if (!m[0]) continue;
+    write_str(m == inside ? "  contains: " : m == below ? "  below:    " : "  above:    ");
+    write_str(m);
+    write_str("\n");
+  }
+#else
+  (void)address;
+#endif
 }
 
 void print_tracepoint_summary();
@@ -1143,6 +1199,14 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   describe_memory(fault, where, sizeof where);
   std::snprintf(line, sizeof line, "Fault address: %s\n", where);
   write_str(line);
+  if (std::strcmp(where, "not memory the emulator handed out") == 0 && fault >= 0x10000) {
+    uint8_t probe_byte;
+    std::snprintf(line, sizeof line, "Fault code %d (%s); the address is %sreadable now\n", info->si_code,
+                  info->si_code == SEGV_MAPERR ? "not mapped" : info->si_code == SEGV_ACCERR ? "protection" : "other",
+                  safe_read(fault, &probe_byte, 1) ? "" : "not ");
+    write_str(line);
+    print_host_mappings_near(fault);
+  }
   describe_memory(rsp, where, sizeof where);
   uint64_t probe;
   std::snprintf(line, sizeof line, "Stack pointer: %s%s\n", where,
@@ -1321,8 +1385,12 @@ bool overlaps_watched_page(uint64_t address, uint64_t size) {
 void register_dump_thread(uint32_t guest_thread_id, uint64_t stack_low, uint64_t stack_high) {
   const int self = current_tid();
   {
-    char line[96];
-    std::snprintf(line, sizeof line, "[info ][thread] guest thread %u runs on host tid %d\n", guest_thread_id, self);
+    char line[160];
+    std::snprintf(line, sizeof line, "[info ][thread] guest thread %u runs on host tid %d, stack [%#llx, %#llx), sp %#llx, tp %#llx\n",
+                  guest_thread_id, self, static_cast<unsigned long long>(stack_low),
+                  static_cast<unsigned long long>(stack_high),
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_frame_address(0))),
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_thread_pointer())));
     write_str(line);
   }
   for (DumpSlot& s : g_dump_slots) {

@@ -1264,6 +1264,18 @@ static void test_headless_d3d12(void) {
   void* heap_small = 0;
   CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_small, iid, &heap_small) == 0 && heap_small);
   CHECK(((HeapStartFn)VT(heap_small)[9])(heap_small) != (uint64_t)(uintptr_t)title_mem);
+  /* Stack contents that look like (pointer, size): a pointer into this
+   * thread's stack is never the heap's memory (GTA VI's render-thread heaps
+   * once landed on the main thread's stack top this way). */
+  {
+    volatile uint8_t on_stack[64 * 32];
+    on_stack[0] = 1;
+    uint64_t heap_desc_stack[4] = {(uint64_t)64 << 32, 1, (uint64_t)(uintptr_t)on_stack, 0x2600000};
+    void* heap_stack = 0;
+    CHECK(((CreateHeapFn)VT(device)[14])(device, heap_desc_stack, iid, &heap_stack) == 0 && heap_stack);
+    const uint64_t stack_start = ((HeapStartFn)VT(heap_stack)[9])(heap_stack);
+    CHECK(stack_start && stack_start != (uint64_t)(uintptr_t)on_stack);
+  }
 
   /* Heaps: CreateHeap (28); placed resources live at heap + offset. */
   typedef HRESULT (*CreateMemHeapFn)(void*, const void*, const void*, void**);

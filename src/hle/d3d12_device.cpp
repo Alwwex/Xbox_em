@@ -1213,12 +1213,26 @@ bool is_allocated_memory(uint64_t address) {
   return state != MEM_FREE && kind == MEM_PRIVATE;
 }
 
+// Is `address` in the calling guest thread's stack? (Its range as the TEB
+// gives it also covers the host's thread control block and TLS at the top.)
+bool in_calling_thread_stack(uint64_t address) {
+  rt::GuestThread* t = rt::current_thread();
+  if (!t || !t->teb) return false;
+  uint64_t lo = 0, hi = 0;
+  std::memcpy(&lo, t->teb + rt::teb::kStackLimit, 8);
+  std::memcpy(&hi, t->teb + rt::teb::kStackBase, 8);
+  return address >= lo && address < hi;
+}
+
 // 14 CreateDescriptorHeap(desc, riid, ppv). The console's descriptor heap
 // desc is the PC {Type, NumDescriptors, Flags, NodeMask} followed by the memory
 // the title set aside for the descriptors and its size (+16, +24; the title
 // checks that the heap starts there). Some call sites fill only the 16 PC
 // bytes and leave stack contents behind them, so the memory is taken only when
-// the size covers the heap.
+// the size covers the heap, the whole heap lies in allocated memory, and that
+// memory is not the calling thread's stack: a stale pointer into the stack
+// (or the host TLS above it) once placed GTA VI's render-thread heaps there,
+// and the title later read descriptors past the stack's top.
 HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const uint8_t* desc, const void*, void** out) {
   auto* state = new DescriptorHeapState;
   uint8_t raw[32] = {};
@@ -1233,7 +1247,9 @@ HRESULT XBEM_GUEST_ABI device_create_descriptor_heap(ProbeObject* self, const ui
   uint64_t memory = 0, memory_size = 0;
   std::memcpy(&memory, raw + 16, 8);
   std::memcpy(&memory_size, raw + 24, 8);
-  const bool title_memory = memory && memory_size >= bytes && memory_size < (1ull << 40) && is_allocated_memory(memory);
+  const bool title_memory = memory && memory_size >= bytes && memory_size < (1ull << 40) &&
+                            is_allocated_memory(memory) && is_allocated_memory(memory + bytes - 1) &&
+                            !in_calling_thread_stack(memory) && !in_calling_thread_stack(memory + bytes - 1);
   if (!title_memory) memory = 0;
   if (!memory)
     memory = reinterpret_cast<uint64_t>(virtual_alloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0));

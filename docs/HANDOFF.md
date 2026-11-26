@@ -157,7 +157,44 @@ console gives the title 13.5 GB. Fix applied: C:\Users\alexa\.wslconfig
 cache default lowered to 128 MB. Next: rerun the press script after the WSL
 restart and check that loading gets past ~300 s.
 
-## WHERE WORK STOPPED (2026-11-26) - read first
+## WHERE WORK STOPPED (2026-11-26, later) - read first
+
+- RAM is fine now (WSL 11 GB + 16 GB swap, VmSwap 0). The loading stall was
+  DirectStorage running on the title's main thread (Submit drained the queue
+  synchronously: main thread 344 sat in dstorage drain -> cached_read). Fixed:
+  one worker thread per queue (commit 3c9f6d4; XBEM_DSTORAGE_SYNC=1 = old).
+  The main loop now stays at ~60 frames/s through the load.
+- Watchdog (fn 0x2215a60) fully understood: each 1 s tick it compares the
+  heartbeat [0x1471b6338] (written by fn 0x22159f0, called every main-loop
+  frame from 0x120790 and 0xc9e350) with its last value; 30 equal ticks with
+  no timed operation running -> crash at +0x23cf683. Flag [0x1471b6330]
+  (event 0x24 via callback 0x22159c0) pauses it. So it only fires when the
+  main loop stops for 30 s. Still fires sometimes (1 in ~4 runs), e.g. with
+  --screenshot during the load.
+- With the main loop fast, loading gets through in some runs (run4: 600 s,
+  steady 150 draws + 50 dispatches per second, display image black - the
+  post-load screen is probably drawn by compute shaders, which are not run).
+- In ~half the runs: SIGSEGV at +0x4eec964 (render threads 360-376, fn
+  0x4eec8e0 gathers 32-byte descriptors into a table: obj = [ctx+idx*8-0x122c0],
+  descriptor pointer = [obj+0x18]). Always idx 0x11e, objects with vtable
+  0x1461ecda0 (0x20 apart, at ctx+0x21de0), and the pointer is always
+  StackBase(guest thread 344 = main loop) + 0x250: the guard page of the
+  next thread's stack (glibc installs guards with MADV_GUARD_INSTALL, invisible
+  in /proc/self/maps; crash report now prints fault code + nearby mappings).
+  Next: find who builds that descriptor array (dump the object array start,
+  run13 logs in ~/xbem-runs), probably a title array relative to TEB
+  StackBase or a stack array whose layout differs.
+- The title also prints "D3D12 XDXR Error: DestAccelerationStructureData can
+  not have more than 40b of address set": console GPU VAs are 40-bit, ours
+  are host pointers (47-bit). Raytracing (XboxBvhBuilder) will need GPU VAs
+  below 2^40.
+- Rarely a host thread crashes (guest thread 0, page-aligned fault) - not
+  captured yet; may be the new DirectStorage worker writing into memory the
+  title released. Keep the per-run logs separate (run11_N.log) to catch it.
+- Debug aids added: Ctrl+\ dump prints host frames (addr2line -f -C -e
+  build/bin/xbem 0xOFF); "[thread] ... stack [lo, hi), sp" per thread.
+
+## WHERE WORK STOPPED (2026-11-26, earlier) - read first
 
 - Story loading (after Confirm at ~197 s with the press script) ends in the
   title's loading watchdog (+0x23cf683, thread ~328) at ~240-300 s.

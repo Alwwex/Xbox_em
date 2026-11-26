@@ -290,7 +290,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
               "  -> {} offset {:#x} size {:#x} (uncompressed {:#x}), compression {}, dest {} size {:#x}",
               file->guest_path, offset, source_size, uncompressed_size, compression, static_cast<void*>(dest),
               dest_size);
-  if (!dest || !source_size || source_size > (256u << 20)) return E_INVALIDARG;
+  if (!dest || !source_size || source_size > (256u << 20) || skip + dest_size > (1ull << 30)) return E_INVALIDARG;
 
   std::vector<uint8_t> buffer(source_size);
   if (!file->read(offset, buffer.data(), source_size)) {
@@ -340,23 +340,35 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     }
     // An undecodable format: reported (and failed) below.
   }
+  // Into guest memory with safe writes: the worker runs while the title goes
+  // on, and a destination that is not mapped (any more) must fail the
+  // request, not the emulator.
+  const auto deliver = [&](const uint8_t* data, uint64_t n) {
+    if (!n || platform::safe_write(reinterpret_cast<uint64_t>(dest), data, n)) return true;
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1) < 16)
+      XBEM_WARN("dstorage", "{}: destination {} ({:#x} bytes) is not writable - request failed:{}", file->guest_path,
+                static_cast<void*>(dest), n, hex_qwords(w, 12));
+    return false;
+  };
   if (compression == 0) {
-    std::memcpy(dest, buffer.data(), std::min<uint64_t>(source_size, dest_size));
-    q->bytes_out += std::min<uint64_t>(source_size, dest_size);
+    const uint64_t n = std::min<uint64_t>(source_size, dest_size);
+    if (!deliver(buffer.data(), n)) return HRESULT(0x800706F8);  // HRESULT_FROM_WIN32(ERROR_INVALID_USER_BUFFER)
+    q->bytes_out += n;
     return S_OK;
   }
   size_t produced = 0;
   InflateResult r;
-  if (physical) {
-    std::vector<uint8_t> scratch(skip + dest_size);
-    r = inflate_auto(buffer.data(), buffer.size(), scratch.data(), scratch.size(), produced);
-  } else if (skip) {
+  {
     std::vector<uint8_t> whole(skip + dest_size);
     r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
-    if (r == InflateResult::OutputFull) r = InflateResult::Ok;  // the rest of the chunk is not wanted
-    if (produced > skip) std::memcpy(dest, whole.data() + skip, std::min<uint64_t>(produced - skip, dest_size));
-  } else {
-    r = inflate_auto(buffer.data(), buffer.size(), dest, dest_size, produced);
+    if (skip && r == InflateResult::OutputFull) r = InflateResult::Ok;  // the rest of the chunk is not wanted
+    // (A physical destination only gets here with an undecodable format: its
+    // `dest` is the frame number array, which is never written.)
+    if (!physical) {
+      const uint64_t n = produced > skip ? std::min<uint64_t>(produced - skip, dest_size) : 0;
+      if (!deliver(whole.data() + skip, n)) return HRESULT(0x800706F8);
+    }
   }
   q->bytes_out += produced;
   if (r != InflateResult::Ok) {
@@ -374,7 +386,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     }
     // Experiment switch: report undecodable formats as delivered (zeros).
     if (std::getenv("XBEM_DSTORAGE_PRETEND") && compression != 1) {
-      if (!physical) std::memset(dest, 0, dest_size);
+      if (!physical) {
+        const std::vector<uint8_t> zeros(dest_size);
+        deliver(zeros.data(), zeros.size());
+      }
       return S_OK;
     }
     return HRESULT(0x80070017);  // HRESULT_FROM_WIN32(ERROR_CRC): corrupt data
