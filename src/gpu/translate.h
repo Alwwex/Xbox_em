@@ -64,6 +64,9 @@ struct Slot {
 struct DecodedInstruction {
   rdna2::Instruction insn;
   uint32_t pc = 0;  // byte offset in the program
+  // A far jump (s_getpc_b64 / s_add_u32 / s_addc_u32 / s_setpc_b64 with a
+  // constant offset) becomes an s_branch to this pc; ~0u: none.
+  uint32_t far_target = ~0u;
 };
 
 struct Program {
@@ -96,6 +99,10 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
 // turns the descriptor words found in SGPRs into slot words.
 struct ScalarRun {
   uint32_t sgpr[128] = {};  // initial user SGPRs (s0..) - 106 SGPRs, vcc, m0, exec ...
+  // s_getpc_b64: the address of the program's first byte as the shader sees
+  // it (0: not available) and the pc of the instruction being run.
+  uint64_t code_address = 0;
+  uint32_t pc = 0;
   std::function<bool(uint64_t address, void* out, size_t size)> read;
   std::function<void(SlotKind kind, const uint32_t* words, uint32_t* out)> resolve;
   std::string error;

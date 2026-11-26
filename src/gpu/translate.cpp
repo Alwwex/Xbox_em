@@ -178,6 +178,7 @@ bool is_branch(const rdna2::Instruction& i) {
          (std::string_view(i.name) == "s_branch" || std::string_view(i.name).starts_with("s_cbranch_"));
 }
 uint32_t branch_target(const DecodedInstruction& d) {
+  if (d.far_target != ~0u) return d.far_target;
   const int32_t simm = static_cast<int16_t>(d.insn.words[0] & 0xffff);
   return static_cast<uint32_t>(static_cast<int32_t>(d.pc) + 4 + simm * 4);
 }
@@ -624,6 +625,15 @@ class Translator {
       if (wide) line(std::format("{} = 0u;", sreg(dst + 1)));
       return true;
     }
+    if (n == "s_getpc_b64") {
+      // The CPU knows the program's address (ScalarRun::code_address):
+      // the value arrives as slots captured right after this instruction.
+      ++index_;
+      line(std::format("{} = D({});", sreg(dst), add_slot(SlotKind::Sgpr, dst, 1)));
+      line(std::format("{} = D({});", sreg(dst + 1), add_slot(SlotKind::Sgpr, dst + 1, 1)));
+      --index_;
+      return true;
+    }
     if (n == "s_bitreplicate_b64_b32") {
       // Every bit of the source twice (bit i -> bits 2i and 2i + 1).
       if (!src(s0, insn, a)) return false;
@@ -673,6 +683,11 @@ class Translator {
       std::string a64;
       if (!src64(s0, insn, a64)) return false;
       line(std::format("{{ uvec2 m = unpackUint2x32({1}); {0} = m.x != 0u ? uint(findLSB(m.x)) : m.y != 0u ? uint(findLSB(m.y)) + 32u : 0xffffffffu; }}", d, a64));
+    } else if (n == "s_flbit_i32_b64") {
+      // Leading zeros counted from bit 63.
+      std::string a64;
+      if (!src64(s0, insn, a64)) return false;
+      line(std::format("{{ uvec2 m = unpackUint2x32({1}); {0} = m.y != 0u ? uint(31 - findMSB(m.y)) : m.x != 0u ? uint(63 - findMSB(m.x)) : 0xffffffffu; }}", d, a64));
     } else if (n == "s_flbit_i32_b32") line(std::format("{{ uint m = {1}; {0} = m == 0u ? 0xffffffffu : uint(31 - findMSB(m)); }}", d, a));
     else if (n == "s_flbit_i32") line(std::format("{{ int m = int({1}); {0} = (m == 0 || m == -1) ? 0xffffffffu : uint(31 - findMSB(m)); }}", d, a));
     else if (n == "s_sext_i32_i8") line(std::format("{} = uint(bitfieldExtract(int({}), 0, 8));", d, a));
@@ -885,6 +900,7 @@ class Translator {
         // Only what the CPU interpreter evaluates.
         ScalarRun probe;
         probe.read = [](uint64_t, void*, size_t) { return false; };
+        probe.code_address = uint64_t{1} << 63;  // s_getpc_b64: the renderer provides it
         bool pscc = false, pstop = false;
         if (!scalar_step(i, probe, pscc, pstop)) in = false;
         uint32_t d, c;
@@ -1325,11 +1341,11 @@ class Translator {
                        fresult(v, std::format("fma({}, {}, uintBitsToFloat({}))", a, b, vreg(v.dst)))));
       return true;
     }
-    if (n == "v_fmaak_f32" || n == "v_fmamk_f32") {
-      // fmaak: s0 * s1 + K; fmamk: s0 * K + s1 (K = the literal)
+    if (n == "v_fmaak_f32" || n == "v_fmamk_f32" || n == "v_madak_f32" || n == "v_madmk_f32") {
+      // fmaak: s0 * s1 + K; fmamk: s0 * K + s1 (K = the literal; mad = fma here)
       if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b)) return false;
       const std::string k = std::format("uintBitsToFloat({:#x}u)", insn.literal);
-      const std::string e = n == "v_fmaak_f32" ? std::format("fma({}, {}, {})", a, b, k) : std::format("fma({}, {}, {})", a, k, b);
+      const std::string e = n.ends_with("ak_f32") ? std::format("fma({}, {}, {})", a, b, k) : std::format("fma({}, {}, {})", a, k, b);
       line(std::format("{} = {};", vreg(v.dst), fresult(v, e)));
       return true;
     }
@@ -1396,7 +1412,7 @@ class Translator {
     if (n == "v_cvt_rpi_i32_f32") return f1("uint(int(floor({} + 0.5)))", false);
     if (n == "v_sqrt_f32") return f1("sqrt({})", true);
     if (n == "v_rsq_f32") return f1("inversesqrt({})", true);
-    if (n == "v_rcp_f32") return f1("1.0 / {}", true);
+    if (n == "v_rcp_f32" || n == "v_rcp_iflag_f32") return f1("1.0 / {}", true);
     if (n == "v_exp_f32") return f1("exp2({})", true);
     if (n == "v_log_f32") return f1("log2({})", true);
     if (n == "v_floor_f32") return f1("floor({})", true);
@@ -1422,7 +1438,8 @@ class Translator {
           {"max", "max({0}, {1})"}, {"min", "min({0}, {1})"}, {"fma", "fma({0}, {1}, {2})"},
           {"rcp", "1.0 / {0}"}, {"sqrt", "sqrt({0})"}, {"rsq", "inversesqrt({0})"}, {"fract", "fract({0})"},
           {"floor", "floor({0})"}, {"ceil", "ceil({0})"}, {"trunc", "trunc({0})"}, {"rndne", "roundEven({0})"},
-          {"fmac", "fma({0}, {1}, {3})"}};
+          {"fmac", "fma({0}, {1}, {3})"}, {"exp", "exp2({0})"}, {"log", "log2({0})"},
+          {"sin", "sin({0} * 6.2831853)"}, {"cos", "cos({0} * 6.2831853)"}};
       const bool packed = starts(n, "v_pk_") && n.ends_with("_f16");
       const bool scalar = !packed && starts(n, "v_") && n.ends_with("_f16") && n.find("cvt") == std::string_view::npos &&
                           n.find("cmp") == std::string_view::npos && n.find("mix") == std::string_view::npos;
@@ -2046,6 +2063,13 @@ class Translator {
       if (i == 1) return std::string(sampling ? "0x3f000000u" : "0u");
       return addr_reg(i > 1 ? i - 1 : i);
     };
+    if (starts(n, "image_bvh")) {
+      // Ray / BVH node intersection (raytracing). The emulator builds no
+      // acceleration structures: every node reports no children and no hit
+      // (invalid node pointers), so traversal ends at once as a miss.
+      for (uint32_t k = 0; k < 4; ++k) line(std::format("{} = 0xffffffffu;", vreg(vdata + k)));
+      return true;
+    }
     if (wave_ && (n == "image_store" || n == "image_store_mip")) {
       // UAV writes: storage images by the same dimension.
       if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image_store dimension {}", dim));
@@ -2418,6 +2442,13 @@ bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool
       return true;
     case Format::Sop1: {
       const uint32_t dst = (w0 >> 16) & 0x7f, s0 = w0 & 0xff;
+      if (n == "s_getpc_b64") {
+        if (!run.code_address) return run.error = "s_getpc_b64 (no code address)", false;
+        const uint64_t v = run.code_address + run.pc + 4;
+        s[dst] = static_cast<uint32_t>(v);
+        s[dst + 1] = static_cast<uint32_t>(v >> 32);
+        return true;
+      }
       if (n == "s_mov_b32") s[dst] = sop_src(run, s0, insn, ok);
       else if (n == "s_mov_b64" || n == "s_wqm_b64") {
         const uint64_t v = sop_src64(run, s0, insn, ok);
@@ -2586,16 +2617,48 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
   TranslatedShader out;
   out.stage = stage;
   if (compute) out.compute = *compute;
+  // Decoding ends at an s_endpgm no branch jumps past (data such as
+  // constant tables may follow the code). Far jumps - s_getpc_b64 sX,
+  // s_add_u32 sX, sX, K, s_addc_u32 sX+1, sX+1, 0, s_setpc_b64 sX - become
+  // s_branch to pc(getpc) + 4 + K (s_sub_u32 / s_subb_u32: - K).
+  auto& insns = out.program.instructions;
+  uint32_t furthest = 0;
+  const auto note_targets = [&](size_t from) {
+    for (size_t k = from; k < insns.size(); ++k) {
+      if (k >= 3 && insns[k].insn.name && std::string_view(insns[k].insn.name) == "s_setpc_b64") {
+        const DecodedInstruction &g = insns[k - 3], &a = insns[k - 2], &c = insns[k - 1];
+        const uint32_t x = (insns[k].insn.words[0] & 0xff);
+        const auto named = [](const DecodedInstruction& d, const char* n) {
+          return d.insn.name && std::string_view(d.insn.name) == n;
+        };
+        const bool add = named(a, "s_add_u32") && named(c, "s_addc_u32"),
+                   sub = named(a, "s_sub_u32") && named(c, "s_subb_u32");
+        if (named(g, "s_getpc_b64") && ((g.insn.words[0] >> 16) & 0x7f) == x && (add || sub) && a.insn.has_literal &&
+            ((a.insn.words[0] >> 16) & 0x7f) == x && (a.insn.words[0] & 0xff) == x &&
+            ((c.insn.words[0] >> 16) & 0x7f) == x + 1 && (c.insn.words[0] & 0xff) == x + 1 &&
+            ((c.insn.words[0] >> 8) & 0xff) == 128) {
+          insns[k].far_target = add ? g.pc + 4 + a.insn.literal : g.pc + 4 - a.insn.literal;
+          insns[k].insn.name = "s_branch";
+          insns[k].insn.format = rdna2::Format::Sopp;
+        }
+      }
+      if (is_branch(insns[k].insn)) furthest = std::max(furthest, branch_target(insns[k]));
+    }
+  };
   for (size_t pc = 0; pc + 4 <= size;) {
     rdna2::Instruction insn = rdna2::decode(code + pc, size - pc);
     if (insn.format == rdna2::Format::Invalid) {
       out.error = std::format("undecodable instruction at +{:#x}", pc);
       return out;
     }
-    out.program.instructions.push_back({insn, static_cast<uint32_t>(pc)});
+    insns.push_back({insn, static_cast<uint32_t>(pc)});
     pc += insn.size;
-    if (insn.name && std::string_view(insn.name) == "s_endpgm") break;
+    if (insn.name && std::string_view(insn.name) == "s_endpgm") {
+      note_targets(0);
+      if (furthest < pc) break;
+    }
   }
+  note_targets(0);
   Translator t(out);
   out.ok = t.run();
   return out;
@@ -2626,6 +2689,7 @@ bool run_scalar(const TranslatedShader& shader, ScalarRun& run, std::vector<uint
       const rdna2::Instruction& insn = insns[k].insn;
       if (is_scalar(insn.format) && !is_branch(insn) && !(insn.format == Format::Sopp)) {
         stop = false;
+        run.pc = insns[k].pc;
         std::string saved = run.error;
         if (!scalar_step(insn, run, scc, stop)) run.error = saved;  // a GPU-side value: not needed here
       }
@@ -2675,6 +2739,7 @@ bool run_scalar(const TranslatedShader& shader, ScalarRun& run, std::vector<uint
       ++k;
       continue;
     }
+    run.pc = insns[k].pc;
     if (is_scalar(insn.format) && !scalar_step(insn, run, scc, stop)) {
       run.error = std::format("+{:#x}: {}", insns[k].pc, run.error);
       return false;

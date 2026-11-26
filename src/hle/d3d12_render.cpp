@@ -104,6 +104,10 @@ struct ShaderEntry {
   gpu::TranslatedShader shader;
   VkShaderModule module = VK_NULL_HANDLE;
   std::string error;
+  // The program itself on the GPU (compute): s_getpc_b64 points into it, for
+  // the constant tables that follow the code.
+  Buffer code;
+  std::vector<uint8_t> code_bytes;
 };
 
 struct PipelineKey {
@@ -1408,6 +1412,11 @@ class Renderer {
     e->shader = gpu::translate_shader(p.code.data(), p.code.size(), gpu::ShaderStage::Compute, &info);
     if (!e->shader.ok) e->error = e->shader.error;
     else e->module = compile(e->shader.glsl, "comp", e->error);
+    if (e->module && !p.code.empty()) {
+      e->code = core_.create_buffer((p.code.size() + 15) & ~size_t{15}, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+      if (e->code.mapped) std::memcpy(e->code.mapped, p.code.data(), p.code.size());
+      e->code_bytes = p.code;
+    }
     if (!e->error.empty()) XBEM_WARN("gpu", "compute shader {:016x}: {}", p.cs_hash, e->error);
     ShaderEntry* raw = e.get();
     shaders_[p.cs_hash] = std::move(e);
@@ -1443,7 +1452,16 @@ class Renderer {
     gpu::ScalarRun run;
     static const std::vector<uint8_t> no_vb;
     user_sgprs(gpu::ShaderStage::Compute, tokens, run.sgpr, 0, no_vb);
-    run.read = [&](uint64_t address, void* out, size_t size) { return tokens.read(address, out, size); };
+    // s_getpc_b64: the program's copy on the GPU, as a direct device address
+    // (bit 63); the CPU reads such addresses from the program bytes.
+    if (cs->code.mapped) run.code_address = cs->code.address | (uint64_t{1} << 63);
+    run.read = [&](uint64_t address, void* out, size_t size) {
+      if (run.code_address && address >= run.code_address && address - run.code_address + size <= cs->code_bytes.size()) {
+        std::memcpy(out, cs->code_bytes.data() + (address - run.code_address), size);
+        return true;
+      }
+      return tokens.read(address, out, size);
+    };
     run.resolve = [&](gpu::SlotKind kind, const uint32_t* w, uint32_t* out) { resolve(kind, w, out, tokens); };
     std::vector<uint32_t> words;
     written_.clear();
