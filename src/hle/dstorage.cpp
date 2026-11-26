@@ -197,6 +197,77 @@ std::string hex_qwords(const uint64_t* q, int n) {
 }
 
 // Executes one request; returns its HRESULT.
+// Requests into the middle of a compressed chunk. GTA VI's read layer (fn
+// 0x4ffd520) maps a texture's pieces onto the .ttpf chunk table; when a
+// piece does not start at a chunk (its own int3 at +0x4ffd868 - our tiling
+// answers cut textures into smaller pieces than the files were chunked for)
+// it still enqueues the chunk's compressed size from "chunk start + offset of
+// the piece in the chunk", which is not the start of a DEFLATE stream. The
+// piece's data is bytes [shift, shift + size) of the chunk that starts
+// `shift` bytes earlier: find that start (4 KiB steps back, the stream must
+// decode completely) and keep the last chunks decoded, since the pieces of
+// one chunk arrive one after another.
+struct DecodedChunk {
+  const FileState* file = nullptr;
+  uint64_t start = 0, compressed = 0;
+  std::vector<uint8_t> data;
+};
+std::mutex g_chunk_mutex;
+std::vector<DecodedChunk> g_chunks;  // most recent last
+std::map<std::pair<const FileState*, uint64_t>, uint64_t> g_chunk_start;  // (file, bad offset) -> chunk start
+std::atomic<uint64_t> g_shifted_ok{0}, g_shifted_failed{0};
+
+constexpr uint64_t kMaxChunkShift = 0x40000, kMaxChunkBytes = 0x100000;
+
+const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t compressed) {
+  for (const DecodedChunk& c : g_chunks)
+    if (c.file == file && c.start == start && c.compressed == compressed) return &c;
+  std::vector<uint8_t> in(compressed);
+  if (!file->read(start, in.data(), in.size())) return nullptr;
+  DecodedChunk c{file, start, compressed, std::vector<uint8_t>(kMaxChunkBytes)};
+  size_t produced = 0;
+  if (inflate_auto(in.data(), in.size(), c.data.data(), c.data.size(), produced) != InflateResult::Ok) return nullptr;
+  c.data.resize(produced);
+  if (g_chunks.size() >= 8) g_chunks.erase(g_chunks.begin());
+  g_chunks.push_back(std::move(c));
+  return &g_chunks.back();
+}
+
+// Bytes [skip, skip + size) of the piece at `offset` (compressed size
+// `compressed`, the whole chunk's) into out[skip...]; false when no chunk
+// start before `offset` decodes.
+bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, uint64_t skip, uint64_t size,
+                         std::vector<uint8_t>& out, size_t& produced) {
+  std::lock_guard lock(g_chunk_mutex);
+  const auto key = std::make_pair(static_cast<const FileState*>(file), offset);
+  uint64_t start = UINT64_MAX;
+  if (auto it = g_chunk_start.find(key); it != g_chunk_start.end()) start = it->second;
+  const DecodedChunk* c = nullptr;
+  if (start != UINT64_MAX) {
+    c = decoded_chunk(file, start, compressed);
+  } else {
+    for (uint64_t shift = 0x1000; shift <= kMaxChunkShift && shift <= offset && !c; shift += 0x1000) {
+      c = decoded_chunk(file, offset - shift, compressed);
+      if (c && c->data.size() < shift + skip + size) c = nullptr;  // decodes, but too short to hold the piece
+      if (c) g_chunk_start[key] = start = offset - shift;
+    }
+  }
+  if (!c) {
+    if (g_shifted_failed.fetch_add(1) < 4)
+      XBEM_WARN("dstorage", "{}: no compressed chunk before {:#x} holds the piece", file->guest_path, offset);
+    return false;
+  }
+  const uint64_t from = offset - start + skip;
+  produced = from < c->data.size() ? std::min<uint64_t>(size, c->data.size() - from) : 0;
+  out.assign(skip + size, 0);
+  std::memcpy(out.data() + skip, c->data.data() + from, produced);
+  produced += skip;
+  if (g_shifted_ok.fetch_add(1) < 4)
+    XBEM_INFO("dstorage", "{}: piece at {:#x} is {:#x} bytes into the compressed chunk at {:#x} - delivered from it",
+              file->guest_path, offset, offset - start, start);
+  return true;
+}
+
 HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) {
   uint64_t w[12] = {};
   if (!request || !platform::safe_read(reinterpret_cast<uint64_t>(request), w, sizeof w)) return E_POINTER;
@@ -325,6 +396,9 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       whole.resize(skip + dest_size);
       r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
       if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+      if (r != InflateResult::Ok && compression == 1 &&
+          shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+        r = InflateResult::Ok;
     }
     if (r == InflateResult::Ok) {
       // An uncompressed source shorter than the window holds just the window.
@@ -362,7 +436,12 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   {
     std::vector<uint8_t> whole(skip + dest_size);
     r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
-    if (skip && r == InflateResult::OutputFull) r = InflateResult::Ok;  // the rest of the chunk is not wanted
+    // A piece shorter than its chunk (the title's int3 at +0x4ffd879): the
+    // rest of the chunk is not wanted.
+    if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+    if ((r == InflateResult::BadData || r == InflateResult::Truncated) && compression == 1 &&
+        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+      r = InflateResult::Ok;
     // (A physical destination only gets here with an undecodable format: its
     // `dest` is the frame number array, which is never written.)
     if (!physical) {
