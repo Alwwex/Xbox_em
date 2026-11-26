@@ -419,7 +419,7 @@ int cmd_gpu_translate(const Args& args) {
   }
   out("{}", shader.glsl);
   out("// {} slots, {} words:", shader.slots.size(), shader.slot_words);
-  static const char* kKinds[] = {"sgpr", "buffer", "texture", "sampler"};
+  static const char* kKinds[] = {"sgpr", "buffer", "texture", "sampler", "blocks"};
   for (const auto& s : shader.slots) out(" {}@{}:s{}", kKinds[static_cast<int>(s.kind)], s.instruction, s.sgpr);
   out("\n");
   return 0;

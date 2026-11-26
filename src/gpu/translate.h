@@ -36,6 +36,7 @@ enum class SlotKind : uint8_t {
   Buffer,   // 4 words: device address (lo, hi), stride, size limit (records)
   Texture,  // 4 words: bindless 2D index, image info (width | height << 16), 2D array index, 3D index
   Sampler,  // 1 word: bindless sampler index
+  Blocks,   // 1 word: bit n set when the scalar run executed basic block n (uniform branches)
 };
 
 struct Slot {
@@ -52,6 +53,7 @@ struct DecodedInstruction {
 
 struct Program {
   std::vector<DecodedInstruction> instructions;
+  std::vector<uint32_t> block_of;  // basic block of each instruction (uniform forward branches)
 };
 
 struct TranslatedShader {

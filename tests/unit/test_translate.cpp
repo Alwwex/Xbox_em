@@ -52,3 +52,33 @@ TEST(translate_readfirstlane_makes_a_gpu_side_sgpr) {
   CHECK(has(t, "uint sd16 = 0u;"));
   CHECK(t.slots.empty());  // nothing comes from the CPU
 }
+
+TEST(translate_uniform_branch_gates_blocks) {
+  // s_cmp_eq_u32 s0, 1 ; s_cbranch_scc0 +1 ; v_mov_b32 v1, 1.0 ; v_mov_b32 v2, 2.0 ; s_endpgm
+  const TranslatedShader t =
+      translate({0xbf068100, 0xbf840001, 0x7e0202f2, 0x7e0402f4, kEndpgm}, ShaderStage::Pixel);
+  CHECK(t.ok);
+  CHECK(has(t, "if ((D(0) & 0x2u) != 0u) {"));  // v1 = 1.0 sits in block 1
+  for (uint32_t s0 : {1u, 0u}) {
+    ScalarRun run;
+    run.sgpr[0] = s0;
+    run.read = [](uint64_t, void*, size_t) { return false; };
+    run.resolve = [](SlotKind, const uint32_t*, uint32_t*) {};
+    std::vector<uint32_t> words;
+    CHECK(run_scalar(t, run, words));
+    // s0 == 1: scc set, no branch - blocks 0, 1, 2; otherwise block 1 is skipped
+    CHECK_EQ(words[0], s0 == 1 ? 0x7u : 0x5u);
+  }
+}
+
+TEST(scalar_run_bitfield_mask) {
+  // s_bfm_b32 s2, 4, 8 ; v_mov_b32 v0, s2 ; s_endpgm (mask of 4 bits at bit 8)
+  const TranslatedShader t = translate({0x92028884, 0x7e000202, kEndpgm}, ShaderStage::Pixel);
+  CHECK(t.ok);
+  ScalarRun run;
+  run.read = [](uint64_t, void*, size_t) { return false; };
+  run.resolve = [](SlotKind, const uint32_t*, uint32_t*) {};
+  std::vector<uint32_t> words;
+  CHECK(run_scalar(t, run, words));
+  CHECK_EQ(words[0], 0xf00u);
+}

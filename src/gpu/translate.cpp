@@ -131,19 +131,73 @@ Vop vop_fields(const rdna2::Instruction& i) {
   return v;
 }
 
+// ------------------------------------------------------------ branches
+
+// SOPP branches: target pc = pc + 4 + simm16 * 4.
+bool is_branch(const rdna2::Instruction& i) {
+  return i.format == Format::Sopp && i.name && std::string_view(i.name).starts_with("s_") &&
+         (std::string_view(i.name) == "s_branch" || std::string_view(i.name).starts_with("s_cbranch_"));
+}
+uint32_t branch_target(const DecodedInstruction& d) {
+  const int32_t simm = static_cast<int16_t>(d.insn.words[0] & 0xffff);
+  return static_cast<uint32_t>(static_cast<int32_t>(d.pc) + 4 + simm * 4);
+}
+
 // ------------------------------------------------------------ translation
 
 class Translator {
  public:
   Translator(TranslatedShader& out) : out_(out) {}
 
+  // Basic blocks: split at branch targets and after branches. Only forward
+  // branches (no loops); each block's code runs when the scalar run (which
+  // follows the uniform branches on the CPU) reached it.
+  bool split_blocks() {
+    auto& insns = out_.program.instructions;
+    std::set<uint32_t> leaders{0};
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      if (!is_branch(insns[k].insn)) continue;
+      const uint32_t target = branch_target(insns[k]);
+      if (target <= insns[k].pc) {
+        index_ = k;
+        return fail("loop (backward branch)");
+      }
+      leaders.insert(target);
+      if (k + 1 < insns.size()) leaders.insert(insns[k + 1].pc);
+    }
+    out_.program.block_of.assign(insns.size(), 0);
+    uint32_t block = 0;
+    for (uint32_t k = 0; k < insns.size(); ++k) {
+      if (k && leaders.count(insns[k].pc)) ++block;
+      out_.program.block_of[k] = block;
+    }
+    blocks_ = block + 1;
+    if (blocks_ > 32) return fail("more than 32 basic blocks");
+    last_leader_pc_ = *leaders.rbegin();
+    return true;
+  }
+
   bool run() {
     body_.reserve(8192);
+    if (!split_blocks()) return false;
+    uint32_t mask_slot = 0, open_block = ~0u;
+    if (blocks_ > 1) {
+      index_ = 0;
+      mask_slot = add_slot(SlotKind::Blocks, 0, 1);
+    }
     for (uint32_t k = 0; k < out_.program.instructions.size(); ++k) {
       index_ = k;
       const rdna2::Instruction& insn = out_.program.instructions[k].insn;
+      if (blocks_ > 1 && out_.program.block_of[k] != open_block) {
+        if (open_block != ~0u) line("}");
+        open_block = out_.program.block_of[k];
+        line(std::format("if ((D({}) & {:#x}u) != 0u) {{", mask_slot, 1u << open_block));
+      }
       if (is_scalar(insn.format)) {
-        if (name_of(insn) == "s_endpgm") break;
+        if (name_of(insn) == "s_endpgm") {
+          if (out_.program.instructions[k].pc >= last_leader_pc_) break;
+          continue;  // later blocks are reached by branches
+        }
         if (!scalar_on_gpu(insn)) return false;
         continue;  // runs on the CPU (unless it reads an SGPR only the GPU knows)
       }
@@ -160,6 +214,7 @@ class Translator {
       }
       if (!emit(insn)) return false;
     }
+    if (open_block != ~0u) line("}");
     finish();
     return true;
   }
@@ -793,7 +848,8 @@ class Translator {
   uint32_t max_vgpr_ = 0;
   bool wrote_position_ = false;
   std::set<uint32_t> flat_inputs_;
-  std::array<bool, 106> dyn_{};  // SGPRs whose value only the GPU knows (from v_readfirstlane_b32)
+  std::array<bool, 106> dyn_{};
+  uint32_t blocks_ = 1, last_leader_pc_ = 0;  // SGPRs whose value only the GPU knows (from v_readfirstlane_b32)
 };
 
 // ------------------------------------------------------------ scalar run
@@ -904,6 +960,22 @@ bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool
       else if (n == "s_lshl3_add_u32") r = (a << 3) + b;
       else if (n == "s_lshl4_add_u32") r = (a << 4) + b;
       else if (n == "s_pack_ll_b32_b16") r = (a & 0xffff) | (b << 16);
+      else if (n == "s_pack_lh_b32_b16") r = (a & 0xffff) | (b & 0xffff0000u);
+      else if (n == "s_pack_hh_b32_b16") r = (a >> 16) | (b & 0xffff0000u);
+      else if (n == "s_bfm_b32") r = (((a & 31) ? (1u << (a & 31)) : 0u) - 1u) << (b & 31);
+      else if (n == "s_bfe_i32") {
+        const uint32_t off = b & 31, width = (b >> 16) & 0x7f;
+        const int32_t v = static_cast<int32_t>(a);
+        r = width == 0 ? 0 : width >= 32 ? static_cast<uint32_t>(v >> off)
+                        : static_cast<uint32_t>((v << (32 - off - std::min(width, 32 - off))) >> (32 - std::min(width, 32 - off)));
+        scc = r != 0;
+      } else if (n == "s_mul_hi_u32") r = static_cast<uint32_t>((uint64_t{a} * b) >> 32);
+      else if (n == "s_mul_hi_i32") r = static_cast<uint32_t>((int64_t{static_cast<int32_t>(a)} * static_cast<int32_t>(b)) >> 32);
+      else if (n == "s_absdiff_i32") r = static_cast<uint32_t>(std::abs(static_cast<int32_t>(a) - static_cast<int32_t>(b))), scc = r != 0;
+      else if (n == "s_nand_b32") r = ~(a & b), scc = r != 0;
+      else if (n == "s_nor_b32") r = ~(a | b), scc = r != 0;
+      else if (n == "s_xnor_b32") r = ~(a ^ b), scc = r != 0;
+      else if (n == "s_orn2_b32") r = a | ~b, scc = r != 0;
       else return run.error = std::string(n), false;
       s[dst] = r;
       return ok;
@@ -916,6 +988,12 @@ bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool
       else if (n == "s_cmp_gt_u32") scc = a > b;
       else if (n == "s_cmp_ge_u32") scc = a >= b;
       else if (n == "s_cmp_le_u32") scc = a <= b;
+      else if (n == "s_cmp_lt_i32") scc = static_cast<int32_t>(a) < static_cast<int32_t>(b);
+      else if (n == "s_cmp_gt_i32") scc = static_cast<int32_t>(a) > static_cast<int32_t>(b);
+      else if (n == "s_cmp_ge_i32") scc = static_cast<int32_t>(a) >= static_cast<int32_t>(b);
+      else if (n == "s_cmp_le_i32") scc = static_cast<int32_t>(a) <= static_cast<int32_t>(b);
+      else if (n == "s_bitcmp0_b32") scc = ((a >> (b & 31)) & 1) == 0;
+      else if (n == "s_bitcmp1_b32") scc = ((a >> (b & 31)) & 1) != 0;
       else return run.error = std::string(n), false;
       return ok;
     }
@@ -978,20 +1056,54 @@ bool run_scalar(const TranslatedShader& shader, ScalarRun& run, std::vector<uint
   words.assign(shader.slot_words, 0);
   run.sgpr[kExecLo] = run.sgpr[kExecHi] = 0xffffffffu;
   bool scc = false, stop = false;
-  size_t next_slot = 0;
   const auto& insns = shader.program.instructions;
-  for (uint32_t k = 0; k < insns.size() && !stop; ++k) {
+  // Slots by instruction (captured when that instruction is reached).
+  std::vector<uint32_t> first(insns.size() + 1, static_cast<uint32_t>(shader.slots.size()));
+  for (uint32_t i = static_cast<uint32_t>(shader.slots.size()); i-- > 0;) first[shader.slots[i].instruction] = i;
+  for (uint32_t k = static_cast<uint32_t>(insns.size()); k-- > 0;) first[k] = std::min(first[k], first[k + 1]);
+  uint32_t visited = 0;
+  int64_t mask_offset = -1;
+  for (const Slot& slot : shader.slots)
+    if (slot.kind == SlotKind::Blocks) mask_offset = slot.offset;
+  for (uint32_t k = 0, steps = 0; k < insns.size() && !stop && steps < 100000; ++steps) {
+    if (k < shader.program.block_of.size()) visited |= 1u << shader.program.block_of[k];
     // Values the vector instruction at k reads, as they are before it runs.
-    for (; next_slot < shader.slots.size() && shader.slots[next_slot].instruction == k; ++next_slot) {
-      const Slot& slot = shader.slots[next_slot];
+    for (uint32_t i = first[k]; i < shader.slots.size() && shader.slots[i].instruction == k; ++i) {
+      const Slot& slot = shader.slots[i];
+      if (slot.kind == SlotKind::Blocks) continue;
       if (slot.kind == SlotKind::Sgpr) words[slot.offset] = run.sgpr[slot.sgpr];
       else run.resolve(slot.kind, &run.sgpr[slot.sgpr], &words[slot.offset]);
     }
-    if (is_scalar(insns[k].insn.format) && !scalar_step(insns[k].insn, run, scc, stop)) {
+    const rdna2::Instruction& insn = insns[k].insn;
+    if (is_branch(insn)) {
+      const std::string_view n = insn.name;
+      bool taken;
+      if (n == "s_branch") taken = true;
+      else if (n == "s_cbranch_scc0") taken = !scc;
+      else if (n == "s_cbranch_scc1") taken = scc;
+      else if (n == "s_cbranch_execz") taken = false;  // all lanes are active
+      else if (n == "s_cbranch_execnz") taken = true;
+      else {
+        run.error = std::format("+{:#x}: {} (branch on a per-lane condition)", insns[k].pc, n);
+        return false;
+      }
+      if (taken) {
+        const uint32_t target = branch_target(insns[k]);
+        uint32_t t = k + 1;
+        while (t < insns.size() && insns[t].pc < target) ++t;
+        k = t;
+        continue;
+      }
+      ++k;
+      continue;
+    }
+    if (is_scalar(insn.format) && !scalar_step(insn, run, scc, stop)) {
       run.error = std::format("+{:#x}: {}", insns[k].pc, run.error);
       return false;
     }
+    ++k;
   }
+  if (mask_offset >= 0) words[static_cast<size_t>(mask_offset)] = visited;
   return true;
 }
 
