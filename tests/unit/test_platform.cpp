@@ -61,3 +61,90 @@ TEST(window_surface_row_conversion) {
   CHECK(out[0] == 0xff8000u);
   CHECK(!xbem::platform::convert_surface_row(rgba, 71, 1, 1, out));  // BC1: not shown
 }
+
+#if defined(__linux__)
+#include <algorithm>
+
+#include "platform/page_tracker.h"
+
+namespace {
+uint16_t written_mask(const platform::pages::Changes& c, uint64_t id) {
+  for (const auto& [i, m] : c.written)
+    if (i == id) return m;
+  return 0;
+}
+}  // namespace
+
+// Page ids, aliasing and write detection for the GPU memory mirror.
+TEST(page_tracker_ids_and_writes) {
+  namespace pg = platform::pages;
+  const uint64_t P = pg::kPageSize;
+  pg::Changes c;
+  pg::collect(c);  // drop what earlier tests left
+  void* anon = platform::map_guest(4 * P, P, platform::Prot::RW);
+  CHECK(anon != nullptr);
+  const auto a = reinterpret_cast<uint64_t>(anon);
+  CHECK(a < pg::kLimit);
+  CHECK_EQ(pg::page_id(a + P + 0x123), a + P);  // anonymous: the address itself
+
+  // Two views of one physical page.
+  const intptr_t mem = platform::create_shared_memory(16 * P);
+  CHECK(mem >= 0);
+  void* v1 = platform::map_guest(P, P, platform::Prot::RW);
+  void* v2 = platform::map_guest(P, P, platform::Prot::RW);
+  const auto b1 = reinterpret_cast<uint64_t>(v1), b2 = reinterpret_cast<uint64_t>(v2);
+  CHECK(platform::map_shared(b1, P, platform::Prot::RW, mem, 3 * P));
+  CHECK(platform::map_shared(b2, P, platform::Prot::RW, mem, 3 * P));
+  const uint64_t phys = pg::kSharedId | (3 * P);
+  CHECK_EQ(pg::page_id(b1), phys);
+  CHECK_EQ(pg::page_id(b2 + 0x8000), phys);
+
+  pg::watch(a + P);
+  pg::watch(phys);
+  pg::collect(c);
+  CHECK(std::find_if(c.remapped.begin(), c.remapped.end(), [&](auto& r) { return r.first == b2; }) == c.remapped.end());
+  if (pg::write_tracking()) {
+    CHECK_EQ(written_mask(c, a + P), 0);  // watch() protected them: nothing written yet
+    CHECK_EQ(written_mask(c, phys), 0);
+  }
+
+  static_cast<volatile uint8_t*>(anon)[P + 0x2010] = 1;  // part 2 of the watched anonymous page
+  static_cast<volatile uint8_t*>(anon)[3 * P] = 1;       // not watched
+  static_cast<volatile uint8_t*>(v2)[0x5000] = 7;        // through the second view: part 5
+  const uint8_t bytes[4] = {1, 2, 3, 4};
+  CHECK(platform::write_shared(mem, 3 * P + 0xf000, bytes, 4));  // the object itself: part 15
+  pg::collect(c);
+  if (pg::write_tracking()) {
+    CHECK_EQ(written_mask(c, a + P), 1u << 2);
+    CHECK_EQ(written_mask(c, phys), (1u << 5) | (1u << 15));
+    CHECK_EQ(written_mask(c, a + 3 * P), 0);
+    pg::collect(c);
+    CHECK(c.written.empty());  // collected writes are re-armed
+  } else {
+    CHECK_EQ(written_mask(c, phys), 0xffff);
+  }
+
+  // Contents by id; GPU write-back is not a guest write.
+  uint8_t page[0x10000];
+  CHECK(pg::read_page(phys, page));
+  CHECK(page[0x5000] == 7 && page[0xf002] == 3);
+  page[0x1000] = 9;
+  CHECK(pg::write_page(phys, page, 1u << 1));
+  CHECK(static_cast<uint8_t*>(v1)[0x1000] == 9);
+  pg::collect(c);
+  if (pg::write_tracking()) CHECK_EQ(written_mask(c, phys), 0);
+
+  // A new mapping at a watched address is reported.
+  CHECK(platform::remap_anonymous(b1, P, platform::Prot::RW));
+  CHECK_EQ(pg::page_id(b1), b1);
+  pg::collect(c);
+  CHECK(std::find_if(c.remapped.begin(), c.remapped.end(), [&](auto& r) { return r.first == b1; }) != c.remapped.end());
+
+  pg::unwatch(a + P);
+  pg::unwatch(phys);
+  platform::unmap(anon, 4 * P);
+  platform::unmap(v1, P);
+  platform::unmap(v2, P);
+  CHECK_EQ(pg::page_id(a), 0u);
+}
+#endif

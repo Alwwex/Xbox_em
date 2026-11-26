@@ -1,5 +1,7 @@
 #include "platform/memory.h"
 
+#include "platform/page_tracker.h"
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -61,7 +63,7 @@ intptr_t create_shared_memory(uint64_t) { return -1; }
 bool map_shared(uint64_t, size_t, Prot, intptr_t, uint64_t) { return false; }
 bool remap_anonymous(uint64_t, size_t, Prot) { return false; }
 bool discard_shared(intptr_t, uint64_t, size_t) { return false; }
-bool write_shared(intptr_t, uint64_t, const void*, size_t) { return false; }
+bool write_shared(intptr_t, uint64_t, const void*, size_t, bool) { return false; }
 
 bool safe_write(uint64_t address, const void* data, size_t size) {
   SIZE_T done = 0;
@@ -141,7 +143,9 @@ bool arena_ready(Arena& a) {
 bool arena_commit(uint64_t start, uint64_t size, Prot prot) {
   void* p = mmap(reinterpret_cast<void*>(start), size, to_native(prot),
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-  return p != MAP_FAILED;
+  if (p == MAP_FAILED) return false;
+  pages::mapped_anonymous(start, size);
+  return true;
 }
 // Removes [start, start+size) from the free list if all of it is free.
 bool arena_take(Arena& a, uint64_t start, uint64_t size) {
@@ -223,6 +227,7 @@ void* map_fixed(uint64_t address, size_t size, Prot prot) {
     munmap(p, size);
     return nullptr;
   }
+  pages::mapped_anonymous(address, align_up(size, page_size()));
   return p;
 }
 
@@ -254,16 +259,20 @@ bool unmap(void* address, size_t size) {
       void* p = mmap(address, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
       if (p == MAP_FAILED) return false;
       arena_give_back(a, start, length);
+      pages::unmapped(start, length);
       return true;
     }
   }
-  return munmap(address, size) == 0;
+  if (munmap(address, size) != 0) return false;
+  pages::unmapped(start, align_up(size, page_size()));
+  return true;
 }
 
 bool protect(void* address, size_t size, Prot prot) { return mprotect(address, size, to_native(prot)) == 0; }
 
 bool decommit(void* address, size_t size) {
   madvise(address, size, MADV_DONTNEED);
+  pages::mapped_anonymous(reinterpret_cast<uint64_t>(address), align_up(size, page_size()));  // contents reset
   return mprotect(address, size, PROT_NONE) == 0;
 }
 
@@ -280,21 +289,27 @@ intptr_t create_shared_memory(uint64_t size) {
 bool map_shared(uint64_t address, size_t size, Prot prot, intptr_t memory, uint64_t offset) {
   void* p = mmap(reinterpret_cast<void*>(address), size, to_native(prot), MAP_SHARED | MAP_FIXED,
                  static_cast<int>(memory), static_cast<off_t>(offset));
-  return p != MAP_FAILED;
+  if (p == MAP_FAILED) return false;
+  pages::mapped_shared(address, size, memory, offset);
+  return true;
 }
 
 bool remap_anonymous(uint64_t address, size_t size, Prot prot) {
   void* p = mmap(reinterpret_cast<void*>(address), size, to_native(prot),
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-  return p != MAP_FAILED;
+  if (p == MAP_FAILED) return false;
+  pages::mapped_anonymous(address, size);
+  return true;
 }
 
 bool discard_shared(intptr_t memory, uint64_t offset, size_t size) {
+  pages::shared_written(offset, size);
   return fallocate(static_cast<int>(memory), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
                    static_cast<off_t>(size)) == 0;
 }
 
-bool write_shared(intptr_t memory, uint64_t offset, const void* data, size_t size) {
+bool write_shared(intptr_t memory, uint64_t offset, const void* data, size_t size, bool report) {
+  if (report) pages::shared_written(offset, size);
   const auto* p = static_cast<const uint8_t*>(data);
   while (size) {
     const ssize_t n = pwrite(static_cast<int>(memory), p, size, static_cast<off_t>(offset));

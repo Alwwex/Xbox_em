@@ -50,8 +50,10 @@ bool map_shared(uint64_t address, size_t size, Prot prot, intptr_t memory, uint6
 bool remap_anonymous(uint64_t address, size_t size, Prot prot);
 // Releases the host memory behind a range of the shared object (contents become zero).
 bool discard_shared(intptr_t memory, uint64_t offset, size_t size);
-// Writes into the shared object directly (whether or not the range is mapped anywhere).
-bool write_shared(intptr_t memory, uint64_t offset, const void* data, size_t size);
+// Writes into the shared object directly (whether or not the range is mapped
+// anywhere). `report`: tell the page tracker (platform/page_tracker.h), so GPU
+// copies of those pages are refreshed.
+bool write_shared(intptr_t memory, uint64_t offset, const void* data, size_t size, bool report = true);
 
 inline uint64_t align_down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 inline uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
