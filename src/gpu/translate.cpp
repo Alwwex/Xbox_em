@@ -47,6 +47,43 @@ bool inline_constant(uint32_t src, uint32_t& value) {
 std::string_view name_of(const rdna2::Instruction& i) { return i.name ? i.name : ""; }
 bool starts(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
+// Depth compare of four texels against a reference (S# compare function:
+// never, less, equal, less-equal, greater, not-equal, greater-equal, always;
+// reference OP texel), 1.0 where it passes.
+constexpr const char* kCmpDepth =
+    "vec4 cmp_depth(float r, vec4 t, uint f) {\n"
+    "  bvec4 lt = lessThan(vec4(r), t), eq = equal(vec4(r), t), gt = greaterThan(vec4(r), t);\n"
+    "  bvec4 p = bvec4(f == 7u);\n"
+    "  if (f == 1u) p = lt; else if (f == 2u) p = eq; else if (f == 3u) p = not(gt);\n"
+    "  else if (f == 4u) p = gt; else if (f == 5u) p = not(eq); else if (f == 6u) p = not(lt);\n"
+    "  return vec4(p);\n"
+    "}\n"
+    // Cube map face selection (v_cubeid/ma/sc/tc): major axis z, then y, then x.
+    "float cubeid(vec3 v) {\n"
+    "  vec3 a = abs(v);\n"
+    "  if (a.z >= a.x && a.z >= a.y) return v.z < 0.0 ? 5.0 : 4.0;\n"
+    "  if (a.y >= a.x) return v.y < 0.0 ? 3.0 : 2.0;\n"
+    "  return v.x < 0.0 ? 1.0 : 0.0;\n"
+    "}\n"
+    "float cubema(vec3 v) {\n"
+    "  vec3 a = abs(v);\n"
+    "  if (a.z >= a.x && a.z >= a.y) return 2.0 * v.z;\n"
+    "  if (a.y >= a.x) return 2.0 * v.y;\n"
+    "  return 2.0 * v.x;\n"
+    "}\n"
+    "float cubesc(vec3 v) {\n"
+    "  vec3 a = abs(v);\n"
+    "  if (a.z >= a.x && a.z >= a.y) return v.z < 0.0 ? -v.x : v.x;\n"
+    "  if (a.y >= a.x) return v.x;\n"
+    "  return v.x < 0.0 ? v.z : -v.z;\n"
+    "}\n"
+    "float cubetc(vec3 v) {\n"
+    "  vec3 a = abs(v);\n"
+    "  if (a.z >= a.x && a.z >= a.y) return -v.y;\n"
+    "  if (a.y >= a.x) return v.y < 0.0 ? -v.z : v.z;\n"
+    "  return -v.y;\n"
+    "}\n";
+
 bool is_scalar(Format f) {
   return f == Format::Sop1 || f == Format::Sop2 || f == Format::Sopk || f == Format::Sopc || f == Format::Sopp ||
          f == Format::Smem;
@@ -978,7 +1015,7 @@ class Translator {
          "layout(set = 0, binding = 4) uniform image2D images[];\n"
          "layout(set = 0, binding = 5) uniform image2DArray images_a[];\n"
          "layout(set = 0, binding = 6) uniform image3D images_3d[];\n"
-         "uint D(uint i) { return Words(pc.data).w[i]; }\n"
+         "uint D(uint i) { return Words(pc.data).w[i]; }\n" + std::string(kCmpDepth) +
          "uint ld32(uint64_t a) {\n"
          "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
          "  uint w0 = Words(gpa(al)).w[0];\n"
@@ -1166,10 +1203,10 @@ class Translator {
                           !(starts(n, "v_cvt_f32_") && (n.ends_with("_u32") || n.ends_with("_i32") || n.find("ubyte") != std::string_view::npos)) &&
                           !(starts(n, "v_cvt_f16_") && (n.ends_with("_u16") || n.ends_with("_i16")));
     // A half-precision operation reads its operand from the selected word;
-    // v_cmp_class's second operand is an integer mask.
+    // v_cmp(x)_class's second operand is an integer mask.
     const bool f16_source = n.ends_with("_f16");
     for (int k = 0; k < (insn.format == Format::Vop1 ? 1 : 2); ++k) {
-      const bool float_operand = is_float && !(k == 1 && starts(n, "v_cmp_class"));
+      const bool float_operand = is_float && !(k == 1 && (starts(n, "v_cmp_class") || starts(n, "v_cmpx_class")));
       if (float_operand && !f16_source && v.sel[k] != 6) return fail("SDWA sub-dword float operand");
       std::string u;
       if (!src(v.src[k], insn, u)) return false;
@@ -1433,6 +1470,12 @@ class Translator {
       return true;
     }
     if (n == "v_bcnt_u32_b32") return u2("uint(bitCount({})) + {}");
+    if (n == "v_bfm_b32") return u2("((1u << ({} & 31u)) - 1u) << ({} & 31u)");
+    if (n == "v_ldexp_f32") {
+      if (!fsrc(v, 0, insn, a) || !src(v.src[1], insn, b)) return false;
+      line(std::format("{} = {};", vreg(v.dst), fresult(v, std::format("ldexp({}, clamp(int({}), -256, 256))", a, b))));
+      return true;
+    }
     if (n == "v_mbcnt_lo_u32_b32" && wave_) return u2("uint(bitCount({} & ((1u << lane) - 1u))) + {}");
     if (n == "v_mbcnt_hi_u32_b32" && wave_) return u2("(0u * {}) + {}");  // wave32: no lanes 32-63
     if (n == "v_add_lshl_u32" || n == "v_lshl_add_u32" || n == "v_bfi_b32" || n == "v_alignbit_b32" ||
@@ -1468,6 +1511,18 @@ class Translator {
         return true;
       }
       line(std::format("{} = {};", vreg(v.dst), e));
+      return true;
+    }
+    if (n == "v_cubeid_f32" || n == "v_cubema_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32") {
+      if (!fsrc(v, 0, insn, a) || !fsrc(v, 1, insn, b) || !fsrc(v, 2, insn, c)) return false;
+      line(std::format("{} = {};", vreg(v.dst), fresult(v, std::format("{}(vec3({}, {}, {}))", n.substr(2, 6), a, b, c))));
+      return true;
+    }
+    if (n == "v_cvt_pk_u8_f32") {
+      // Byte (src1 & 3) of src2 = src0 rounded and clamped to [0, 255].
+      if (!fsrc(v, 0, insn, a) || !src(v.src[1], insn, b) || !src(v.src[2], insn, c)) return false;
+      line(std::format("{} = bitfieldInsert({}, uint(clamp(roundEven({}), 0.0, 255.0)), int(({} & 3u) * 8u), 8);",
+                       vreg(v.dst), c, a, b));
       return true;
     }
     if (n == "v_med3_f32" || n == "v_min3_f32" || n == "v_max3_f32") {
@@ -1842,8 +1897,13 @@ class Translator {
       line(std::format("imageStore({}, {}, vec4({}, {}, {}, {}));", target, coord, comps[0], comps[1], comps[2], comps[3]));
       return true;
     }
-    // dim: 1 2D, 2 3D, 5 2D array (others not yet). The texture slot holds
-    // the image's index in each bindless array: 2D, 2D array, 3D.
+    // dim: 1 2D, 2 3D, 3 cube, 5 2D array (others not yet). The texture slot
+    // holds the image's index in each bindless array: 2D, 2D array, 3D. A
+    // cube is a 2D texture of 6 layers: its coordinates arrive already
+    // projected (v_cubesc/tc / |ma| + 1.5, face id), so it is sampled as a
+    // 2D array (no filtering across faces).
+    const bool cube = dim == 3 && sampling;
+    if (cube) dim = 5;
     if (dim != 1 && dim != 2 && dim != 5) return fail(std::format("image dimension {}", dim));
     const std::string tex = image_words(SlotKind::Texture, srsrc);
     const char* type = dim == 1 ? "sampler2D" : dim == 2 ? "sampler3D" : "sampler2DArray";
@@ -1857,30 +1917,82 @@ class Translator {
     };
     const int coords = dim == 1 ? 2 : 3;
     std::string value;
-    if (n == "image_sample" || n == "image_sample_lz" || n == "image_sample_l" || n == "image_sample_b") {
+    if (starts(n, "image_sample") || starts(n, "image_gather4")) {
+      // Name: image_sample|image_gather4 [_c] [_lz|_l|_b] [_o]. Address
+      // operands in order: offset (_o), bias (_b), depth reference (_c),
+      // coordinates, lod (_l).
+      const bool gather = starts(n, "image_gather4");
+      std::string_view rest = n.substr(gather ? 13 : 12);
+      const bool has_offset = rest.ends_with("_o");
+      if (has_offset) rest.remove_suffix(2);
+      const bool compare = starts(rest, "_c") && !starts(rest, "_cl");
+      if (compare) rest.remove_prefix(2);
+      if (!rest.empty() && rest != "_lz" && rest != "_l" && rest != "_b") return fail("");
+      if (dim == 2 && (gather || compare)) return fail("gather or compare on a 3D image");
+      uint32_t a = 0;
+      const std::string offset = has_offset ? addr_reg(a++) : "";
+      const std::string bias = rest == "_b" ? addr_reg(a++) : "";
+      const std::string ref = compare ? addr_reg(a++) : "";
+      // Coordinate j after the prefix operands (a 1D image's y is constant;
+      // later operands such as the lod shift down by one).
+      const uint32_t base = a;
+      const auto C = [&](uint32_t j) {
+        if (!one_d) return addr_reg(base + j);
+        if (j == 1) return std::string("0x3f000000u");
+        return addr_reg(base + (j > 1 ? j - 1 : j));
+      };
       const std::string smp = sampler_index();
-      // image_sample_b takes the bias before the coordinates, _l the lod after.
-      const uint32_t c = n == "image_sample_b" ? 1 : 0;
-      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(c), A(c + 1));
-      if (coords == 3)
-        coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(c + 2))
-                          : std::format(", uintBitsToFloat({})", A(c + 2));
-      coord = std::format("vec{}({})", coords, coord);
       const std::string sampler = std::format("{}({}, samplers[nonuniformEXT({})])", type, array, smp);
-      if (n == "image_sample_lz") value = std::format("textureLod({}, {}, 0.0)", sampler, coord);
-      else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, A(c + coords));
-      else value = std::format("texture({}, {})", sampler, coord);
-    } else if (n == "image_gather4_lz" || n == "image_gather4" || n == "image_gather4_l") {
-      const std::string smp = sampler_index();
-      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(0), A(1));
-      if (coords == 3) coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(2)) : std::format(", uintBitsToFloat({})", A(2));
-      const int comp = dmask & 1 ? 0 : dmask & 2 ? 1 : dmask & 4 ? 2 : 3;
-      if (dim == 2) return fail("gather from a 3D image");
-      value = std::format("textureGather({}({}, samplers[nonuniformEXT({})]), vec{}({}), {})", type, array, smp, coords,
-                          coord, comp);
+      const std::string tsize = std::format("vec{}(textureSize({}, 0))", coords, sampler);
       line("{");
+      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", C(0), C(1));
+      if (coords == 3)
+        coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", C(2)) : std::format(", uintBitsToFloat({})", C(2));
+      line(std::format("  vec{} uv = vec{}({});", coords, coords, coord));
+      if (cube) line("  uv.xy -= 1.0;");
+      if (has_offset) {
+        // Texel offsets: signed 6-bit x, y, z in bytes 0-2.
+        line(std::format("  uint o = {};", offset));
+        line("  ivec3 io = ivec3(int(o << 26) >> 26, int(o << 18) >> 26, int(o << 10) >> 26);");
+        if (dim == 2) line(std::format("  uv += vec3(io) / {};", tsize));
+        else line(std::format("  uv.xy += vec2(io.xy) / {}.xy;", tsize));
+      }
+      const std::string lod = rest == "_l" ? std::format("uintBitsToFloat({})", C(coords)) : "0.0";
+      if (compare) {
+        // Depth compare (shadow maps) done by hand: the four texels of the
+        // bilinear footprint against the reference, filtered by the sampler's
+        // filter (point = nearest of the four). Compare function: S# dword 0
+        // bits 12-14, result = reference OP texel.
+        std::string w0;
+        if (gpu_samp_.count(index_)) w0 = sreg(ssamp);
+        else if (!src(ssamp, insn, w0)) return false;
+        line(std::format("  vec4 g = cmp_depth(uintBitsToFloat({}), textureGather({}, uv, 0), ({} >> 12) & 7u);", ref,
+                         sampler, w0));
+        if (gather) {
+          value = "g";
+        } else {
+          line(std::format("  vec2 f = fract(uv.xy * {}.xy - 0.5);", tsize));
+          line(std::format("  if (({} & 1u) == 0u) f = step(vec2(0.5), f);", smp));
+          value = "vec4(mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y), 0.0, 0.0, 1.0)";
+        }
+      } else if (gather) {
+        const int comp = dmask & 1 ? 0 : dmask & 2 ? 1 : dmask & 4 ? 2 : 3;
+        value = std::format("textureGather({}, uv, {})", sampler, comp);
+      } else if (rest == "_lz" || rest == "_l") {
+        value = std::format("textureLod({}, uv, {})", sampler, lod);
+      } else if (rest == "_b") {
+        value = std::format("texture({}, uv, uintBitsToFloat({}))", sampler, bias);
+      } else {
+        value = std::format("texture({}, uv)", sampler);
+      }
       line(std::format("  vec4 t = {};", value));
-      for (int k = 0; k < 4; ++k) line(std::format("  {} = floatBitsToUint(t.{});", vreg(vdata + k), "xyzw"[k]));
+      if (gather) {
+        for (int k = 0; k < 4; ++k) line(std::format("  {} = floatBitsToUint(t.{});", vreg(vdata + k), "xyzw"[k]));
+      } else {
+        uint32_t r = vdata;
+        for (int k = 0; k < 4; ++k)
+          if (dmask & (1u << k)) line(std::format("  {} = floatBitsToUint(t.{});", vreg(r++), "xyzw"[k]));
+      }
       line("}");
       return true;
     } else if (n == "image_load") {
@@ -2031,6 +2143,7 @@ class Translator {
                     "layout(set = 0, binding = 3) uniform texture3D textures_3d[];\n"
                     "layout(set = 0, binding = 1) uniform sampler samplers[];\n"
                     "uint D(uint i) { return Words(pc.data).w[i]; }\n"
+                    "%CMP%"
                     "%MEM%"
                     "uint ld32(uint64_t a) {\n"
                     "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
@@ -2038,6 +2151,7 @@ class Translator {
                     "  if (sh == 0u) return w0;\n"
                     "  return (w0 >> sh) | (Words(gpa(al + 4ul)).w[0] << (32u - sh));\n"
                     "}\n";
+    g.replace(g.find("%CMP%"), 5, kCmpDepth);
     g.replace(g.find("%MEM%"), 5, mem::glsl_helpers(false));
     // Push constants: the vertex stage's per-draw words at offset 0, the pixel stage's at 8, the
     // guest memory table at 16.
