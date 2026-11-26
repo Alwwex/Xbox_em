@@ -907,7 +907,6 @@ class Translator {
          "layout(set = 0, binding = 4) uniform image2D images[];\n"
          "layout(set = 0, binding = 5) uniform image2DArray images_a[];\n"
          "layout(set = 0, binding = 6) uniform image3D images_3d[];\n"
-         "layout(set = 0, binding = 7) uniform image1D images_1d[];\n"
          "uint D(uint i) { return Words(pc.data).w[i]; }\n"
          "uint ld32(uint64_t a) {\n"
          "  uint64_t al = a & ~uint64_t(3); uint sh = uint(a & uint64_t(3)) * 8u;\n"
@@ -1593,22 +1592,33 @@ class Translator {
   bool emit_mimg(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
     const uint32_t w0 = insn.words[0], w1 = insn.words[1];
-    const uint32_t dmask = (w0 >> 8) & 0xf, dim = (w0 >> 3) & 7, nsa = (w0 >> 1) & 3;
+    const uint32_t dmask = (w0 >> 8) & 0xf, nsa = (w0 >> 1) & 3;
+    uint32_t dim = (w0 >> 3) & 7;
+    // 1D images are 2D images of height 1 (y = 0 / the texel row's centre).
+    const bool one_d = dim == 0;
+    if (one_d) dim = 1;
     const uint32_t vaddr = w1 & 0xff, vdata = (w1 >> 8) & 0xff, srsrc = ((w1 >> 16) & 0x1f) * 4,
                    ssamp = ((w1 >> 21) & 0x1f) * 4;
     // Address VGPR i: consecutive from vaddr, or listed one per byte after
     // the two instruction dwords (NSA encoding).
-    const auto A = [&](uint32_t i) {
+    const auto addr_reg = [&](uint32_t i) {
       if (!nsa || i == 0) return vreg(vaddr + i);
       const uint32_t b = i - 1;
       return vreg((insn.words[2 + b / 4] >> ((b % 4) * 8)) & 0xff);
+    };
+    // Coordinate i (a 1D image's y is a constant: 0.5 for sampling, 0 for loads;
+    // later operands such as the lod shift down by one).
+    const bool sampling = starts(n, "image_sample") || starts(n, "image_gather");
+    const auto A = [&](uint32_t i) {
+      if (!one_d) return addr_reg(i);
+      if (i == 1) return std::string(sampling ? "0x3f000000u" : "0u");
+      return addr_reg(i > 1 ? i - 1 : i);
     };
     if (wave_ && (n == "image_store" || n == "image_store_mip")) {
       // UAV writes: storage images by the same dimension.
       const uint32_t img = add_slot(SlotKind::Image, srsrc, 4);
       std::string target, coord;
-      if (dim == 0) target = std::format("images_1d[nonuniformEXT(D({}))]", img), coord = std::format("int({})", A(0));
-      else if (dim == 1) target = std::format("images[nonuniformEXT(D({}))]", img + 1), coord = std::format("ivec2(int({}), int({}))", A(0), A(1));
+      if (dim == 1) target = std::format("images[nonuniformEXT(D({}))]", img + 1), coord = std::format("ivec2(int({}), int({}))", A(0), A(1));
       else if (dim == 2) target = std::format("images_3d[nonuniformEXT(D({}))]", img + 3), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
       else if (dim == 5) target = std::format("images_a[nonuniformEXT(D({}))]", img + 2), coord = std::format("ivec3(int({}), int({}), int({}))", A(0), A(1), A(2));
       else return fail(std::format("image_store dimension {}", dim));

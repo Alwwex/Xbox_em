@@ -62,6 +62,7 @@ namespace xbem::gpu::vk {
   X(vkCreateDescriptorSetLayout)                 \
   X(vkCreatePipelineLayout)                      \
   X(vkCreateGraphicsPipelines)                   \
+  X(vkCreateComputePipelines)                    \
   X(vkCreateDescriptorPool)                      \
   X(vkAllocateDescriptorSets)                    \
   X(vkUpdateDescriptorSets)                      \
@@ -80,6 +81,7 @@ namespace xbem::gpu::vk {
   X(vkCmdSetViewport)                            \
   X(vkCmdSetScissor)                             \
   X(vkCmdDraw)                                   \
+  X(vkCmdDispatch)                               \
   X(vkCmdClearAttachments)                       \
   X(vkCmdDrawIndexed)
 

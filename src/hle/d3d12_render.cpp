@@ -54,6 +54,8 @@ using gpu::vk::Core;
 using gpu::vk::Image;
 
 constexpr uint32_t kMaxTextures = 4096, kSamplers = 8, kMaxArrayTextures = 1024, kMaxVolumeTextures = 256;
+// Storage images (UAVs that compute shaders write): 2D, 2D array, 3D.
+constexpr uint32_t kMaxStorage = 2048, kMaxStorageArrays = 512, kMaxStorageVolumes = 256;
 constexpr VkDeviceSize kRingSize = 256ull << 20;
 
 uint64_t fnv1a(const void* data, size_t size, uint64_t h = 1469598103934665603ull) {
@@ -114,6 +116,7 @@ struct GpuImage {
   uint32_t texture_index = 0;  // in the bindless 2D array, 0 = not yet (or a 3D image)
   uint32_t array_index = 0;    // in the bindless 2D-array array (2D images, all layers)
   uint32_t volume_index = 0;   // in the bindless 3D array (3D images)
+  uint32_t storage_index = 0, storage_array_index = 0, storage_volume_index = 0;  // storage bindings (0 = none)
   bool rendered = false;       // the GPU holds its contents
   uint64_t last_render = 0;
   uint64_t uploaded_frame = 0;  // textures from guest memory: refreshed once per frame they are used
@@ -147,24 +150,28 @@ class Renderer {
     f.vkCreateFence(dev, &fci, nullptr, &fence_);
 
     // Bindless textures and samplers.
-    // Bindings: 0 2D textures, 1 samplers, 2 2D-array textures, 3 3D textures.
-    VkDescriptorSetLayoutBinding b[4]{};
-    const uint32_t counts[4] = {kMaxTextures, kSamplers, kMaxArrayTextures, kMaxVolumeTextures};
-    for (uint32_t i = 0; i < 4; ++i) {
+    // Bindings: 0 2D textures, 1 samplers, 2 2D-array textures, 3 3D textures,
+    // 4-6 storage images (2D, 2D array, 3D) for compute shaders.
+    VkDescriptorSetLayoutBinding b[7]{};
+    const uint32_t counts[7] = {kMaxTextures, kSamplers, kMaxArrayTextures, kMaxVolumeTextures,
+                                kMaxStorage, kMaxStorageArrays, kMaxStorageVolumes};
+    for (uint32_t i = 0; i < 7; ++i) {
       b[i].binding = i;
-      b[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      b[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER
+                            : i >= 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       b[i].descriptorCount = counts[i];
-      b[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+      b[i].stageFlags = i >= 4 ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
     }
     const VkDescriptorBindingFlags bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-    VkDescriptorBindingFlags bflags[4] = {bound, 0, bound, bound};
+    VkDescriptorBindingFlags bflags[7] = {bound, 0, bound, bound, bound, bound, bound};
     VkDescriptorSetLayoutBindingFlagsCreateInfo bfi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-    bfi.bindingCount = 4;
+    bfi.bindingCount = 7;
     bfi.pBindingFlags = bflags;
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     lci.pNext = &bfi;
     lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-    lci.bindingCount = 4;
+    lci.bindingCount = 7;
     lci.pBindings = b;
     if (f.vkCreateDescriptorSetLayout(dev, &lci, nullptr, &set_layout_) != VK_SUCCESS) {
       info = "descriptor set layout failed";
@@ -178,12 +185,17 @@ class Renderer {
     plci.pushConstantRangeCount = 2;
     plci.pPushConstantRanges = push;
     f.vkCreatePipelineLayout(dev, &plci, nullptr, &layout_);
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures + kMaxArrayTextures + kMaxVolumeTextures},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplers}};
+    VkPushConstantRange cpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &cpush;
+    f.vkCreatePipelineLayout(dev, &plci, nullptr, &compute_layout_);
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures + kMaxArrayTextures + kMaxVolumeTextures},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplers},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxStorage + kMaxStorageArrays + kMaxStorageVolumes}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     dpci.maxSets = 1;
-    dpci.poolSizeCount = 2;
+    dpci.poolSizeCount = 3;
     dpci.pPoolSizes = sizes;
     f.vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool_);
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -237,6 +249,17 @@ class Renderer {
     submit();
     bind_texture(0, white_volume_.view, 3);
     next_texture_ = next_array_ = next_volume_ = 1;
+    // Storage index 0: scratch images that unresolved UAV writes land in.
+    scratch_storage_ = core_.create_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
+    scratch_storage_volume_ = core_.create_image(1, 1, 1, 1, true, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
+    begin();
+    transition(scratch_storage_.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition(scratch_storage_volume_.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    submit();
+    bind_storage(0, scratch_storage_.view, 4);
+    bind_storage(0, scratch_storage_.array_view, 5);
+    bind_storage(0, scratch_storage_volume_.view, 6);
+    next_storage_ = next_storage_array_ = next_storage_volume_ = 1;
 
     const char* home = std::getenv("HOME");
     cache_dir_ = fs::path(home ? home : "/tmp") / ".cache" / "xbem" / "spirv";
@@ -279,8 +302,8 @@ class Renderer {
       for (uint64_t i = 0; i < uint64_t{w} * h; i += 97)
         if (px[i] & 0x00ffffff) ++lit, sample = px[i];
       XBEM_INFO("gpu", "present #{}: {}x{} display image ({} of {} sampled pixels lit, e.g. {:#010x}); {} draws "
-                "rendered, {} skipped so far{}", presents_, w, h, lit, uint64_t{w} * h / 97, sample, draws_, skipped_,
-                top_skip_reasons());
+                "rendered, {} skipped; {} dispatches run, {} skipped so far{}", presents_, w, h, lit,
+                uint64_t{w} * h / 97, sample, draws_, skipped_, dispatches_, dispatches_skipped_, top_skip_reasons());
       if (std::getenv("XBEM_GPU_STATS")) image_stats();
     }
   }
@@ -371,6 +394,19 @@ class Renderer {
     core_.fn().vkUpdateDescriptorSets(core_.device(), 1, &w, 0, nullptr);
   }
 
+  void bind_storage(uint32_t index, VkImageView view, uint32_t binding) {
+    if (!view) return;
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set_;
+    w.dstBinding = binding;
+    w.dstArrayElement = index;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w.pImageInfo = &ii;
+    core_.fn().vkUpdateDescriptorSets(core_.device(), 1, &w, 0, nullptr);
+  }
+
   // ---------------------------------------------------------- resources
 
   // The GPU image of a guest resource (render target or texture).
@@ -399,7 +435,8 @@ class Renderer {
     std::memcpy(&depth_or_array, r->desc + 28, 2);
     std::memcpy(&format, r->desc + 32, 4);
     const VkFormat vf = vk_format(format);
-    if ((dimension != 3 && dimension != 4) || vf == VK_FORMAT_UNDEFINED || !width || !height || width > 16384 ||
+    if (dimension == 2) height = 1;  // 1D: a 2D image of one row
+    if ((dimension != 2 && dimension != 3 && dimension != 4) || vf == VK_FORMAT_UNDEFINED || !width || !height || width > 16384 ||
         height > 16384 || (for_render && dimension == 4)) {
       note(std::format("resource format {} dimension {} not supported", format, dimension));
       return nullptr;
@@ -410,6 +447,8 @@ class Renderer {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (!block) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    const bool storage = !block && format != 65 && core_.format_supported(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    if (storage) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     auto g = std::make_unique<GpuImage>();
     if (volume || slices > 1) usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     g->image = volume || slices > 1
@@ -451,6 +490,13 @@ class Renderer {
     if (volume && next_volume_ < kMaxVolumeTextures) {
       g->volume_index = next_volume_++;
       bind_texture(g->volume_index, g->image.view, 3);
+    }
+    if (storage) {
+      if (!volume && next_storage_ < kMaxStorage) bind_storage(g->storage_index = next_storage_++, g->image.view, 4);
+      if (!volume && g->image.array_view && next_storage_array_ < kMaxStorageArrays)
+        bind_storage(g->storage_array_index = next_storage_array_++, g->image.array_view, 5);
+      if (volume && next_storage_volume_ < kMaxStorageVolumes)
+        bind_storage(g->storage_volume_index = next_storage_volume_++, g->image.view, 6);
     }
     GpuImage* raw = g.get();
     images_[r] = std::move(g);
@@ -769,6 +815,9 @@ class Renderer {
   };
 
   struct State {
+    ComputePipeline* compute = nullptr;
+    const gpu::RootSignature* compute_root = nullptr;
+    std::map<uint32_t, RootValue> compute_params;
     GraphicsPipeline* pipeline = nullptr;
     std::string pipeline_name;  // for skip statistics
     const gpu::RootSignature* root = nullptr;
@@ -816,6 +865,10 @@ class Renderer {
         }
         break;
       case 25: {
+        if (ComputePipeline* cp = compute_pipeline_of(a[0])) {
+          state_.compute = cp;
+          break;
+        }
         GraphicsPipeline* p = graphics_pipeline_of(a[0]);
         state_.pipeline = p;
         state_.pipeline_name = !p && is_probe_object(a[0]) ? reinterpret_cast<ProbeObject*>(a[0])->name.substr(0, 40)
@@ -836,6 +889,26 @@ class Renderer {
         state_.root = root_signature_of(a[0]);
         state_.params.clear();
         break;
+      case 33:
+        state_.compute_root = root_signature_of(a[0]);
+        state_.compute_params.clear();
+        break;
+      case 35: state_.compute_params[u32(0)].value = a[1]; break;
+      case 37: {
+        auto& rv = state_.compute_params[u32(0)];
+        if (rv.constants.size() <= u32(2)) rv.constants.resize(u32(2) + 1);
+        rv.constants[u32(2)] = u32(1);
+        break;
+      }
+      case 39: {
+        auto& rv = state_.compute_params[u32(0)];
+        const uint32_t n = static_cast<uint32_t>(c.blob.size() / 4);
+        if (rv.constants.size() < u32(3) + n) rv.constants.resize(u32(3) + n);
+        std::memcpy(rv.constants.data() + u32(3), c.blob.data(), n * 4);
+        break;
+      }
+      case 41: case 43: case 45: state_.compute_params[u32(0)].value = a[1]; break;
+      case 14: dispatch(u32(0), u32(1), u32(2)); break;
       case 36: state_.params[u32(0)].value = a[1]; break;
       case 38: {
         auto& rv = state_.params[u32(0)];
@@ -921,31 +994,39 @@ class Renderer {
       s[1] = 0;
       s[2] = base_vertex;
     }
-    uint32_t r = 8;
-    if (state_.root) {
-      for (uint32_t i = 0; i < state_.root->params.size() && r < 100; ++i) {
-        const auto& p = state_.root->params[i];
-        const uint32_t vis = p.visibility;
-        if (vis != 0 && vis != (stage == gpu::ShaderStage::Vertex ? 1u : 5u)) continue;
-        const auto it = state_.params.find(i);
-        switch (p.type) {
-          case gpu::RootSignature::ParamType::DescriptorTable:
-            s[r++] = it != state_.params.end() ? tokens.add(it->second.value, 1 << 20) : 0;
-            break;
-          case gpu::RootSignature::ParamType::Constants32:
-            for (uint32_t k = 0; k < p.num_constants && r < 100; ++k)
-              s[r++] = it != state_.params.end() && k < it->second.constants.size() ? it->second.constants[k] : 0;
-            break;
-          default: {
-            const uint64_t va = it != state_.params.end() ? it->second.value : 0;
-            s[r++] = static_cast<uint32_t>(va);
-            s[r++] = static_cast<uint32_t>(va >> 32);
-            break;
-          }
+    const bool cs = stage == gpu::ShaderStage::Compute;
+    // Compute: the root parameters from s4 (GTA VI's compute metadata maps
+    // its descriptor tables to s4, s5, ...); graphics from s8.
+    root_sgprs(cs ? state_.compute_root : state_.root, cs ? state_.compute_params : state_.params, stage, tokens, s,
+               cs ? 4 : 8);
+  }
+
+  void root_sgprs(const gpu::RootSignature* root, const std::map<uint32_t, RootValue>& params, gpu::ShaderStage stage,
+                  Tokens& tokens, uint32_t* s, uint32_t r) {
+    if (!root) return;
+    for (uint32_t i = 0; i < root->params.size() && r < 100; ++i) {
+      const auto& p = root->params[i];
+      const uint32_t vis = p.visibility;
+      if (stage != gpu::ShaderStage::Compute && vis != 0 && vis != (stage == gpu::ShaderStage::Vertex ? 1u : 5u))
+        continue;
+      const auto it = params.find(i);
+      switch (p.type) {
+        case gpu::RootSignature::ParamType::DescriptorTable:
+          s[r++] = it != params.end() ? tokens.add(it->second.value, 1 << 20) : 0;
+          break;
+        case gpu::RootSignature::ParamType::Constants32:
+          for (uint32_t k = 0; k < p.num_constants && r < 100; ++k)
+            s[r++] = it != params.end() && k < it->second.constants.size() ? it->second.constants[k] : 0;
+          break;
+        default: {
+          const uint64_t va = it != params.end() ? it->second.value : 0;
+          s[r++] = static_cast<uint32_t>(va);
+          s[r++] = static_cast<uint32_t>(va >> 32);
+          break;
         }
       }
-      if ((state_.root->flags & 0x800) && state_.heaps[1]) s[r++] = tokens.add(state_.heaps[1], 1 << 20);
     }
+    if ((root->flags & 0x800) && state_.heaps[1]) s[r++] = tokens.add(state_.heaps[1], 1 << 20);
   }
 
   void resolve(gpu::SlotKind kind, const uint32_t* w, uint32_t* out, const Tokens& tokens) {
@@ -974,6 +1055,23 @@ class Renderer {
         out[1] = g ? (g->image.width | (g->image.height << 16)) : 0x00010001;
         out[2] = g ? g->array_index : 0;
         out[3] = g ? g->volume_index : 0;
+        break;
+      }
+      case gpu::SlotKind::Image: {
+        uint8_t bytes[32];
+        std::memcpy(bytes, w, 32);
+        GpuImage* g = image_from_descriptor(bytes, false);
+        if (g && !g->storage_index && !g->storage_array_index && !g->storage_volume_index)
+          note(std::format("UAV image {}x{} (format {}) cannot be a storage image - writes are dropped", g->image.width,
+                           g->image.height, static_cast<int>(g->image.format)));
+        out[0] = out[1] = g ? g->storage_index : 0;
+        out[2] = g ? g->storage_array_index : 0;
+        out[3] = g ? g->storage_volume_index : 0;
+        if (g) {
+          g->rendered = true;  // the GPU holds its contents now
+          g->last_render = ++render_serial_;
+          written_.push_back(g);
+        }
         break;
       }
       case gpu::SlotKind::Sampler: {
@@ -1175,6 +1273,85 @@ class Renderer {
     }
   }
 
+  // ---------------------------------------------------------- compute
+
+  ShaderEntry* compute_shader(const ComputePipeline& p) {
+    auto it = shaders_.find(p.cs_hash);
+    if (it != shaders_.end()) return it->second.get();
+    auto e = std::make_unique<ShaderEntry>();
+    const gpu::ComputeInfo info = gpu::ComputeInfo::from_state(p.state_a.data(), p.state_a.size());
+    e->shader = gpu::translate_shader(p.code.data(), p.code.size(), gpu::ShaderStage::Compute, &info);
+    if (!e->shader.ok) e->error = e->shader.error;
+    else e->module = compile(e->shader.glsl, "comp", e->error);
+    if (!e->error.empty()) XBEM_WARN("gpu", "compute shader {:016x}: {}", p.cs_hash, e->error);
+    ShaderEntry* raw = e.get();
+    shaders_[p.cs_hash] = std::move(e);
+    return raw;
+  }
+
+  VkPipeline compute_pipeline(uint64_t hash, VkShaderModule module) {
+    if (auto it = compute_pipelines_.find(hash); it != compute_pipelines_.end()) return it->second;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module,
+                "main", nullptr};
+    ci.layout = compute_layout_;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (core_.fn().vkCreateComputePipelines(core_.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) {
+      note(std::format("compute pipeline {:016x} creation failed", hash));
+      pipe = VK_NULL_HANDLE;
+    }
+    return compute_pipelines_[hash] = pipe;
+  }
+
+  void dispatch(uint32_t x, uint32_t y, uint32_t z) {
+    if (std::getenv("XBEM_NO_COMPUTE")) return;
+    ComputePipeline* p = state_.compute;
+    if (!p) return skip_dispatch("no compute pipeline");
+    if (!x || !y || !z) return;
+    ShaderEntry* cs = compute_shader(*p);
+    if (!cs->module) return skip_dispatch(std::format("cs {:016x} not translated", p->cs_hash));
+    VkPipeline pipe = compute_pipeline(p->cs_hash, cs->module);
+    if (!pipe) return skip_dispatch("pipeline creation failed");
+    end_rendering();
+    Tokens tokens;
+    gpu::ScalarRun run;
+    static const std::vector<uint8_t> no_vb;
+    user_sgprs(gpu::ShaderStage::Compute, tokens, run.sgpr, 0, no_vb);
+    run.read = [&](uint64_t address, void* out, size_t size) { return tokens.read(address, out, size); };
+    run.resolve = [&](gpu::SlotKind kind, const uint32_t* w, uint32_t* out) { resolve(kind, w, out, tokens); };
+    std::vector<uint32_t> words;
+    written_.clear();
+    if (!gpu::run_scalar(cs->shader, run, words)) return skip_dispatch("scalar run");
+    const VkDeviceSize n = std::max<VkDeviceSize>(words.size() * 4, 16);
+    const VkDeviceSize at = ring_alloc(n, 16);
+    std::memset(static_cast<uint8_t*>(ring_.mapped) + at, 0, n);
+    std::memcpy(static_cast<uint8_t*>(ring_.mapped) + at, words.data(), words.size() * 4);
+    const VkDeviceAddress data = ring_.address + at;
+    const auto& f = core_.fn();
+    f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, compute_layout_, 0, 1, &set_, 0, nullptr);
+    f.vkCmdPushConstants(cmd_, compute_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &data);
+    f.vkCmdDispatch(cmd_, x, y, z);
+    full_barrier();
+    ++dispatches_;
+    static const int trace = [] {
+      const char* t = std::getenv("XBEM_GPU_TRACE_CS");
+      return t ? std::atoi(t) : 0;
+    }();
+    if (dispatches_traced_ < trace) {
+      ++dispatches_traced_;
+      std::string w;
+      for (uint32_t v : words) w += std::format(" {:08x}", v);
+      XBEM_INFO("gpu", "dispatch {}: cs {:016x} ({}, {}, {}), {} images written\n  words:{}", dispatches_, p->cs_hash, x, y,
+                z, written_.size(), w);
+    }
+  }
+
+  void skip_dispatch(const std::string& reason) {
+    ++dispatches_skipped_;
+    ++skip_reasons_["dispatch: " + reason];
+  }
+
   // Development: what every rendered image holds (lit sampled pixels).
   void image_stats() {
     for (auto& [r, g] : images_) {
@@ -1219,7 +1396,13 @@ class Renderer {
   bool recording_ = false, rendering_ = false;
   GpuImage* current_target_ = nullptr;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
-  VkPipelineLayout layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout layout_ = VK_NULL_HANDLE, compute_layout_ = VK_NULL_HANDLE;
+  Image scratch_storage_, scratch_storage_volume_;
+  uint32_t next_storage_ = 0, next_storage_array_ = 0, next_storage_volume_ = 0;
+  std::map<uint64_t, VkPipeline> compute_pipelines_;
+  std::vector<GpuImage*> written_;
+  uint64_t dispatches_ = 0, dispatches_skipped_ = 0;
+  int dispatches_traced_ = 0;
   VkDescriptorPool dpool_ = VK_NULL_HANDLE;
   VkDescriptorSet set_ = VK_NULL_HANDLE;
   VkSampler samplers_[kSamplers] = {};

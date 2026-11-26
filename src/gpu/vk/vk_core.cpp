@@ -121,6 +121,8 @@ bool Core::init(std::string& reason) {
   enable12.descriptorBindingPartiallyBound = f12.descriptorBindingPartiallyBound;
   enable12.descriptorBindingSampledImageUpdateAfterBind = f12.descriptorBindingSampledImageUpdateAfterBind;
   enable12.scalarBlockLayout = f12.scalarBlockLayout;
+  enable12.shaderStorageImageArrayNonUniformIndexing = f12.shaderStorageImageArrayNonUniformIndexing;
+  enable12.descriptorBindingStorageImageUpdateAfterBind = f12.descriptorBindingStorageImageUpdateAfterBind;
   enable12.timelineSemaphore = f12.timelineSemaphore;
   VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
   dynamic.dynamicRendering = VK_TRUE;
@@ -132,6 +134,8 @@ bool Core::init(std::string& reason) {
   enable.features.shaderInt64 = f2.features.shaderInt64;
   enable.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
   enable.features.vertexPipelineStoresAndAtomics = f2.features.vertexPipelineStoresAndAtomics;
+  enable.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
+  enable.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
   const char* extensions[] = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.pNext = &enable;
