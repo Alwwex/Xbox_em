@@ -348,7 +348,29 @@ class Translator {
       line(std::format("  if (lane_on()) {} = src_on ? val : 0u; }}", vreg(vdst)));
       return true;
     }
-    if (starts(n, "v_cmp")) line("cmpv = false;");
+    if (starts(n, "v_cmp") || n.find("_co_") != std::string_view::npos) line("cmpv = false;");
+    // DPP16: the source operand comes from another lane of the row (a
+    // shuffle, so outside the lane guard).
+    if (insn.extension == rdna2::Instruction::Extension::Dpp16) {
+      const uint32_t w1 = insn.words[1];
+      const uint32_t src0 = w1 & 0xff, ctrl = (w1 >> 8) & 0x1ff, bound_ctrl = (w1 >> 19) & 1;
+      std::string from;
+      if (ctrl <= 0xff) from = std::format("(lane & ~3u) | ((0x{:x}u >> ((lane & 3u) * 2u)) & 3u)", ctrl);
+      else if (ctrl >= 0x101 && ctrl <= 0x10f) from = std::format("lane + {}u", ctrl & 15);          // row_shl
+      else if (ctrl >= 0x111 && ctrl <= 0x11f) from = std::format("lane - {}u", ctrl & 15);          // row_shr
+      else if (ctrl >= 0x121 && ctrl <= 0x12f) from = std::format("(lane & ~15u) | ((lane - {}u) & 15u)", ctrl & 15);  // row_ror
+      else if (ctrl == 0x140) from = "(lane & ~15u) | (15u - (lane & 15u))";                          // row_mirror
+      else if (ctrl == 0x141) from = "(lane & ~7u) | (7u - (lane & 7u))";                             // row_half_mirror
+      else if (ctrl >= 0x150 && ctrl <= 0x15f) from = std::format("(lane & ~15u) | {}u", ctrl & 15);  // row_share
+      else if (ctrl >= 0x160 && ctrl <= 0x16f) from = std::format("lane ^ {}u", ctrl & 15);          // row_xmask
+      else return fail(std::format("DPP control {:#x}", ctrl));
+      const bool shift = (ctrl >= 0x101 && ctrl <= 0x11f);
+      line(std::format("{{ uint from = {}; dppv = subgroupShuffle({}, from & 31u);", from, vreg(src0)));
+      line(std::format("  bool valid = {} && ((exec_lo >> (from & 31u)) & 1u) != 0u; if (!valid) dppv = {}; }}",
+                       shift ? "((from & ~15u) == (lane & ~15u)) && from < 32u" : "true",
+                       bound_ctrl ? "0u" : vreg(v.dst)));
+      dpp_ = true;
+    }
     line("if (lane_on()) {");
     post_.clear();
     bool ok;
@@ -412,7 +434,7 @@ class Translator {
         if (gpu_smem_.count(k)) {
           const uint32_t sbase = (w0 & 0x3f) * 2, soffset = (w1 >> 25) & 0x7f;
           const uint32_t imm = w1 & 0x1fffff;
-          const uint32_t buf = add_slot(SlotKind::Buffer, sbase, 4);
+          const uint32_t buf = add_slot(SlotKind::Buffer, sbase, 5);
           std::string so;
           if (!src(soffset, insn, so)) return false;
           line(std::format("{{ uint off = ({} + {:#x}u) & ~3u; uint64_t a = packUint2x32(uvec2(D({}), D({} + 1u))) + uint64_t(off);",
@@ -915,13 +937,61 @@ class Translator {
          "  return (w0 >> sh) | (Words(al).w[1] << (32u - sh));\n"
          "}\n"
          "void st32(uint64_t a, uint v) { Words(a & ~uint64_t(3)).w[0] = v; }\n";
+    if (uses_fetch_format_)
+      // gfx10 buffer formats: (bits per component, components, kind) - unorm,
+      // snorm, uint, sint, float; out-of-range reads give (0, 0, 0, 1).
+      g += "uvec4 fetch_format(uint64_t a, uint f, bool inb) {\n"
+           "  uint bits = 0u, n = 0u, kind = 0u;\n"  // kind: 0 unorm 1 snorm 2 uint 3 sint 4 float
+           "  switch (f) {\n"
+           "    case 1u: bits = 8u; n = 1u; kind = 0u; break;   case 2u: bits = 8u; n = 1u; kind = 1u; break;\n"
+           "    case 5u: bits = 8u; n = 1u; kind = 2u; break;   case 6u: bits = 8u; n = 1u; kind = 3u; break;\n"
+           "    case 7u: bits = 16u; n = 1u; kind = 0u; break;  case 8u: bits = 16u; n = 1u; kind = 1u; break;\n"
+           "    case 11u: bits = 16u; n = 1u; kind = 2u; break; case 12u: bits = 16u; n = 1u; kind = 3u; break;\n"
+           "    case 13u: bits = 16u; n = 1u; kind = 4u; break;\n"
+           "    case 14u: bits = 8u; n = 2u; kind = 0u; break;  case 15u: bits = 8u; n = 2u; kind = 1u; break;\n"
+           "    case 18u: bits = 8u; n = 2u; kind = 2u; break;  case 19u: bits = 8u; n = 2u; kind = 3u; break;\n"
+           "    case 20u: bits = 32u; n = 1u; kind = 2u; break; case 21u: bits = 32u; n = 1u; kind = 3u; break;\n"
+           "    case 22u: bits = 32u; n = 1u; kind = 4u; break;\n"
+           "    case 23u: bits = 16u; n = 2u; kind = 0u; break; case 24u: bits = 16u; n = 2u; kind = 1u; break;\n"
+           "    case 27u: bits = 16u; n = 2u; kind = 2u; break; case 28u: bits = 16u; n = 2u; kind = 3u; break;\n"
+           "    case 29u: bits = 16u; n = 2u; kind = 4u; break;\n"
+           "    case 56u: bits = 8u; n = 4u; kind = 0u; break;  case 57u: bits = 8u; n = 4u; kind = 1u; break;\n"
+           "    case 60u: bits = 8u; n = 4u; kind = 2u; break;  case 61u: bits = 8u; n = 4u; kind = 3u; break;\n"
+           "    case 62u: bits = 32u; n = 2u; kind = 2u; break; case 63u: bits = 32u; n = 2u; kind = 3u; break;\n"
+           "    case 64u: bits = 32u; n = 2u; kind = 4u; break;\n"
+           "    case 65u: bits = 16u; n = 4u; kind = 0u; break; case 66u: bits = 16u; n = 4u; kind = 1u; break;\n"
+           "    case 69u: bits = 16u; n = 4u; kind = 2u; break; case 70u: bits = 16u; n = 4u; kind = 3u; break;\n"
+           "    case 71u: bits = 16u; n = 4u; kind = 4u; break;\n"
+           "    case 72u: bits = 32u; n = 3u; kind = 2u; break; case 73u: bits = 32u; n = 3u; kind = 3u; break;\n"
+           "    case 74u: bits = 32u; n = 3u; kind = 4u; break;\n"
+           "    case 75u: bits = 32u; n = 4u; kind = 2u; break; case 76u: bits = 32u; n = 4u; kind = 3u; break;\n"
+           "    case 77u: bits = 32u; n = 4u; kind = 4u; break;\n"
+           "    default: bits = 32u; n = 1u; kind = 2u; break;\n"
+           "  }\n"
+           "  bool ints = kind == 2u || kind == 3u;\n"
+           "  uvec4 r = uvec4(0u, 0u, 0u, ints ? 1u : 0x3f800000u);\n"
+           "  if (!inb) return r;\n"
+           "  for (uint i = 0u; i < n; ++i) {\n"
+           "    uint raw;\n"
+           "    if (bits == 32u) raw = ld32(a + uint64_t(i * 4u));\n"
+           "    else { uint byte_at = i * bits / 8u; raw = bitfieldExtract(ld32(a + uint64_t(byte_at)), 0, int(bits)); }\n"
+           "    uint v;\n"
+           "    if (kind == 0u) v = floatBitsToUint(float(raw) / float((1u << bits) - 1u));\n"
+           "    else if (kind == 1u) v = floatBitsToUint(max(float(bitfieldExtract(int(raw), 0, int(bits))) / float((1u << (bits - 1u)) - 1u), -1.0));\n"
+           "    else if (kind == 2u) v = raw;\n"
+           "    else if (kind == 3u) v = uint(bitfieldExtract(int(raw), 0, int(bits)));\n"
+           "    else v = bits == 16u ? floatBitsToUint(unpackHalf2x16(raw).x) : raw;\n"
+           "    r[i] = v;\n"
+           "  }\n"
+           "  return r;\n"
+           "}\n";
     if (lds_words_) {
       const uint32_t words = std::min<uint32_t>(std::max<uint32_t>(c.lds_bytes / 4, 1024), 8192);
       uint32_t pow2 = 1;
       while (pow2 < words) pow2 <<= 1;
       g += std::format("#define LDS_MASK {}u\nshared uint lds[{}];\n", pow2 - 1, pow2);
     }
-    g += "uint lane;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes;\nbool scc, cmpv;\n";
+    g += "uint lane;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes, dppv;\nbool scc, cmpv;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("uint s{};\n", k);
     const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 3);
     for (uint32_t k = 0; k < vgprs; ++k) g += std::format("uint v{};\n", k);
@@ -994,6 +1064,7 @@ class Translator {
         case kScc: return e = "uint(scc)", true;
         case 251: return e = "uint(vcc_lo == 0u)", true;   // src_vccz
         case 252: return e = "uint(exec_lo == 0u)", true;  // src_execz
+        case 250: return dpp_ ? (e = "dppv", true) : fail("DPP outside wave mode");
         default: return fail(std::format("operand {}", s));
       }
     }
@@ -1243,6 +1314,26 @@ class Translator {
       }
       return true;
     }
+    // Integer add/sub with carry: the carry is a lane mask (vcc, or an SGPR
+    // pair in the VOP3 form); carry-in reads this lane's bit.
+    if (wave_ && (n == "v_add_co_u32" || n == "v_sub_co_u32" || n == "v_subrev_co_u32" || n == "v_add_co_ci_u32" ||
+                  n == "v_sub_co_ci_u32" || n == "v_subrev_co_ci_u32")) {
+      if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
+      const bool ci = n.ends_with("_ci_u32");
+      std::string cin = "0u";
+      if (ci) {
+        std::string m = "vcc_lo";
+        if (insn.format == Format::Vop3 && !src(v.src[2], insn, m)) return false;
+        cin = std::format("uint({})", lane_bit(m));
+      }
+      if (n.find("subrev") != std::string_view::npos) std::swap(a, b);
+      const bool sub = n.find("sub") != std::string_view::npos;
+      if (sub) line(std::format("{{ uint64_t w = uint64_t({}) - uint64_t({}) - uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
+      else line(std::format("{{ uint64_t w = uint64_t({}) + uint64_t({}) + uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
+      const uint32_t sdst = insn.format == Format::Vop3 ? v.sdst : kVccLo;
+      post_.push_back(std::format("{} = subgroupBallot(cmpv).x; {} = 0u;", sreg(sdst), sreg(sdst + 1)));
+      return true;
+    }
     // 64-bit shifts (result in a VGPR pair)
     if (n == "v_lshrrev_b64" || n == "v_lshlrev_b64" || n == "v_ashrrev_i64") {
       std::string lo, hi;
@@ -1430,7 +1521,7 @@ class Translator {
     const uint32_t w0 = insn.words[0], w1 = insn.words[1];
     const uint32_t offset = w0 & 0xfff, offen = (w0 >> 12) & 1, idxen = (w0 >> 13) & 1;
     const uint32_t vaddr = w1 & 0xff, srsrc = ((w1 >> 16) & 0x1f) * 4, soffset = (w1 >> 24) & 0xff;
-    const uint32_t base = add_slot(SlotKind::Buffer, srsrc, 4);
+    const uint32_t base = add_slot(SlotKind::Buffer, srsrc, 5);
     slot = std::to_string(base);
     std::string so;
     if (!src(soffset, insn, so)) return false;
@@ -1447,6 +1538,19 @@ class Translator {
   bool emit_mubuf(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
     if (wave_ && (starts(n, "buffer_store") || starts(n, "buffer_atomic"))) return emit_mubuf_write(insn);
+    if (wave_ && starts(n, "buffer_load_format_") && !starts(n, "buffer_load_format_d16")) {
+      // Typed load: the data format is the descriptor's (dword 3 bits 12-18).
+      const int comps = n.ends_with("_xyzw") ? 4 : n.ends_with("_xyz") ? 3 : n.ends_with("_xy") ? 2 : 1;
+      const uint32_t vdata = (insn.words[1] >> 8) & 0xff;
+      std::string slot, addr, bound;
+      if (!buffer_address(insn, slot, addr, bound)) return false;
+      line("{");
+      line(std::format("  uvec4 t = fetch_format({}, (D({} + 4u) >> 12) & 0x7fu, {});", addr, slot, bound));
+      for (int k = 0; k < comps; ++k) line(std::format("  {} = t.{};", vreg(vdata + k), "xyzw"[k]));
+      line("}");
+      uses_fetch_format_ = true;
+      return true;
+    }
     int words = 0;
     if (n == "buffer_load_dword") words = 1;
     else if (n == "buffer_load_dwordx2") words = 2;
@@ -1653,6 +1757,19 @@ class Translator {
       if (n == "image_sample_lz") value = std::format("textureLod({}, {}, 0.0)", sampler, coord);
       else if (n == "image_sample_l") value = std::format("textureLod({}, {}, uintBitsToFloat({}))", sampler, coord, A(c + coords));
       else value = std::format("texture({}, {})", sampler, coord);
+    } else if (n == "image_gather4_lz" || n == "image_gather4" || n == "image_gather4_l") {
+      const uint32_t smp = add_slot(SlotKind::Sampler, ssamp, 1);
+      std::string coord = std::format("uintBitsToFloat({}), uintBitsToFloat({})", A(0), A(1));
+      if (coords == 3) coord += dim == 5 ? std::format(", roundEven(uintBitsToFloat({}))", A(2)) : std::format(", uintBitsToFloat({})", A(2));
+      const int comp = dmask & 1 ? 0 : dmask & 2 ? 1 : dmask & 4 ? 2 : 3;
+      if (dim == 2) return fail("gather from a 3D image");
+      value = std::format("textureGather({}({}, samplers[nonuniformEXT(D({}))]), vec{}({}), {})", type, array, smp, coords,
+                          coord, comp);
+      line("{");
+      line(std::format("  vec4 t = {};", value));
+      for (int k = 0; k < 4; ++k) line(std::format("  {} = floatBitsToUint(t.{});", vreg(vdata + k), "xyzw"[k]));
+      line("}");
+      return true;
     } else if (n == "image_load") {
       std::string coord = std::format("int({}), int({})", A(0), A(1));
       if (coords == 3) coord += std::format(", int({})", A(2));
@@ -1856,6 +1973,8 @@ class Translator {
   uint32_t max_sgpr_ = 0;
   std::vector<std::string> post_;  // wave mode: statements after the active-lane guard (ballots)
   std::set<uint32_t> gpu_smem_;     // wave mode: s_buffer_load instructions the GPU performs
+  bool uses_fetch_format_ = false;
+  bool dpp_ = false;
   uint32_t lds_words_ = 0;
   uint32_t blocks_ = 1, last_leader_pc_ = 0;  // SGPRs whose value only the GPU knows (from v_readfirstlane_b32)
 };

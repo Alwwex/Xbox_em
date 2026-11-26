@@ -1045,6 +1045,7 @@ class Renderer {
         out[1] = static_cast<uint32_t>(a >> 32);
         out[2] = stride;
         out[3] = w[2];
+        out[4] = w[3];
         break;
       }
       case gpu::SlotKind::Texture: {

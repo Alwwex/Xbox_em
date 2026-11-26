@@ -47,7 +47,7 @@ struct ComputeInfo {
 // What the per-draw slots of a translated shader hold.
 enum class SlotKind : uint8_t {
   Sgpr,     // 1 word: an SGPR's value at that point of the program
-  Buffer,   // 4 words: device address (lo, hi), stride, size limit (records)
+  Buffer,   // 5 words: device address (lo, hi), stride, size limit (records), V# dword 3 (format, swizzle)
   Texture,  // 4 words: bindless 2D index, image info (width | height << 16), 2D array index, 3D index
   Image,    // 4 words: storage image bindless indices (1D/buffer, 2D, 2D array, 3D) for image_store/_load on UAVs
   Sampler,  // 1 word: bindless sampler index
