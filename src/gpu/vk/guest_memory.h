@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/guest_memory_layout.h"
 #include "gpu/vk/vk_core.h"
 
 namespace xbem::gpu::vk {
@@ -53,6 +54,15 @@ class GuestMemory {
     uint64_t misses = 0, misses_dropped = 0;  // pages shaders reached without a copy
   };
   const Stats& stats() const { return stats_; }
+  // The tag a compute shader left when its loop guard ended it (0: none);
+  // cleared. Call after a submission finished.
+  uint32_t take_guard_tag() {
+    if (!table_.mapped) return 0;
+    uint32_t& w = words()[gpu::mem::kGuardWord];
+    const uint32_t tag = w;
+    w = 0;
+    return tag;
+  }
 
  private:
   struct Page {

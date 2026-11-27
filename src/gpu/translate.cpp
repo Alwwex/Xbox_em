@@ -308,6 +308,7 @@ class Translator {
     // program after 2^18 block transitions.
     line("uint blk = 0u, guard = 0u;");
     line("while (blk != 0xffffffffu && ++guard < 0x40000u) {");
+    line(std::format("if (guard == 0x3ffffu) MemT(pc.mem).w[{}u] = {:#x}u;", mem::kGuardWord, out_.tag));
     line("switch (blk) {");
     bool open = false;
     for (uint32_t k = 0; k < insns.size(); ++k) {
@@ -2631,6 +2632,8 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
   TranslatedShader out;
   out.stage = stage;
   if (compute) out.compute = *compute;
+  out.tag = 0x811c9dc5u;
+  for (size_t i = 0; i < size; ++i) out.tag = (out.tag ^ code[i]) * 0x01000193u;
   // Decoding ends at an s_endpgm no branch jumps past (data such as
   // constant tables may follow the code). Far jumps - s_getpc_b64 sX,
   // s_add_u32 sX, sX, K, s_addc_u32 sX+1, sX+1, 0, s_setpc_b64 sX - become

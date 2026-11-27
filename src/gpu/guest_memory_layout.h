@@ -47,7 +47,10 @@ constexpr uint32_t kDescMissWord = kDescWord + kDescEntries * kDescEntryWords;
 constexpr uint32_t kMaxDescMisses = 1024, kDescMissWords = 9;
 constexpr uint32_t kDescMissedWord = kDescMissWord + 1 + kMaxDescMisses * kDescMissWords;
 constexpr uint32_t kDescMissedBits = 1u << 16;
-constexpr uint32_t kTableWords = kDescMissedWord + kDescMissedBits / 32;
+// A compute shader whose loop guard ended it writes its tag here (see the
+// translator's block loop); the renderer reports and clears it.
+constexpr uint32_t kGuardWord = kDescMissedWord + kDescMissedBits / 32;
+constexpr uint32_t kTableWords = kGuardWord + 1;
 // Descriptor kinds in the table (as gpu::SlotKind's Texture / Image).
 constexpr uint32_t kDescTexture = 1, kDescImage = 2;
 

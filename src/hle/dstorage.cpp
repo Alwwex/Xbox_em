@@ -251,6 +251,14 @@ const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t comp
 // start before `offset` decodes.
 bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, uint64_t skip, uint64_t size,
                          std::vector<uint8_t>& out, size_t& produced) {
+  // Off by default: with it GTA VI's story load never left the loading
+  // screen (reads stopped at ~240 s in every run), without it - the pieces
+  // failing - the title reaches the scene after it (2026-11-27, runs 12/13).
+  static const bool enabled = [] {
+    const char* v = std::getenv("XBEM_CHUNK_RECOVERY");
+    return v && *v && *v != '0';
+  }();
+  if (!enabled) return false;
   std::lock_guard lock(g_chunk_mutex);
   const auto key = std::make_pair(static_cast<const FileState*>(file), offset);
   uint64_t start = UINT64_MAX;

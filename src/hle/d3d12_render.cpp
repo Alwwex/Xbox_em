@@ -417,6 +417,20 @@ class Renderer {
                   submitted_dispatches_, list.empty() ? " none" : list);
       }
     }
+    // A compute shader ended by its loop guard (a loop that would not end).
+    if (const uint32_t hit = memory_.take_guard_tag()) {
+      {
+        uint64_t hash = 0;
+        {
+          std::lock_guard lock(tags_mutex_);
+          if (auto it = shader_tags_.find(hit); it != shader_tags_.end()) hash = it->second;
+        }
+        static int logged = 0;
+        if (logged++ < 16)
+          XBEM_WARN("gpu", "compute shader {:016x} (tag {:#x}) ran into its loop guard - a loop that does not end",
+                    hash, hit);
+      }
+    }
     submitted_cs_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
     // Every ~10 s: how much of the time went into waiting for the GPU.
@@ -1500,6 +1514,10 @@ class Renderer {
     compile_pool().run([this, raw, job] {
       const gpu::ComputeInfo info = gpu::ComputeInfo::from_state(job->state_a.data(), job->state_a.size());
       raw->shader = gpu::translate_shader(job->code.data(), job->code.size(), gpu::ShaderStage::Compute, &info);
+      {
+        std::lock_guard lock(tags_mutex_);
+        shader_tags_[raw->shader.tag] = job->hash;
+      }
       if (!raw->shader.ok) raw->error = raw->shader.error;
       else raw->module = compile(raw->shader.glsl, "comp", raw->error);
       if (raw->module) {
@@ -1627,6 +1645,8 @@ class Renderer {
   std::set<uint64_t> submitted_cs_;
   uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0;
   uint64_t gpu_wait_us_ = 0, gpu_submissions_ = 0;
+  std::mutex tags_mutex_;
+  std::map<uint32_t, uint64_t> shader_tags_;  // translated code tag -> compute shader hash
   std::chrono::steady_clock::time_point stats_since_{};
   gpu::vk::GuestMemory memory_;
   uint64_t descriptors_ = 0, descriptor_misses_ = 0, descriptor_table_resets_ = 0;

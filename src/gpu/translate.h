@@ -85,6 +85,7 @@ struct TranslatedShader {
   uint32_t inputs = 0;       // pixel: attributes read (locations 0..inputs-1)
   uint32_t color_targets = 0;  // pixel: mrt exports (bit mask)
   ComputeInfo compute;         // compute: launch state
+  uint32_t tag = 0;            // FNV-1a of the code: what the loop guard reports (mem::kGuardWord)
   Program program;
 };
 
