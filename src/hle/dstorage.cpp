@@ -234,7 +234,8 @@ struct DecodedChunk {
 };
 std::mutex g_chunk_mutex;
 std::map<const FileState*, ChunkTable> g_tables;
-std::vector<DecodedChunk> g_chunks;  // most recent last
+std::vector<DecodedChunk> g_chunks;  // most recently used last
+uint64_t g_chunk_bytes = 0;
 std::atomic<uint64_t> g_shifted_ok{0}, g_shifted_failed{0};
 // For the status line: bytes read by the title (ReadFile), by requests, and by
 // chunk decodes for pieces inside chunks.
@@ -254,8 +255,18 @@ const ChunkTable& chunk_table(FileState* file) {
 }
 
 const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t compressed, uint64_t expected) {
-  for (const DecodedChunk& c : g_chunks)
-    if (c.file == file && c.start == start) return &c;
+  // Most recently used last. The pieces of texture arrays (one per slice,
+  // slices of several chunks interleaved) come back to the same chunks many
+  // times: a cache of up to 128 MiB of decoded data.
+  for (size_t i = g_chunks.size(); i-- > 0;)
+    if (g_chunks[i].file == file && g_chunks[i].start == start) {
+      if (i + 1 != g_chunks.size()) {
+        DecodedChunk c = std::move(g_chunks[i]);
+        g_chunks.erase(g_chunks.begin() + static_cast<std::ptrdiff_t>(i));
+        g_chunks.push_back(std::move(c));
+      }
+      return &g_chunks.back();
+    }
   std::vector<uint8_t> in(compressed);
   if (!file->read(start, in.data(), in.size())) return nullptr;
   ++g_decodes;
@@ -265,8 +276,12 @@ const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t comp
   const InflateResult r = inflate_auto(in.data(), in.size(), c.data.data(), c.data.size(), produced);
   if (r != InflateResult::Ok && r != InflateResult::OutputFull) return nullptr;
   c.data.resize(produced);
-  if (g_chunks.size() >= 16) g_chunks.erase(g_chunks.begin());
+  g_chunk_bytes += c.data.size();
   g_chunks.push_back(std::move(c));
+  while (g_chunk_bytes > (128u << 20) && g_chunks.size() > 1) {
+    g_chunk_bytes -= g_chunks.front().data.size();
+    g_chunks.erase(g_chunks.begin());
+  }
   return &g_chunks.back();
 }
 
