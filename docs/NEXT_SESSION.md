@@ -43,6 +43,13 @@ async graphics pipelines, GLSL size limit. The display is black from ~450 s
 (the final composite now runs); scene progress is limited by dzn pipeline
 builds (seconds each).
 
+Late evening: the thread-340 crash (HANDOFF "THREAD 340 CRASH = FAILED
+FILE READS") was pread on /mnt/d returning ENOMEM: failed DirectStorage
+requests made the title place resources twice and crash. Reads are retried
+now. Next blocker seen: a host abort "stack smashing detected" in dzn while
+building a large pipeline (run 246 at ~450 s; run 247 logs the large
+builds - look for "building (" lines just before the abort).
+
 ## Next steps (suggested order)
 
 0. Black display: capture the draws into the display resource at ~560 s.

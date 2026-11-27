@@ -10,6 +10,29 @@ Render GTA VI (Xbox Series build, `/mnt/d/GTAVI/GTAVI`, executable
 WSL2 on Windows 11. First target: the first screens of the game (the menu
 / loading screen reached ~60 s after start with `--press A@45`).
 
+## THREAD 340 CRASH = FAILED FILE READS (2026-11-27, late evening) - read first
+
+- Symptom: guest crash in worker thread 340 (entry +0x2215ea0) 360-510 s
+  into most scene runs, at varying sites (+0x4da63f8, +0x22bfc0,
+  +0x4f28e0f, +0x2b8035, ...).
+- Cause: right before each crash the title hit int3 at +0x4da6315, the
+  assert in RAGE's pointer fixup (0x4da62d0 looks a pointer up in the
+  resource's page map; 0x2593560 places a streamed resource, called for each
+  finished request by 0x2592c50 on thread 340). The pointers were already
+  absolute: resources were placed again over stale bytes. Crash runs, and
+  only they, logged `dstorage ... read of N bytes at X failed` with X inside
+  the file: pread on WSL's drvfs returns ENOMEM when memory is short, and the
+  block cache then kept the short block (every later read there failed).
+- Fix (platform/file_cache.cpp): failed or early-zero reads are retried with
+  backoff; short blocks are cached only at the end of the file.
+- Ruled out on the way (diagnostics kept, all env-gated): GPU write-back into
+  CPU heap pages (XBEM_CHECK_GPU_WRITES), wave guard merging
+  (XBEM_WAVE_LEGACY_GUARDS=1), the pipeline cache (XBEM_NO_PIPELINE_CACHE=1),
+  thread affinity (XBEM_AFFINITY=1 applies guest masks; the title asks for
+  14 logical processors, e.g. 0x3fff/0x3f00, we report 12).
+- Crash reports now describe a physical page's allocation/map times and the
+  last file read into it.
+
 ## Ground rules from the owner
 
 - Write in Czech to the owner; code, comments and commits in English.
@@ -165,7 +188,7 @@ slot-57 pipelines, MRT.
 - Shader build time is the scene's real stall: dzn takes ~1.5-4 s per
   pipeline, minutes for the largest compute programs; e45616a4accd3409
   (3.4 MiB GLSL) aborts dzn with "stack smashing detected" (run 227) -
-  programs over XBEM_MAX_GLSL_KB (1536) are refused. Graphics pipelines
+  programs over XBEM_MAX_GLSL_KB (now 960) are refused. Graphics pipelines
   are now built on the compile pool (draws skipped until ready;
   XBEM_SYNC_PIPELINES=1 for the old way). A VkPipelineCache persists in
   ~/.cache/xbem/spirv/pipelines.bin but helps little (the driver's DXIL

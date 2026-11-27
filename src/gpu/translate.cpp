@@ -3057,10 +3057,11 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
   TranslatedShader out = translate_any(code, size, stage, compute);
   // The largest programs (GTA VI's e45616a4accd3409: 3.5 MB of GLSL, 8.7 MB
   // of SPIR-V) take dzn minutes to build and then crash it ("stack smashing
-  // detected"), ending the process: refused (XBEM_MAX_GLSL_KB, default 1536).
+  // detected"), ending the process: refused (XBEM_MAX_GLSL_KB, default 960;
+  // 1.0-1.1 MiB programs aborted dzn too, in run 247).
   static const size_t limit = [] {
     const char* e = std::getenv("XBEM_MAX_GLSL_KB");
-    return (e ? std::strtoull(e, nullptr, 10) : 1536ull) << 10;
+    return (e ? std::strtoull(e, nullptr, 10) : 960ull) << 10;
   }();
   if (out.ok && limit && out.glsl.size() > limit) {
     out.ok = false;
