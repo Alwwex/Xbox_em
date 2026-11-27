@@ -180,6 +180,26 @@ struct GpuImage {
   uint64_t last_render = 0;
   uint64_t uploaded_frame = 0;  // textures from guest memory: refreshed once per frame they are used
   uint64_t content_hash = 0;
+  uint64_t last_used = 0;   // the present it was last looked up at (eviction)
+  uint64_t bytes = 0;       // estimated memory
+};
+
+// Bindless array indices, recycled when images are evicted (index 0 is the
+// placeholder).
+struct IndexPool {
+  uint32_t next = 1, max = 0;
+  std::vector<uint32_t> free;
+  uint32_t take() {
+    if (!free.empty()) {
+      const uint32_t i = free.back();
+      free.pop_back();
+      return i;
+    }
+    return next < max ? next++ : 0;
+  }
+  void give(uint32_t i) {
+    if (i) free.push_back(i);
+  }
 };
 
 class Renderer {
@@ -316,7 +336,9 @@ class Renderer {
     copy_to_image(white_volume_, at3, 1, 1);
     submit();
     bind_texture(0, white_volume_.view, 3);
-    next_texture_ = next_array_ = next_volume_ = 1;
+    const uint32_t pool_max[6] = {kMaxTextures, kMaxArrayTextures, kMaxVolumeTextures,
+                                  kMaxStorage, kMaxStorageArrays, kMaxStorageVolumes};
+    for (int i = 0; i < 6; ++i) pools_[i].max = pool_max[i];
     // Storage index 0: scratch images that unresolved UAV writes land in.
     scratch_storage_ = core_.create_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
     scratch_storage_volume_ = core_.create_image(1, 1, 1, 1, true, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
@@ -327,7 +349,7 @@ class Renderer {
     bind_storage(0, scratch_storage_.view, 4);
     bind_storage(0, scratch_storage_.array_view, 5);
     bind_storage(0, scratch_storage_volume_.view, 6);
-    next_storage_ = next_storage_array_ = next_storage_volume_ = 1;
+
 
     const char* home = std::getenv("HOME");
     cache_dir_ = fs::path(home ? home : "/tmp") / ".cache" / "xbem" / "spirv";
@@ -372,6 +394,7 @@ class Renderer {
     submit();
     platform::window_set_surface(rb.mapped, w, h, uint64_t{w} * 4, display_format_);
     ++presents_;
+    evict_images();
     if (presents_ == 1 || (presents_ & (presents_ - 1)) == 0) {
       const auto* px = static_cast<const uint32_t*>(rb.mapped);
       uint64_t lit = 0;
@@ -586,6 +609,7 @@ class Renderer {
     auto it = images_.find(r);
     if (it != images_.end()) {
       GpuImage* g = it->second.get();
+      g->last_used = presents_;
       // Guest-written textures change (glyph caches, streamed data): refresh
       // once per frame when the memory changed.
       if (!for_render && !g->rendered && g->uploaded_frame != presents_ && r->gpu_va) {
@@ -650,25 +674,20 @@ class Renderer {
       upload_texture(*g, r, format, block);
       g->uploaded_frame = presents_;
     }
-    if (!volume && next_texture_ < kMaxTextures) {
-      g->texture_index = next_texture_++;
-      bind_texture(g->texture_index, g->image.view);
-    }
-    if (!volume && g->image.array_view && next_array_ < kMaxArrayTextures) {
-      g->array_index = next_array_++;
+    if (!volume && (g->texture_index = pools_[0].take())) bind_texture(g->texture_index, g->image.view);
+    if (!volume && g->image.array_view && (g->array_index = pools_[1].take()))
       bind_texture(g->array_index, g->image.array_view, 2);
-    }
-    if (volume && next_volume_ < kMaxVolumeTextures) {
-      g->volume_index = next_volume_++;
-      bind_texture(g->volume_index, g->image.view, 3);
-    }
+    if (volume && (g->volume_index = pools_[2].take())) bind_texture(g->volume_index, g->image.view, 3);
     if (storage) {
-      if (!volume && next_storage_ < kMaxStorage) bind_storage(g->storage_index = next_storage_++, g->image.view, 4);
-      if (!volume && g->image.array_view && next_storage_array_ < kMaxStorageArrays)
-        bind_storage(g->storage_array_index = next_storage_array_++, g->image.array_view, 5);
-      if (volume && next_storage_volume_ < kMaxStorageVolumes)
-        bind_storage(g->storage_volume_index = next_storage_volume_++, g->image.view, 6);
+      if (!volume && (g->storage_index = pools_[3].take())) bind_storage(g->storage_index, g->image.view, 4);
+      if (!volume && g->image.array_view && (g->storage_array_index = pools_[4].take()))
+        bind_storage(g->storage_array_index, g->image.array_view, 5);
+      if (volume && (g->storage_volume_index = pools_[5].take())) bind_storage(g->storage_volume_index, g->image.view, 6);
     }
+    g->last_used = presents_;
+    g->bytes = uint64_t{g->image.width} * g->image.height * std::max<uint32_t>(g->image.layers, 1) *
+               std::max<uint32_t>(g->image.depth, 1) * 8;  // (rough: up to 8 bytes per texel)
+    image_bytes_ += g->bytes;
     GpuImage* raw = g.get();
     images_[r] = std::move(g);
     return raw;
@@ -1062,6 +1081,66 @@ class Renderer {
     if (notes_.insert(what).second && notes_.size() < 64) XBEM_WARN("gpu", "{}", what);
   }
 
+  // GPU images of resources unused for a while are dropped when their
+  // memory passes the budget (XBEM_IMAGE_BUDGET_MB, default 3072): resources
+  // are never released (probe objects live on), and titles place new ones at
+  // reused addresses, so images only accumulated until the device ran out.
+  void evict_images() {
+    static const uint64_t budget = [] {
+      const char* e = std::getenv("XBEM_IMAGE_BUDGET_MB");
+      return (e ? std::strtoull(e, nullptr, 10) : 3072ull) << 20;
+    }();
+    if (image_bytes_ <= budget || (presents_ & 15) != 0) return;
+    std::vector<std::pair<uint64_t, std::pair<bool, const ResourceState*>>> old;
+    for (const auto& [r, g] : images_)
+      if (g && g->last_used + 32 < presents_ && g.get() != display_) old.push_back({g->last_used, {false, r}});
+    for (const auto& [r, g] : depth_images_)
+      if (g && g->last_used + 32 < presents_) old.push_back({g->last_used, {true, r}});
+    std::sort(old.begin(), old.end());
+    const auto& f = core_.fn();
+    uint64_t freed = 0, count = 0;
+    for (const auto& [used, which] : old) {
+      if (image_bytes_ <= budget * 3 / 4) break;
+      auto& map = which.first ? depth_images_ : images_;
+      auto it = map.find(which.second);
+      if (it == map.end() || !it->second) continue;
+      GpuImage& g = *it->second;
+      if (g.texture_index) bind_texture(g.texture_index, white_.view), pools_[0].give(g.texture_index);
+      if (g.array_index) bind_texture(g.array_index, white_.array_view, 2), pools_[1].give(g.array_index);
+      if (g.volume_index) bind_texture(g.volume_index, white_volume_.view, 3), pools_[2].give(g.volume_index);
+      if (g.storage_index) bind_storage(g.storage_index, scratch_storage_.view, 4), pools_[3].give(g.storage_index);
+      if (g.storage_array_index)
+        bind_storage(g.storage_array_index, scratch_storage_.array_view, 5), pools_[4].give(g.storage_array_index);
+      if (g.storage_volume_index)
+        bind_storage(g.storage_volume_index, scratch_storage_volume_.view, 6), pools_[5].give(g.storage_volume_index);
+      if (g.image.array_view) f.vkDestroyImageView(core_.device(), g.image.array_view, nullptr);
+      if (g.image.view) f.vkDestroyImageView(core_.device(), g.image.view, nullptr);
+      if (g.image.image) f.vkDestroyImage(core_.device(), g.image.image, nullptr);
+      if (g.image.memory) f.vkFreeMemory(core_.device(), g.image.memory, nullptr);
+      image_bytes_ -= std::min(image_bytes_, g.bytes);
+      freed += g.bytes;
+      ++count;
+      map.erase(it);
+    }
+    // Pointers into the maps the pass state may still hold.
+    state_.target = state_.depth = nullptr;
+    for (GpuImage*& t : state_.targets) t = nullptr;
+    state_.target_count = 0;
+    for (GpuImage*& t : current_targets_) t = nullptr;
+    current_depth_ = nullptr;
+    current_count_ = 0;
+    if (count && memory_.ready()) {
+      // The GPU-side descriptor table holds image indices: start it over.
+      using namespace gpu::mem;
+      std::memset(memory_.table_words() + kDescWord, 0, uint64_t{kDescEntries} * kDescEntryWords * 4);
+      descriptors_ = 0;
+      ++descriptor_table_resets_;
+    }
+    if (count)
+      XBEM_INFO("gpu", "{} images not used for 32 presents dropped ({} MiB); {} MiB of images left", count, freed >> 20,
+                image_bytes_ >> 20);
+  }
+
   // Copies between resources happen in guest memory (unified memory, as on
   // the console): the renderer re-reads textures whose memory changed. The
   // CPU does them when the command list runs, in order with the rest.
@@ -1149,7 +1228,10 @@ class Renderer {
   // the stencil test is not emulated yet.
   GpuImage* depth_of(ResourceState* r) {
     if (!r) return nullptr;
-    if (auto it = depth_images_.find(r); it != depth_images_.end()) return it->second.get();
+    if (auto it = depth_images_.find(r); it != depth_images_.end()) {
+      if (it->second) it->second->last_used = presents_;
+      return it->second.get();
+    }
     uint32_t dimension, height, format;
     uint64_t width;
     std::memcpy(&dimension, r->desc, 4);
@@ -1164,8 +1246,14 @@ class Renderer {
       g->image = core_.create_image(static_cast<uint32_t>(width), height, VK_FORMAT_D32_SFLOAT,
                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                         VK_IMAGE_USAGE_SAMPLED_BIT);
-      if (!g->image.image) g.reset();
-      else transition(g->image.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+      if (!g->image.image) {
+        g.reset();
+      } else {
+        transition(g->image.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+        g->last_used = presents_;
+        g->bytes = static_cast<uint64_t>(width) * height * 4;
+        image_bytes_ += g->bytes;
+      }
     } else {
       note(std::format("depth-stencil resource format {} dimension {} not supported", format, dimension));
     }
@@ -2004,7 +2092,8 @@ class Renderer {
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE, compute_layout_ = VK_NULL_HANDLE;
   Image scratch_storage_, scratch_storage_volume_;
-  uint32_t next_storage_ = 0, next_storage_array_ = 0, next_storage_volume_ = 0;
+  IndexPool pools_[6];  // textures, 2D arrays, 3D; storage images, arrays, 3D
+  uint64_t image_bytes_ = 0;
   std::map<uint64_t, VkPipeline> compute_pipelines_;
   std::vector<GpuImage*> written_;
   uint64_t dispatches_ = 0, dispatches_skipped_ = 0;
@@ -2013,7 +2102,7 @@ class Renderer {
   VkDescriptorSet set_ = VK_NULL_HANDLE;
   VkSampler samplers_[kSamplers] = {};
   Image white_, white_volume_;
-  uint32_t next_texture_ = 0, next_array_ = 0, next_volume_ = 0;
+
   std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> images_;
   std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> depth_images_;
   std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> shaders_;
