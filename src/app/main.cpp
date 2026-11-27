@@ -40,6 +40,8 @@ void print_usage() {
       "      --strict                    stop at the first call to an unimplemented import\n"
       "      --trace-hle                 log calls to emulated functions; crash reports and Ctrl+C\n"
       "                                  dumps show each thread's last 64 calls\n"
+      "      --skip-fault ADDR:LEN       a SIGSEGV at ADDR (module+hex or RVA) continues LEN bytes\n"
+      "                                  further, e.g. a title's deliberate crash in its watchdog\n"
       "      --continue-after-breakpoint log int3/__debugbreak() in the title and keep running\n"
       "      --trace-at ADDR[,ADDR...]   tracepoints: log registers and callers when the title's code\n"
       "                                  reaches ADDR (module!export[+hex], module+hex, or a hex RVA\n"

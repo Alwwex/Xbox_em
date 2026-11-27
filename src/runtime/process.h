@@ -36,6 +36,7 @@ struct ProcessOptions {
   bool strict = false;           // terminate on the first call to an unimplemented import
   bool trace_hle = false;
   bool continue_after_breakpoint = false;
+  std::vector<std::string> skip_faults;  // --skip-fault ADDR:LEN
   std::filesystem::path dump_shaders_dir;  // save shader binaries the title creates
   std::vector<std::string> trace_at;  // code tracepoints: module!export[+off], module+off, or an offset in the exe
   uint64_t trace_skip_hits = 0;      // matched hits not logged before the logged ones

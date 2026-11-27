@@ -34,6 +34,9 @@ void set_memory_describer(AddressDescriber describer);
 // int3 / __debugbreak() in guest code normally ends the run with a crash
 // report; when enabled, it is logged and execution continues.
 void set_continue_after_breakpoint(bool enabled);
+// --skip-fault: a SIGSEGV at `rip` continues `length` bytes further (the
+// instruction is skipped). At most 16.
+bool add_skip_fault(uint64_t rip, uint32_t length);
 
 // Console-CPU instructions the host may lack are handled when they fault
 // (SIGILL). Cache write-back hints (CLWB, CLFLUSHOPT) are rewritten in place

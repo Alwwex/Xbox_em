@@ -644,6 +644,16 @@ int Process::run() {
   platform::set_backtrace_printer(&print_unwind_backtrace);
   platform::set_tracepoint_log_hits(options_.trace_log_hits, options_.trace_skip_hits);
   arm_tracepoints(*loader_, options_.trace_at);
+  for (const std::string& spec : options_.skip_faults) {
+    const size_t colon = spec.rfind(':');
+    std::string error;
+    const uint64_t address = colon == std::string::npos ? 0 : resolve_code_spec(*loader_, spec.substr(0, colon), error);
+    const uint32_t length = colon == std::string::npos ? 0 : static_cast<uint32_t>(std::strtoul(spec.c_str() + colon + 1, nullptr, 0));
+    if (!address || !platform::add_skip_fault(address, length))
+      XBEM_WARN("crash", "--skip-fault {}: {}", spec, error.empty() ? "expected ADDR:LENGTH (1-15 bytes)" : error);
+    else
+      XBEM_INFO("crash", "--skip-fault: a fault at {:#x} skips {} bytes", address, length);
+  }
   platform::set_watchpoint_log_writes(options_.watch_log_writes);
   arm_watchpoints(*loader_, options_.watch);
   hle::set_file_read_log(options_.log_reads);

@@ -389,6 +389,14 @@ void describe_memory(uint64_t address, char* out, size_t out_size) {
 
 std::atomic<bool> g_continue_after_breakpoint{false};
 
+struct SkipFault {
+  uint64_t rip;
+  uint32_t length;
+};
+SkipFault g_skip_faults[16];
+std::atomic<int> g_skip_fault_count{0};
+std::atomic<uint64_t> g_skipped_faults{0};
+
 #if defined(__x86_64__)
 // Instructions of the console CPU (AMD Zen 2) that the host CPU may lack.
 // Cache write-back hints (CLWB, CLFLUSHOPT) are rewritten in place into a NOP
@@ -1108,6 +1116,23 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   if (sig == SIGSEGV && handle_watch_fault(info, static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGILL && handle_unsupported_instruction(static_cast<ucontext_t*>(ctx_raw))) return;
   if (sig == SIGTRAP && handle_tracepoint_trap(static_cast<ucontext_t*>(ctx_raw))) return;
+  if (sig == SIGSEGV) {
+    greg_t* g = static_cast<ucontext_t*>(ctx_raw)->uc_mcontext.gregs;
+    const uint64_t rip = static_cast<uint64_t>(g[REG_RIP]);
+    for (int i = 0, n = g_skip_fault_count.load(); i < n; ++i) {
+      if (g_skip_faults[i].rip != rip) continue;
+      g[REG_RIP] = static_cast<greg_t>(rip + g_skip_faults[i].length);
+      const uint64_t k = g_skipped_faults.fetch_add(1) + 1;
+      if (k <= 4 || (k & (k - 1)) == 0) {
+        char line[200], where[160] = {0};
+        if (g_describer) g_describer(rip, where, sizeof where);
+        std::snprintf(line, sizeof line, "[warn ][crash] fault at %s skipped (--skip-fault, #%llu)\n",
+                      where[0] ? where : "?", static_cast<unsigned long long>(k));
+        write_str(line);
+      }
+      return;
+    }
+  }
   if (sig == SIGTRAP && g_continue_after_breakpoint.load()) {
     // int3 leaves RIP after the instruction: returning continues the title.
     char line[320], where[256] = {0};
@@ -1301,6 +1326,14 @@ void install_thread_dump(AddressDescriber describer, CallSiteDescriber call_site
 
 void set_memory_describer(AddressDescriber describer) { g_memory_describer = describer; }
 void set_continue_after_breakpoint(bool enabled) { g_continue_after_breakpoint.store(enabled); }
+
+bool add_skip_fault(uint64_t rip, uint32_t length) {
+  const int n = g_skip_fault_count.load();
+  if (n >= 16 || !length || length > 15) return false;
+  g_skip_faults[n] = {rip, length};
+  g_skip_fault_count.store(n + 1);
+  return true;
+}
 void set_thread_context_printer(ThreadContextPrinter printer) { g_context_printer = printer; }
 void set_backtrace_printer(BacktracePrinter printer) { g_backtrace_printer = printer; }
 

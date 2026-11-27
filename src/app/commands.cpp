@@ -888,6 +888,8 @@ int cmd_run(const Args& args) {
       opt.trace_hle = true;
     } else if (a == "--dump-shaders") {
       opt.dump_shaders_dir = value();
+    } else if (a == "--skip-fault") {
+      opt.skip_faults.push_back(value());
     } else if (a == "--continue-after-breakpoint") {
       opt.continue_after_breakpoint = true;
     } else if (a == "--trace-at") {
