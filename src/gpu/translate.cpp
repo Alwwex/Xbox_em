@@ -2966,7 +2966,8 @@ ComputeInfo ComputeInfo::from_state(const uint8_t* state, size_t size) {
   return c;
 }
 
-TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage, const ComputeInfo* compute) {
+namespace {
+TranslatedShader translate_any(const uint8_t* code, size_t size, ShaderStage stage, const ComputeInfo* compute) {
   TranslatedShader out;
   out.stage = stage;
   if (compute) out.compute = *compute;
@@ -3038,6 +3039,24 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
     w.ok = t.run();
     if (w.ok) return w;
     out.error += std::format("; wave mode: {}", w.error);
+  }
+  return out;
+}
+}  // namespace
+
+TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage stage, const ComputeInfo* compute) {
+  TranslatedShader out = translate_any(code, size, stage, compute);
+  // The largest programs (GTA VI's e45616a4accd3409: 3.5 MB of GLSL, 8.7 MB
+  // of SPIR-V) take dzn minutes to build and then crash it ("stack smashing
+  // detected"), ending the process: refused (XBEM_MAX_GLSL_KB, default 1536).
+  static const size_t limit = [] {
+    const char* e = std::getenv("XBEM_MAX_GLSL_KB");
+    return (e ? std::strtoull(e, nullptr, 10) : 1536ull) << 10;
+  }();
+  if (out.ok && limit && out.glsl.size() > limit) {
+    out.ok = false;
+    out.error = std::format("{} KiB of GLSL: too large for the Vulkan driver (XBEM_MAX_GLSL_KB)", out.glsl.size() >> 10);
+    std::string().swap(out.glsl);
   }
   return out;
 }

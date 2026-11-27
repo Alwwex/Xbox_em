@@ -529,9 +529,11 @@ class Renderer {
     if (now - stats_since_ >= std::chrono::seconds(10)) {
       const auto span = std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_since_).count();
       XBEM_INFO("gpu", "last {} ms: {} submissions ({} to read GPU results on the CPU), {} ms waiting for the GPU; "
-                "shaders so far: {} ms translating, {} glslang runs {} ms, {} pipelines {} ms",
+                "shaders so far: {} ms translating, {} glslang runs {} ms, {} pipelines {} ms ({} graphics {} ms, on "
+                "the render thread)",
                 span, gpu_submissions_, flushes_for_gpu_output_, gpu_wait_us_ / 1000, translate_us_.load() / 1000,
-                glslang_runs_.load(), glslang_us_.load() / 1000, pipelines_created_.load(), pipeline_us_.load() / 1000);
+                glslang_runs_.load(), glslang_us_.load() / 1000, pipelines_created_.load(), pipeline_us_.load() / 1000,
+                graphics_pipelines_.load(), graphics_pipeline_us_.load() / 1000);
       save_pipeline_cache();
       flushes_for_gpu_output_ = 0;
       gpu_wait_us_ = gpu_submissions_ = 0;
@@ -1138,7 +1140,9 @@ class Renderer {
     const auto t_pipe = std::chrono::steady_clock::now();
     const VkResult made = core_.fn().vkCreateGraphicsPipelines(core_.device(), pipeline_cache_, 1, &gci, nullptr, &pipe);
     add_us(pipeline_us_, t_pipe);
+    add_us(graphics_pipeline_us_, t_pipe);
     ++pipelines_created_;
+    ++graphics_pipelines_;
     if (made != VK_SUCCESS)
       XBEM_WARN("gpu", "pipeline vs {:016x} ps {:016x}: vkCreateGraphicsPipelines failed", p.vs_hash, p.ps_hash);
     pipelines_[key] = pipe;
@@ -2277,6 +2281,7 @@ class Renderer {
   fs::path cache_dir_;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::atomic<uint64_t> pipelines_created_{0}, pipelines_saved_{0};
+  std::atomic<uint64_t> graphics_pipelines_{0}, graphics_pipeline_us_{0};
   std::atomic<uint64_t> translate_us_{0}, glslang_us_{0}, pipeline_us_{0}, glslang_runs_{0};
   State state_;
   GpuImage* display_ = nullptr;
