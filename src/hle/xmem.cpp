@@ -306,10 +306,19 @@ void note_io_write(uint64_t va, uint64_t size, const char* file, uint64_t offset
 }
 
 bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size) {
-  std::lock_guard lock(g_phys.mutex);
-  if (g_phys.handle < 0 || !g_phys.valid(pfn) || !g_phys.state(pfn).allocated || offset + size > kPhysPageSize)
-    return false;
-  return platform::write_shared(g_phys.handle, page_of_pfn(pfn) * kPhysPageSize + offset, data, size);
+  intptr_t handle;
+  uint64_t at;
+  {
+    // The check under the lock, the write after it: DirectStorage writes
+    // from several threads at once (a page freed meanwhile is the title's
+    // race, as on the console).
+    std::lock_guard lock(g_phys.mutex);
+    if (g_phys.handle < 0 || !g_phys.valid(pfn) || !g_phys.state(pfn).allocated || offset + size > kPhysPageSize)
+      return false;
+    handle = g_phys.handle;
+    at = page_of_pfn(pfn) * kPhysPageSize + offset;
+  }
+  return platform::write_shared(handle, at, data, size);
 }
 
 namespace {

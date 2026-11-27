@@ -176,7 +176,8 @@ bool is_status_array(uint64_t p) {
 struct QueueState {
   std::mutex mutex;
   HRESULT first_error = S_OK;  // since the last status/signal
-  uint64_t requests = 0, bytes_read = 0, bytes_out = 0;
+  uint64_t requests = 0, bytes_read = 0;
+  std::atomic<uint64_t> bytes_out{0};
   // Statistics for the Submit log: requests per compression format, failed
   // requests, and requests whose source is memory (not executed yet).
   std::map<uint32_t, uint64_t> by_compression;
@@ -496,9 +497,13 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
                 source_size, offset, file->size, describe_code_address(caller), hex_qwords(w, 12));
     return HRESULT(0x80070026);  // HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)
   }
-  std::lock_guard lock(q->mutex);
-  ++q->requests;
-  q->bytes_read += source_size;
+  {
+    // Only the counters: the rest (inflate, writes) runs in parallel for the
+    // requests of one Submit (RequestPool).
+    std::lock_guard lock(q->mutex);
+    ++q->requests;
+    q->bytes_read += source_size;
+  }
   // Writes [from, from + n) of the destination's bytes into its physical pages.
   // How the data was made, for crash reports (note_physical_write).
   uint32_t how = compression == 0 ? 1 : 0;
@@ -940,7 +945,7 @@ void XBEM_GUEST_ABI queue_submit(ProbeObject* self) {
     XBEM_INFO("dstorage",
               "Submit #{}: {} requests so far, {:#x} bytes read, {:#x} bytes delivered; by compression format{}; "
               "failed {}, memory sources not executed {}",
-              n + 1, q->requests, q->bytes_read, q->bytes_out, formats, q->failed, q->memory_sources);
+              n + 1, q->requests, q->bytes_read, q->bytes_out.load(), formats, q->failed, q->memory_sources);
     log_file_coverage();
   }
 }
