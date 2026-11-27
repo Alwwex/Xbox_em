@@ -325,11 +325,12 @@ class Translator {
     // removed after ~2 s and every later submission fails. The guard ends the
     // program after 2^15 block transitions.
     line("uint blk = 0u, guard = 0u;");
-    // The guard counts blocks run (2^15 by default, XBEM_LOOP_GUARD=n for
-    // 2^n): a loop that never ends would hang the GPU into a device removal.
+    // The guard counts blocks run (2^17 by default, XBEM_LOOP_GUARD=n for
+    // 2^n): a loop that never ends would hang the GPU into a device removal
+    // (~1.3 s at 2^17; GTA VI's 1a3bfbc46d1a6fbe needs more than 2^15).
     static const uint32_t limit = [] {
       const char* e = std::getenv("XBEM_LOOP_GUARD");
-      const int n = e ? std::atoi(e) : 15;
+      const int n = e ? std::atoi(e) : 17;
       return 1u << std::clamp(n, 10, 24);
     }();
     line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", limit));
