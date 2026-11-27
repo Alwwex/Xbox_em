@@ -333,8 +333,18 @@ class Translator {
       const int n = e ? std::atoi(e) : 17;
       return 1u << std::clamp(n, 10, 24);
     }();
-    line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", limit));
-    line(std::format("if (guard == {:#x}u) {{ MemT(pc.mem).w[{}u] = {:#x}u; MemT(pc.mem).w[{}u] = blk; }}", limit - 1,
+    // Vertex/pixel shaders run per vertex or pixel - millions per draw: a
+    // lower limit (2^13) keeps a stuck draw below the device-removal timeout.
+    // Pixel helper invocations (derivative lanes) get undefined results from
+    // subgroup operations on D3D12 and can circle in waterfall loops forever:
+    // they stop after 2^9 blocks.
+    const uint32_t stage_limit = out_.stage == ShaderStage::Compute ? limit : std::min<uint32_t>(limit, 1u << 13);
+    if (out_.stage == ShaderStage::Pixel)
+      line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u && !(gl_HelperInvocation && guard > 512u)) {{",
+                       stage_limit));
+    else
+      line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", stage_limit));
+    line(std::format("if (guard == {:#x}u) {{ MemT(pc.mem).w[{}u] = {:#x}u; MemT(pc.mem).w[{}u] = blk; }}", stage_limit - 1,
                      mem::kGuardWord, out_.tag, mem::kGuardBlockWord));
     line("switch (blk) {");
     bool open = false;
