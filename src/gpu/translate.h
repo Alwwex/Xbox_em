@@ -59,6 +59,7 @@ struct Slot {
   uint32_t instruction = 0;  // index into Program::instructions: captured when the scalar run reaches it
   uint32_t sgpr = 0;         // first SGPR (Buffer: 4, Texture: 8, Sampler: 4 consecutive)
   uint32_t offset = 0;       // first word in the per-draw array
+  bool written = false;      // Buffer: the shader stores to it (later scalar reads of it need the results)
 };
 
 struct DecodedInstruction {

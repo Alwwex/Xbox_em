@@ -434,6 +434,7 @@ class Renderer {
     }
     submitted_cs_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
+    gpu_output_.clear();
     // Every ~10 s: how much of the time went into waiting for the GPU.
     gpu_wait_us_ += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
@@ -442,8 +443,9 @@ class Renderer {
     if (stats_since_ == std::chrono::steady_clock::time_point{}) stats_since_ = now;
     if (now - stats_since_ >= std::chrono::seconds(10)) {
       const auto span = std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_since_).count();
-      XBEM_INFO("gpu", "last {} ms: {} submissions, {} ms waiting for the GPU", span, gpu_submissions_,
-                gpu_wait_us_ / 1000);
+      XBEM_INFO("gpu", "last {} ms: {} submissions ({} to read GPU results on the CPU), {} ms waiting for the GPU",
+                span, gpu_submissions_, flushes_for_gpu_output_, gpu_wait_us_ / 1000);
+      flushes_for_gpu_output_ = 0;
       gpu_wait_us_ = gpu_submissions_ = 0;
       stats_since_ = now;
     }
@@ -1553,6 +1555,29 @@ class Renderer {
     return raw;
   }
 
+  // Buffers the recorded (not yet run) dispatches write: [start, end) guest
+  // addresses from their written Buffer slots.
+  std::vector<std::pair<uint64_t, uint64_t>> gpu_output_;
+  uint64_t flushes_for_gpu_output_ = 0;
+
+  bool reads_gpu_output(uint64_t address, size_t size) const {
+    for (const auto& [a, b] : gpu_output_)
+      if (address < b && address + size > a) return true;
+    return false;
+  }
+
+  void note_gpu_output(const gpu::TranslatedShader& shader, const std::vector<uint32_t>& words) {
+    for (const gpu::Slot& slot : shader.slots) {
+      if (slot.kind != gpu::SlotKind::Buffer || !slot.written || slot.offset + 4 > words.size()) continue;
+      const uint64_t address = words[slot.offset] | (uint64_t{words[slot.offset + 1]} << 32);
+      if (!address || (address >> 63)) continue;  // nothing, or data of the upload ring
+      const uint64_t stride = words[slot.offset + 2], records = words[slot.offset + 3];
+      uint64_t bytes = stride ? records * stride : records;
+      if (!bytes || bytes > (uint64_t{1} << 32)) bytes = uint64_t{1} << 20;
+      gpu_output_.emplace_back(address, address + bytes);
+    }
+  }
+
   void dispatch(uint32_t x, uint32_t y, uint32_t z) {
     if (std::getenv("XBEM_NO_COMPUTE")) return;
     ComputePipeline* p = state_.compute;
@@ -1572,17 +1597,32 @@ class Renderer {
     // s_getpc_b64: the program's copy on the GPU, as a direct device address
     // (bit 63); the CPU reads such addresses from the program bytes.
     if (cs->code.mapped) run.code_address = cs->code.address | (uint64_t{1} << 63);
+    // A scalar load from a buffer an earlier dispatch of this command buffer
+    // writes (GPU-driven counts and arguments) would read guest memory before
+    // that dispatch ran: run what is recorded first (its results are written
+    // back) and run the scalar part again.
+    bool stale = false;
     run.read = [&](uint64_t address, void* out, size_t size) {
       if (run.code_address && address >= run.code_address && address - run.code_address + size <= cs->code_bytes.size()) {
         std::memcpy(out, cs->code_bytes.data() + (address - run.code_address), size);
         return true;
       }
+      if (!stale && reads_gpu_output(address, size)) stale = true;
       return tokens.read(address, out, size);
     };
     run.resolve = [&](gpu::SlotKind kind, const uint32_t* w, uint32_t* out) { resolve(kind, w, out, tokens); };
     std::vector<uint32_t> words;
     written_.clear();
     if (!gpu::run_scalar(cs->shader, run, words)) return skip_dispatch("scalar run");
+    if (stale) {
+      ++flushes_for_gpu_output_;
+      submit();
+      begin();
+      stale = false;
+      written_.clear();
+      if (!gpu::run_scalar(cs->shader, run, words)) return skip_dispatch("scalar run");
+    }
+    note_gpu_output(cs->shader, words);
     const VkDeviceSize n = std::max<VkDeviceSize>(words.size() * 4, 16);
     const VkDeviceSize at = ring_alloc(n, 16);
     std::memset(static_cast<uint8_t*>(ring_.mapped) + at, 0, n);

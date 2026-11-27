@@ -1849,6 +1849,9 @@ class Translator {
       dword3 = sreg(srsrc + 3);
     } else {
       const uint32_t base = add_slot(SlotKind::Buffer, srsrc, 5);
+      const std::string_view n = name_of(insn);
+      if (n.find("store") != std::string_view::npos || n.find("atomic") != std::string_view::npos)
+        out_.slots.back().written = true;
       lo = std::format("D({}u)", base);
       hi = std::format("D({}u)", base + 1);
       stride = std::format("D({}u)", base + 2);
