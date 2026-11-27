@@ -122,6 +122,12 @@ struct ShaderEntry {
   VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+// Microseconds since `t0` added to a counter.
+inline void add_us(std::atomic<uint64_t>& counter, std::chrono::steady_clock::time_point t0) {
+  counter += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
 // Worker threads for shader preparation (detached: they live as long as the
 // process).
 class CompilePool {
@@ -355,6 +361,19 @@ class Renderer {
     cache_dir_ = fs::path(home ? home : "/tmp") / ".cache" / "xbem" / "spirv";
     std::error_code ec;
     fs::create_directories(cache_dir_, ec);
+    // Pipelines (the driver's SPIR-V -> DXIL work) persist between runs.
+    {
+      std::ifstream in(cache_dir_ / "pipelines.bin", std::ios::binary);
+      std::vector<char> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+      pci.initialDataSize = blob.size();
+      pci.pInitialData = blob.empty() ? nullptr : blob.data();
+      if (core_.fn().vkCreatePipelineCache(core_.device(), &pci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        pci.initialDataSize = 0, pci.pInitialData = nullptr;
+        core_.fn().vkCreatePipelineCache(core_.device(), &pci, nullptr, &pipeline_cache_);
+      }
+      XBEM_INFO("gpu", "pipeline cache: {} KiB from {}", blob.size() >> 10, (cache_dir_ / "pipelines.bin").string());
+    }
     info = core_.device_name();
     return true;
   }
@@ -509,8 +528,11 @@ class Renderer {
     if (stats_since_ == std::chrono::steady_clock::time_point{}) stats_since_ = now;
     if (now - stats_since_ >= std::chrono::seconds(10)) {
       const auto span = std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_since_).count();
-      XBEM_INFO("gpu", "last {} ms: {} submissions ({} to read GPU results on the CPU), {} ms waiting for the GPU",
-                span, gpu_submissions_, flushes_for_gpu_output_, gpu_wait_us_ / 1000);
+      XBEM_INFO("gpu", "last {} ms: {} submissions ({} to read GPU results on the CPU), {} ms waiting for the GPU; "
+                "shaders so far: {} ms translating, {} glslang runs {} ms, {} pipelines {} ms",
+                span, gpu_submissions_, flushes_for_gpu_output_, gpu_wait_us_ / 1000, translate_us_.load() / 1000,
+                glslang_runs_.load(), glslang_us_.load() / 1000, pipelines_created_.load(), pipeline_us_.load() / 1000);
+      save_pipeline_cache();
       flushes_for_gpu_output_ = 0;
       gpu_wait_us_ = gpu_submissions_ = 0;
       stats_since_ = now;
@@ -519,6 +541,26 @@ class Renderer {
     memory_.end_submission();
     ring_offset_ = 0;
     uploads_.clear();
+  }
+
+  // The pipeline cache to disk when pipelines were made since the last save.
+  void save_pipeline_cache() {
+    const uint64_t made = pipelines_created_.load();
+    if (!pipeline_cache_ || made == pipelines_saved_.load()) return;
+    pipelines_saved_ = made;
+    const auto& f = core_.fn();
+    size_t size = 0;
+    if (f.vkGetPipelineCacheData(core_.device(), pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<char> blob(size);
+    if (f.vkGetPipelineCacheData(core_.device(), pipeline_cache_, &size, blob.data()) != VK_SUCCESS) return;
+    const fs::path tmp = cache_dir_ / "pipelines.bin.tmp";
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      out.write(blob.data(), static_cast<std::streamsize>(size));
+      if (!out) return;
+    }
+    std::error_code ec;
+    fs::rename(tmp, cache_dir_ / "pipelines.bin", ec);
   }
 
   VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align) {
@@ -884,7 +926,9 @@ class Renderer {
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) return it->second.get();
     auto e = std::make_unique<ShaderEntry>();
+    const auto t_translate = std::chrono::steady_clock::now();
     e->shader = gpu::translate_shader(code.data(), code.size(), stage);
+    add_us(translate_us_, t_translate);
     {
       std::lock_guard lock(tags_mutex_);  // (the loop guard reports wave-mode vertex/pixel shaders too)
       shader_tags_[e->shader.tag] = hash;
@@ -910,7 +954,11 @@ class Renderer {
       std::ofstream(src) << glsl;
       const std::string cmd = std::format("glslangValidator -V --target-env vulkan1.2 -o '{}' '{}' > '{}.log' 2>&1",
                                           spv.string(), src.string(), src.string());
-      if (std::system(cmd.c_str()) != 0) {
+      const auto t_glslang = std::chrono::steady_clock::now();
+      const int rc = std::system(cmd.c_str());
+      add_us(glslang_us_, t_glslang);
+      ++glslang_runs_;
+      if (rc != 0) {
         std::ifstream log(src.string() + ".log");
         std::string text((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
         error = std::format("GLSL compile failed ({}): {}", src.string(), text.substr(0, 400));
@@ -1087,7 +1135,11 @@ class Renderer {
     gci.pDynamicState = &dy;
     gci.layout = layout_;
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (core_.fn().vkCreateGraphicsPipelines(core_.device(), VK_NULL_HANDLE, 1, &gci, nullptr, &pipe) != VK_SUCCESS)
+    const auto t_pipe = std::chrono::steady_clock::now();
+    const VkResult made = core_.fn().vkCreateGraphicsPipelines(core_.device(), pipeline_cache_, 1, &gci, nullptr, &pipe);
+    add_us(pipeline_us_, t_pipe);
+    ++pipelines_created_;
+    if (made != VK_SUCCESS)
       XBEM_WARN("gpu", "pipeline vs {:016x} ps {:016x}: vkCreateGraphicsPipelines failed", p.vs_hash, p.ps_hash);
     pipelines_[key] = pipe;
     return pipe;
@@ -1997,7 +2049,9 @@ class Renderer {
     auto job = std::make_shared<Job>(Job{p.cs_hash, p.code, p.state_a});
     compile_pool().run([this, raw, job] {
       const gpu::ComputeInfo info = gpu::ComputeInfo::from_state(job->state_a.data(), job->state_a.size());
+      const auto t_translate = std::chrono::steady_clock::now();
       raw->shader = gpu::translate_shader(job->code.data(), job->code.size(), gpu::ShaderStage::Compute, &info);
+      add_us(translate_us_, t_translate);
       {
         std::lock_guard lock(tags_mutex_);
         shader_tags_[raw->shader.tag] = job->hash;
@@ -2010,8 +2064,12 @@ class Renderer {
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                     raw->module, "main", nullptr};
         ci.layout = compute_layout_;
-        if (core_.fn().vkCreateComputePipelines(core_.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &raw->pipeline) !=
-            VK_SUCCESS) {
+        const auto t_pipe = std::chrono::steady_clock::now();
+        const VkResult made = core_.fn().vkCreateComputePipelines(core_.device(), pipeline_cache_, 1, &ci, nullptr,
+                                                                  &raw->pipeline);
+        add_us(pipeline_us_, t_pipe);
+        ++pipelines_created_;
+        if (made != VK_SUCCESS) {
           raw->pipeline = VK_NULL_HANDLE;
           raw->error = "compute pipeline creation failed";
         }
@@ -2217,6 +2275,9 @@ class Renderer {
   std::map<uint32_t, VkShaderModule> rect_gs_;
   std::map<PipelineKey, VkPipeline> pipelines_;
   fs::path cache_dir_;
+  VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+  std::atomic<uint64_t> pipelines_created_{0}, pipelines_saved_{0};
+  std::atomic<uint64_t> translate_us_{0}, glslang_us_{0}, pipeline_us_{0}, glslang_runs_{0};
   State state_;
   GpuImage* display_ = nullptr;
   uint32_t display_format_ = 28;

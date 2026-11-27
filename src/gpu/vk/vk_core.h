@@ -63,6 +63,8 @@ namespace xbem::gpu::vk {
   X(vkCreatePipelineLayout)                      \
   X(vkCreateGraphicsPipelines)                   \
   X(vkCreateComputePipelines)                    \
+  X(vkCreatePipelineCache)                       \
+  X(vkGetPipelineCacheData)                      \
   X(vkCreateDescriptorPool)                      \
   X(vkAllocateDescriptorSets)                    \
   X(vkUpdateDescriptorSets)                      \
