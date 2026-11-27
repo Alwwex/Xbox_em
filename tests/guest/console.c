@@ -1396,9 +1396,11 @@ static void test_headless_d3d12(void) {
                                               &back_buffer) == 0 && back_buffer);
   CHECK(((GpuVaFn)VT(back_buffer)[11])(back_buffer) != 0);
 
-  /* Descriptors are memory: CreateRenderTargetView (20) / CreateShaderResourceView
-   * (18) write the emulator's 32-byte encoding ("XBDS", kind, resource) at the
-   * handle; copies by the title and CopyDescriptorsSimple (24) carry it. */
+  /* Descriptors are memory: CreateRenderTargetView (20) writes the emulator's
+   * 32-byte encoding ("XBDS", kind, resource) at the handle; a buffer's
+   * CreateShaderResourceView (18) an RDNA2 buffer descriptor (V#: address,
+   * stride, records), as console shaders read them; copies by the title and
+   * CopyDescriptorsSimple (24) carry both. */
   typedef void (*CreateViewFn)(void*, void*, const void*, uint64_t);
   typedef void (*CopySimpleFn)(void*, uint32_t, uint64_t, uint64_t, uint32_t);
   ((CreateViewFn)VT(device)[20])(device, back_buffer, 0, start + 2 * 32);
@@ -1408,7 +1410,11 @@ static void test_headless_d3d12(void) {
   ((CopySimpleFn)VT(device)[24])(device, 2, start + 10 * 32, start + 2 * 32, 0);
   const uint32_t* copied = (const uint32_t*)(uintptr_t)(start + 11 * 32);
   CHECK(memcmp((const void*)(uintptr_t)(start + 10 * 32), rtv, 32) == 0);
-  CHECK(copied[0] == 0x53444258 && ((const uint8_t*)copied)[4] == 2 && *(void* const*)(copied + 2) == buffer);
+  {
+    const uint64_t va = ((GpuVaFn)VT(buffer)[11])(buffer);
+    CHECK(va != 0 && copied[0] == (uint32_t)va && (copied[1] & 0xffff) == (uint32_t)(va >> 32) && copied[2] != 0 &&
+          copied[3] == 0x0002403c);
+  }
   /* 76: CreateCommittedResource's seven arguments */
   void* texture76 = 0;
   CHECK(((CreateCommittedFn)VT(device)[76])(device, heap_props, 0, tex, 0, 0, resource_iid, &texture76) == 0 &&

@@ -890,6 +890,44 @@ void* resource_at(uint64_t address, uint64_t desc) {
   return r;
 }
 
+// A buffer SRV/UAV as the console has it: an RDNA2 buffer descriptor (V#)
+// over the view's elements - the title's shaders load descriptors from the
+// heap and address memory with them (the emulator's own XBDS descriptor sent
+// GTA VI's culling shaders to the magic as an address). D3D12 view layouts:
+// SRV {format, dimension, mapping, pad, FirstElement u64, NumElements,
+// StructureByteStride, Flags}; UAV {format, dimension, FirstElement u64,
+// NumElements, StructureByteStride, CounterOffset u64, Flags}. Dimension 1 =
+// buffer. False for other views.
+bool buffer_view_descriptor(uint64_t resource, uint64_t desc, bool uav, uint64_t handle) {
+  if (!handle) return false;
+  if (!desc) {  // the resource's default view: a buffer as raw bytes
+    const ResourceState* r = resource_of(resource);
+    uint32_t dimension = 0;
+    if (r) std::memcpy(&dimension, r->desc, 4);
+    if (!r || dimension != 1) return false;
+    const uint32_t v[8] = {static_cast<uint32_t>(r->gpu_va), static_cast<uint32_t>(r->gpu_va >> 32),
+                           static_cast<uint32_t>(std::min<uint64_t>(r->size, 0xffffffffu)), 0x0002403c, 0, 0, 0, 0};
+    platform::safe_write(handle, v, sizeof v);
+    return true;
+  }
+  uint32_t d[10] = {};
+  if (!platform::safe_read(desc, d, sizeof d) || d[1] != 1) return false;
+  const uint32_t* b = uav ? d + 2 : d + 4;  // FirstElement (2 words), NumElements, StructureByteStride
+  const uint64_t first = b[0] | (uint64_t{b[1]} << 32);
+  const uint32_t count = b[2], structure = b[3];
+  const uint32_t flags = uav ? d[8] : b[4];
+  uint32_t element = structure;
+  if (!element) element = (flags & 1) ? 4 : std::max<uint32_t>(format_info(d[0]).bytes, 4);
+  const ResourceState* r = resource_of(resource);
+  const uint64_t base = r ? r->gpu_va + first * element : 0;
+  const uint32_t stride = structure ? structure : 0;
+  const uint32_t records = structure ? count : count * element;
+  const uint32_t v[8] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32) | ((stride & 0x3fff) << 16),
+                         r ? records : 0, 0x0002403c, 0, 0, 0, 0};
+  platform::safe_write(handle, v, sizeof v);
+  return true;
+}
+
 // Device descriptor creation (PC order, measured shapes): 17 CBV(desc, handle),
 // 18 SRV(resource, desc, handle), 19 UAV(resource, counter, desc, handle),
 // 20 RTV(resource, desc, handle), 21 DSV(resource, desc, handle), 22
@@ -913,8 +951,16 @@ uint64_t XBEM_GUEST_ABI device_descriptor_method(ProbeObject* self, uint64_t a1,
       platform::safe_write(a2, v, sizeof v);
       break;
     }
-    case 18: { auto [x, y] = view(a2); write_descriptor(a3, kSrv, a1, x, y); break; }
-    case 19: { auto [x, y] = view(a3); write_descriptor(a4, kUav, a1, x, y); break; }
+    case 18: {
+      auto [x, y] = view(a2);
+      if (!buffer_view_descriptor(a1, a2, false, a3)) write_descriptor(a3, kSrv, a1, x, y);
+      break;
+    }
+    case 19: {
+      auto [x, y] = view(a3);
+      if (!buffer_view_descriptor(a1, a3, true, a4)) write_descriptor(a4, kUav, a1, x, y);
+      break;
+    }
     case 20: { auto [x, y] = view(a2); write_descriptor(a3, kRtv, a1, x, y); break; }
     case 21: { auto [x, y] = view(a2); write_descriptor(a3, kDsv, a1, x, y); break; }
     case 22: {  // an S# (16 bytes): address modes and filters of the D3D12_SAMPLER_DESC
