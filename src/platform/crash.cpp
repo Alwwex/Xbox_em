@@ -1137,11 +1137,20 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
     // int3 leaves RIP after the instruction: returning continues the title.
     char line[320], where[256] = {0};
     const uint64_t rip = static_cast<uint64_t>(static_cast<ucontext_t*>(ctx_raw)->uc_mcontext.gregs[REG_RIP]);
-    // GTA VI's streaming asserts hit tens of thousands of times: after the
-    // first 256 lines only every power of two is logged.
-    static std::atomic<uint64_t> hits{0};
-    const uint64_t k = hits.fetch_add(1) + 1;
-    if (k > 256 && (k & (k - 1)) != 0) return;
+    // GTA VI's streaming asserts hit tens of thousands of times: per address,
+    // after the first 16 hits only every power of two is logged.
+    static std::atomic<uint64_t> rips[128];
+    static std::atomic<uint64_t> counts[128];
+    uint64_t k = 1;
+    for (auto& r : rips) {
+      uint64_t seen = r.load();
+      if (seen == 0 && r.compare_exchange_strong(seen, rip)) seen = rip;
+      if (seen == rip) {
+        k = counts[&r - rips].fetch_add(1) + 1;
+        break;
+      }
+    }
+    if (k > 16 && (k & (k - 1)) != 0) return;
     if (g_describer) g_describer(rip - 1, where, sizeof where);
     static std::atomic<int> detailed{0};
     const bool details = detailed.fetch_add(1) < kBreakpointDetails;
