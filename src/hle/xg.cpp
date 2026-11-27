@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 
+#include "gpu/swizzle.h"
 #include "hle/discovery.h"
 #include "hle/hle_util.h"
 #include "hle/probe_com.h"
@@ -182,9 +183,61 @@ HRESULT XBEM_GUEST_ABI computer_copy_from(ProbeObject* self, uint8_t* linear, ui
   return S_OK;
 }
 
+// The console's answer: the layout addrlib gives a 64KB_S texture (tail
+// first, mip 0 last - GTA VI's fn 0x51fb680 assumes the packed mips at tile
+// 0 and merges small mips into them, and the files were cut for it).
+bool console_tiling(const TextureLayout& l, uint32_t* num_tiles, uint8_t* packed, uint32_t* shape,
+                    uint32_t* num_subresources, uint32_t first, uint8_t* tilings) {
+  static const bool off = std::getenv("XBEM_XG_D3D12_TILING") != nullptr;
+  const bool volume = l.dimension == 4;
+  if (off || l.mip.empty() || l.samples > 1 || l.mips > 15) return false;
+  gpu::TileLayout t;
+  if (!gpu::tile_layout(l.element.bytes, l.mip[0].width_elements, l.mip[0].height_elements, l.mip[0].depth, volume,
+                        l.mips, t))
+    return false;
+  const uint32_t slices = volume ? 1 : std::max<uint32_t>(l.slices, 1);
+  if (num_tiles) *num_tiles = t.tiles_per_slice * slices;
+  if (packed) {
+    packed[0] = static_cast<uint8_t>(t.first_tail);
+    packed[1] = static_cast<uint8_t>(l.mips - t.first_tail);
+    put<uint32_t>(packed, 4, t.tail_tiles);
+    put<uint32_t>(packed, 8, t.tail_tiles ? t.tail_tile : 0);
+  }
+  if (shape) {
+    const uint32_t texels = l.element.block ? 4 : 1;
+    shape[0] = t.block_width * texels;
+    shape[1] = t.block_height * texels;
+    shape[2] = t.block_depth;
+  }
+  if (num_subresources && tilings) {
+    const uint32_t total = l.mips * slices;
+    const uint32_t n = first < total ? std::min(*num_subresources, total - first) : 0;
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint32_t sub = first + k, m = sub % l.mips, slice = sub / l.mips;
+      uint8_t* out = tilings + k * 12;
+      const bool is_packed = m >= t.first_tail;
+      put<uint32_t>(out, 0, is_packed ? 0 : t.mip[m].wide);
+      put<uint16_t>(out, 4, static_cast<uint16_t>(is_packed ? 0 : t.mip[m].high));
+      put<uint16_t>(out, 6, static_cast<uint16_t>(is_packed ? 0 : t.mip[m].deep));
+      put<uint32_t>(out, 8, is_packed ? 0xFFFFFFFFu : slice * t.tiles_per_slice + t.mip[m].first_tile);
+    }
+    *num_subresources = n;
+  }
+  static const bool log_all = std::getenv("XBEM_XG_LOG") != nullptr;
+  if (log_all) {
+    std::string mips;
+    for (uint32_t m = 0; m < t.first_tail; ++m) mips += std::format(" {}x{}@{}", t.mip[m].wide, t.mip[m].high, t.mip[m].first_tile);
+    XBEM_INFO("xg", "tiling {}x{}x{} dim {} format {} mips {} slices {} -> {} tiles/slice (64KB_S), std{} tail {} at {}",
+              l.mip[0].width, l.mip[0].height, l.mip[0].depth, l.dimension, l.format, l.mips, slices,
+              t.tiles_per_slice, mips, l.mips - t.first_tail, t.tail_tile);
+  }
+  return true;
+}
+
 // GetResourceTiling(numTiles*, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*,
-// numSubresourceTilings* (in/out), firstSubresource, D3D12_SUBRESOURCE_TILING*)
-// with D3D12's standard 64 KiB tiles: tile shapes of 256x256 (1-byte
+// numSubresourceTilings* (in/out), firstSubresource, D3D12_SUBRESOURCE_TILING*):
+// the console layout (console_tiling above); XBEM_XG_D3D12_TILING=1 or a
+// description addrlib refuses gives the earlier answer, D3D12's standard 64 KiB tiles: tile shapes of 256x256 (1-byte
 // elements) down to 64x64 (16-byte elements, BC blocks); a mip with a side
 // smaller than the tile and all smaller ones are "packed" into whole tiles of
 // their own. GTA VI sizes its streamed textures from this (fn 0x1403441f0);
@@ -195,6 +248,7 @@ HRESULT computer_get_tiling(ProbeObject* self, uint32_t* num_tiles, uint8_t* pac
   if (!state->computed()) return E_INVALIDARG;
   const TextureLayout l = linear_layout(state->desc);
   if (l.mip.empty()) return E_INVALIDARG;
+  if (console_tiling(l, num_tiles, packed, shape, num_subresources, first, tilings)) return S_OK;
   const uint32_t e = std::max<uint32_t>(l.element.bytes, 1);
   const uint32_t tile_w = e <= 2 ? 256 : e <= 8 ? 128 : 64;
   const uint32_t tile_h = e == 1 ? 256 : e == 2 ? 128 : e == 4 ? 128 : 64;

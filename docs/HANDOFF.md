@@ -147,6 +147,41 @@ the UI samples via ps 736a6b6841007e1e). Needed:
 Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
 slot-57 pipelines, MRT.
 
+## SCENE STABILITY (2026-11-27, later) - read first
+
+Runs 185-192 (`tools/gta6_press_run.sh LOG 600`, synchronous DirectStorage,
+both watchdog skip-faults). Fixed:
+- Pieces inside compressed .ttpf chunks are served from the file's own
+  chunk table (RDS5: u32 magic, u32 count, u32 virtual size, u32; u64
+  entries from 0x10: bits 0-25 offset >> 8, 26-29 type, 30-51 first virtual
+  page, 52-63 padding; last entry = end of file). Chunk type t < 8 is
+  DirectStorage format 2t (type 1 -> format 2 = undecoded BCPack?), type 8 ->
+  zlib (format 1). The request also carries the piece's virtual offset in
+  word 9.
+- Wave64 compute pipelines failed in dzn (ballot of a local bool array
+  element): all GTA VI dispatches were skipped. `xbem gpu-translate X.bin cs
+  info.bin --pipeline` and `--pipeline-glsl F.comp` reproduce dzn pipeline
+  failures offline.
+- pread is retried on EINTR (the title checks only ReadFile's result).
+- GPU write-back merges the words a submission changed into the guest's
+  current bytes (snapshot of dispatch output pages before the submission).
+- MRT: up to 8 colour targets per pass.
+Open findings:
+- The title's in-memory chunk table sometimes names chunks the file does not
+  have (requests past the end of ttdb_props_2_3 / lighting / interiors, zlib
+  requests inside type-1 chunks of ttdb_maps_7_7) although its ReadFile of
+  the table returned all bytes - the table memory gets corrupted later.
+  Next: `--watch at:0xf43721?r12=bb2e:rax+0x28d40/64` (maps_7_7, 0xbb2e
+  entries; table pointer in rax at +0xf43721) to catch the writer.
+- The title's tiling layout (fn 0x1403441f0 / 0x51fb680): per level dword =
+  start tile (16 bits) | width tiles << 16 | height tiles << 24; the packed
+  mip tail is assumed at tile 0 and smaller mips merge into it (AMD order:
+  tail first, mip 0 last). Our GetResourceTiling puts mip 0 first.
+- In-run timing of the press script varies: run 190 stayed on LEGAL TERMS
+  (screenshot at ~215 s shows whether the story load started - black).
+- No depth buffers yet; the console pipeline state blobs (gfx-state-a/b)
+  are not decoded, so depth test/write state is unknown.
+
 ## STREAMING PIECES + COMPUTE COVERAGE (2026-11-27) - read first
 
 - Compute coverage: 2429+ / 2680 (90.6 % before the s_getpc work, all

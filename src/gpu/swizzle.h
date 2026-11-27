@@ -27,4 +27,21 @@ struct SwizzleTable {
 std::shared_ptr<const SwizzleTable> swizzle_table(uint32_t mode, uint32_t bytes, uint32_t width, uint32_t height,
                                                   uint32_t slices, bool volume, uint32_t mips);
 
+// The 64 KiB-tile layout of a tiled (reserved) texture as the console lays
+// it out (addrlib, 64KB_S): per mip its first tile and size in tiles within
+// one slice; mips from `first_tail` on share the mip tail. Unlike D3D12's
+// standard layout the tail comes first and mip 0 last.
+struct TileLayout {
+  uint32_t block_width = 0, block_height = 0, block_depth = 1;  // elements per 64 KiB tile
+  uint32_t mips = 0, first_tail = 0;  // first_tail == mips: no tail
+  struct Mip {
+    uint32_t first_tile = 0, wide = 0, high = 0, deep = 1;
+  } mip[16];
+  uint32_t tail_tile = 0, tail_tiles = 0;
+  uint32_t tiles_per_slice = 0;
+};
+// False when addrlib does not accept the description.
+bool tile_layout(uint32_t bytes, uint32_t width, uint32_t height, uint32_t depth, bool volume, uint32_t mips,
+                 TileLayout& out);
+
 }  // namespace xbem::gpu

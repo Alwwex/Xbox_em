@@ -133,4 +133,51 @@ std::shared_ptr<const SwizzleTable> swizzle_table(uint32_t mode, uint32_t bytes,
   return t;
 }
 
+bool tile_layout(uint32_t bytes, uint32_t width, uint32_t height, uint32_t depth, bool volume, uint32_t mips,
+                 TileLayout& out) {
+  ADDR_HANDLE lib = library();
+  mips = std::clamp(mips, 1u, 16u);
+  if (!lib || !bytes || !width || !height) return false;
+  constexpr uint64_t kTile = 0x10000;
+  ADDR2_MIP_INFO info[16]{};
+  ADDR2_COMPUTE_SURFACE_INFO_INPUT si{};
+  ADDR2_COMPUTE_SURFACE_INFO_OUTPUT so{};
+  si.size = sizeof si;
+  so.size = sizeof so;
+  si.flags.texture = 1;
+  si.swizzleMode = ADDR_SW_64KB_S;
+  si.resourceType = volume ? ADDR_RSRC_TEX_3D : ADDR_RSRC_TEX_2D;
+  si.bpp = bytes * 8;
+  si.width = width;
+  si.height = height;
+  si.numSlices = volume ? std::max(depth, 1u) : 1;
+  si.numMipLevels = mips;
+  si.numSamples = si.numFrags = 1;
+  so.pMipInfo = info;
+  {
+    std::lock_guard lock(g_mutex);
+    if (Addr2ComputeSurfaceInfo(lib, &si, &so) != ADDR_OK) return false;
+  }
+  out = TileLayout{};
+  out.block_width = so.blockWidth;
+  out.block_height = so.blockHeight;
+  out.block_depth = volume ? std::max(so.blockSlices, 1u) : 1;
+  out.mips = mips;
+  out.first_tail = so.mipChainInTail ? 0 : (so.firstMipIdInTail < mips ? so.firstMipIdInTail : mips);
+  out.tiles_per_slice = static_cast<uint32_t>((so.sliceSize + kTile - 1) / kTile);
+  if (volume) out.tiles_per_slice = static_cast<uint32_t>((so.surfSize + kTile - 1) / kTile);
+  for (uint32_t m = 0; m < out.first_tail; ++m) {
+    TileLayout::Mip& mm = out.mip[m];
+    mm.first_tile = static_cast<uint32_t>(info[m].macroBlockOffset / kTile);
+    mm.wide = (info[m].pitch + so.blockWidth - 1) / so.blockWidth;
+    mm.high = (info[m].height + so.blockHeight - 1) / so.blockHeight;
+    mm.deep = volume ? (info[m].depth + out.block_depth - 1) / out.block_depth : 1;
+  }
+  if (out.first_tail < mips) {
+    out.tail_tile = static_cast<uint32_t>(info[out.first_tail].macroBlockOffset / kTile);
+    out.tail_tiles = 1;
+  }
+  return true;
+}
+
 }  // namespace xbem::gpu
