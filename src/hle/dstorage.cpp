@@ -249,7 +249,10 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
   std::lock_guard lock(g_chunk_mutex);
   const auto key = std::make_pair(static_cast<const FileState*>(file), offset);
   uint64_t start = UINT64_MAX;
-  if (auto it = g_chunk_start.find(key); it != g_chunk_start.end()) start = it->second;
+  if (auto it = g_chunk_start.find(key); it != g_chunk_start.end()) {
+    if (it->second == UINT64_MAX - 1) return false;  // searched before, nothing found
+    start = it->second;
+  }
   const DecodedChunk* c = nullptr;
   if (start == UINT64_MAX) {
     // The nearest chunk start seen before.
@@ -267,11 +270,31 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
   } else if (start != UINT64_MAX) {
     c = decoded_chunk(file, start, compressed);
   } else {
-    for (uint64_t shift = 0x1000; shift <= kMaxChunkShift && shift <= offset && !c; shift += 0x1000) {
+    // Chunk starts are 256-byte aligned (the chunk table stores offsets >>
+    // 8). One read of the window before the piece; only candidates with a
+    // zlib header (CMF method 8, (CMF << 8 | FLG) % 31 == 0) are inflated.
+    const uint64_t back = std::min<uint64_t>(kMaxChunkShift, offset & ~uint64_t{0xff});
+    std::vector<uint8_t> window(back + 2);
+    if (back && file->read(offset - back, window.data(), window.size())) {
+      for (uint64_t shift = 0x100; shift <= back && !c; shift += 0x100) {
+        const uint8_t* h = window.data() + (back - shift);
+        if ((h[0] & 0x0f) != 8 || ((h[0] << 8) | h[1]) % 31 != 0) continue;
+        c = decoded_chunk(file, offset - shift, compressed);
+        if (c && c->data.size() < shift + skip + size) c = nullptr;  // decodes, but too short to hold the piece
+        if (c) g_chunk_start[key] = start = offset - shift;
+      }
+    }
+    // Raw DEFLATE chunks have no header to test: 4 KiB steps, as pieces are
+    // page-aligned there.
+    for (uint64_t shift = 0x1000; shift <= back && !c; shift += 0x1000) {
+      const uint8_t* h = window.data() + (back - shift);
+      if ((h[0] & 0x0f) == 8 && ((h[0] << 8) | h[1]) % 31 == 0) continue;  // tried above
       c = decoded_chunk(file, offset - shift, compressed);
-      if (c && c->data.size() < shift + skip + size) c = nullptr;  // decodes, but too short to hold the piece
+      if (c && c->data.size() < shift + skip + size) c = nullptr;
       if (c) g_chunk_start[key] = start = offset - shift;
     }
+    // Remember failures too: the title retries such requests.
+    if (!c) g_chunk_start[key] = UINT64_MAX - 1;
   }
   if (!c) {
     if (g_shifted_failed.fetch_add(1) < 4)
