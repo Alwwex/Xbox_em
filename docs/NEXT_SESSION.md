@@ -35,8 +35,7 @@ and commits in English.
 
 ## Next steps (suggested order)
 
-1. Run the press script several times (scratchpad scripts are gone - see
-   HANDOFF "How far the title gets"); in runs that reach the scene read the
+1. Run `tools/gta6_press_run.sh ~/xbem-runs/runN.log` several times; in runs that reach the scene read the
    "loop guard" and "not a known graphics pipeline ... memory:" lines.
 2. Fix the looping compute shader(s); identify the missing pipeline
    creation path.
