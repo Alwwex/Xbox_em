@@ -262,10 +262,45 @@ void GuestMemory::end_submission() {
       const auto idx = static_cast<uint32_t>(i * 2 + h);
       const auto mask = static_cast<uint16_t>(w[i] >> (h * 16));
       if (!mask || !idx || idx >= pages_.size() || !pages_[idx].id) continue;
-      pg::write_page(pages_[idx].id, page_data(idx), mask);
+      if (auto it = snapshots_.find(idx); it != snapshots_.end()) {
+        // Three-way: the guest's bytes now, with the words the GPU changed.
+        const uint8_t* gpu = page_data(idx);
+        const uint8_t* before = it->second.data();
+        pg::read_page(pages_[idx].id, scratch_.data());
+        uint16_t changed = 0;
+        for (uint32_t part = 0; part < 16; ++part) {
+          if (!(mask & (1u << part))) continue;
+          const size_t at = size_t{part} * pg::kPartSize;
+          for (size_t k = at; k < at + pg::kPartSize; k += 4) {
+            if (std::memcmp(gpu + k, before + k, 4) == 0) continue;
+            std::memcpy(scratch_.data() + k, gpu + k, 4);
+            changed |= static_cast<uint16_t>(1u << part);
+          }
+        }
+        if (changed) pg::write_page(pages_[idx].id, scratch_.data(), changed);
+        ++stats_.merged;
+      } else {
+        pg::write_page(pages_[idx].id, page_data(idx), mask);
+      }
       ++stats_.written_back;
     }
     w[i] = 0;
+  }
+  snapshots_.clear();
+  snapshot_bytes_ = 0;
+}
+
+void GuestMemory::snapshot(uint64_t va, uint64_t size) {
+  if (!ready() || !size) return;
+  constexpr uint64_t kMaxSnapshotBytes = 256ull << 20;
+  const uint64_t end = std::min<uint64_t>(va + size, 1ull << 47);
+  for (uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
+    const uint32_t* e = entry(p, false);
+    if (!e || !*e || snapshots_.count(*e)) continue;
+    if (snapshot_bytes_ + kPage > kMaxSnapshotBytes) return;  // the rest is written back by parts
+    const uint8_t* d = page_data(*e);
+    snapshots_.emplace(*e, std::vector<uint8_t>(d, d + kPage));
+    snapshot_bytes_ += kPage;
   }
 }
 

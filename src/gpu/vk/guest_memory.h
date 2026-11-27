@@ -41,6 +41,12 @@ class GuestMemory {
   // Makes [va, va + size) readable on the GPU. False when (part of) it is
   // not tracked guest memory (the caller then copies it some other way).
   bool require(uint64_t va, uint64_t size);
+  // Before the submission runs: the GPU copies of [va, va + size) as they
+  // are now (the ranges its dispatches write). Written-back parts of these
+  // pages take only the 32-bit words the GPU changed, so guest writes made
+  // meanwhile to the rest of a 4 KiB part (other threads run while the GPU
+  // does) are not reverted.
+  void snapshot(uint64_t va, uint64_t size);
   // The submission has completed: GPU writes go back to guest memory.
   void end_submission();
   // Makes [window, window + size) show guest memory [real, real + size) on
@@ -50,7 +56,7 @@ class GuestMemory {
   void alias(uint64_t window, uint64_t real, uint64_t size);
 
   struct Stats {
-    uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, evicted = 0, unmapped = 0;
+    uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, merged = 0, evicted = 0, unmapped = 0;
     uint64_t misses = 0, misses_dropped = 0;  // pages shaders reached without a copy
   };
   const Stats& stats() const { return stats_; }
@@ -70,6 +76,9 @@ class GuestMemory {
     uint64_t last_use = 0;
     std::vector<uint64_t> vas;  // 64 KiB guest pages whose table entry names this page
   };
+
+  std::unordered_map<uint32_t, std::vector<uint8_t>> snapshots_;  // page index -> its copy before the GPU ran
+  uint64_t snapshot_bytes_ = 0;
 
   uint32_t* words() const { return static_cast<uint32_t*>(table_.mapped); }
   uint8_t* page_data(uint32_t idx) const;

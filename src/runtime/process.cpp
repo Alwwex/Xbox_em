@@ -665,6 +665,8 @@ int Process::run() {
       std::this_thread::sleep_for(std::chrono::seconds(30));
       const std::vector<std::string> lines = window_status_lines();
       if (lines.size() >= 2) XBEM_INFO("status", "{}; {}", lines[0], lines[1]);
+      // The fence-wait and DirectStorage lines too (not the window's last line).
+      for (size_t i = 2; i + 1 < lines.size(); ++i) XBEM_INFO("status", "  {}", lines[i]);
     }
   }).detach();
   if (options_.window) {

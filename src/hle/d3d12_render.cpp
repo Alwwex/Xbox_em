@@ -349,9 +349,9 @@ class Renderer {
     if (const uint64_t n = presents_ + 1; n >= 64 && (n & (n - 1)) == 0 && memory_.ready()) {
       const auto& m = memory_.stats();
       XBEM_INFO("gpu", "guest memory copy at present {}: {} pages resident ({} MiB), {} uploaded, {} refreshed, "
-                "{} written back, {} evicted, {} unmapped, {} misses ({} dropped); {} image descriptors looked up on the "
+                "{} written back ({} merged word by word), {} evicted, {} unmapped, {} misses ({} dropped); {} image descriptors looked up on the "
                 "GPU ({} misses, {} table resets)", n, m.resident, m.resident >> 4, m.uploaded, m.refreshed,
-                m.written_back, m.evicted, m.unmapped, m.misses, m.misses_dropped, descriptors_, descriptor_misses_,
+                m.written_back, m.merged, m.evicted, m.unmapped, m.misses, m.misses_dropped, descriptors_, descriptor_misses_,
                 descriptor_table_resets_);
     }
     if (!display_) return;
@@ -402,6 +402,7 @@ class Renderer {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd_;
+    for (const auto& [a, b] : gpu_output_) memory_.snapshot(a, b - a);
     const auto started = std::chrono::steady_clock::now();
     VkResult r = f.vkQueueSubmit(core_.queue(), 1, &si, fence_);
     if (r == VK_SUCCESS) r = f.vkWaitForFences(core_.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
