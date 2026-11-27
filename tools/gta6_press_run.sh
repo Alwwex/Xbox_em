@@ -41,7 +41,8 @@ for try in $(seq 1 "${XBEM_RUN_TRIES:-3}"); do
     --skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11 --screenshot "$CHECK@215" "$@" > "$LOG" 2>&1 &
   RUN=$!
   sleep 2
-  PID=$(pgrep -f "^./build/bin/xbem run" | head -1)
+  PID=$(pgrep -P "$RUN" | head -1)  # xbem itself (timeout forwards signals to it too)
+  PID=${PID:-$RUN}
   until [ -s "$CHECK" ] || ! kill -0 "$PID" 2>/dev/null; do sleep 2; done
   sleep 1
   if [ -s "$CHECK" ] && [ "$(brightness "$CHECK")" -gt 4 ]; then
