@@ -24,6 +24,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,7 +113,49 @@ struct ShaderEntry {
   // the constant tables that follow the code.
   Buffer code;
   std::vector<uint8_t> code_bytes;
+  // Compute shaders are prepared on a worker: 0/1 being prepared, 2 ready
+  // (pipeline set), 3 failed.
+  std::atomic<int> state{0};
+  VkPipeline pipeline = VK_NULL_HANDLE;
 };
+
+// Worker threads for shader preparation (detached: they live as long as the
+// process).
+class CompilePool {
+ public:
+  explicit CompilePool(unsigned workers) {
+    for (unsigned i = 0; i < workers; ++i)
+      std::thread([this] {
+        for (;;) {
+          std::function<void()> job;
+          {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [this] { return !jobs_.empty(); });
+            job = std::move(jobs_.front());
+            jobs_.pop_front();
+          }
+          job();
+        }
+      }).detach();
+  }
+  void run(std::function<void()> job) {
+    {
+      std::lock_guard lock(mutex_);
+      jobs_.push_back(std::move(job));
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> jobs_;
+};
+
+CompilePool& compile_pool() {
+  static CompilePool* pool = new CompilePool(3);
+  return *pool;
+}
 
 struct PipelineKey {
   uint64_t vs, ps, blend;
@@ -1435,37 +1481,47 @@ class Renderer {
 
   // ---------------------------------------------------------- compute
 
+  // Compute shaders are prepared on worker threads (translation, GLSL ->
+  // SPIR-V, pipeline creation - seconds for the largest programs): the
+  // title's render thread must not stall on them (its watchdog ends the run
+  // when the main loop stops for 30 s). Dispatches of a shader still being
+  // prepared are skipped.
   ShaderEntry* compute_shader(const ComputePipeline& p) {
     auto it = shaders_.find(p.cs_hash);
     if (it != shaders_.end()) return it->second.get();
     auto e = std::make_unique<ShaderEntry>();
-    const gpu::ComputeInfo info = gpu::ComputeInfo::from_state(p.state_a.data(), p.state_a.size());
-    e->shader = gpu::translate_shader(p.code.data(), p.code.size(), gpu::ShaderStage::Compute, &info);
-    if (!e->shader.ok) e->error = e->shader.error;
-    else e->module = compile(e->shader.glsl, "comp", e->error);
-    if (e->module && !p.code.empty()) {
-      e->code = core_.create_buffer((p.code.size() + 15) & ~size_t{15}, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-      if (e->code.mapped) std::memcpy(e->code.mapped, p.code.data(), p.code.size());
-      e->code_bytes = p.code;
-    }
-    if (!e->error.empty()) XBEM_WARN("gpu", "compute shader {:016x}: {}", p.cs_hash, e->error);
     ShaderEntry* raw = e.get();
     shaders_[p.cs_hash] = std::move(e);
+    struct Job {
+      uint64_t hash;
+      std::vector<uint8_t> code, state_a;
+    };
+    auto job = std::make_shared<Job>(Job{p.cs_hash, p.code, p.state_a});
+    compile_pool().run([this, raw, job] {
+      const gpu::ComputeInfo info = gpu::ComputeInfo::from_state(job->state_a.data(), job->state_a.size());
+      raw->shader = gpu::translate_shader(job->code.data(), job->code.size(), gpu::ShaderStage::Compute, &info);
+      if (!raw->shader.ok) raw->error = raw->shader.error;
+      else raw->module = compile(raw->shader.glsl, "comp", raw->error);
+      if (raw->module) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                    raw->module, "main", nullptr};
+        ci.layout = compute_layout_;
+        if (core_.fn().vkCreateComputePipelines(core_.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &raw->pipeline) !=
+            VK_SUCCESS) {
+          raw->pipeline = VK_NULL_HANDLE;
+          raw->error = "compute pipeline creation failed";
+        }
+      }
+      if (raw->pipeline && !job->code.empty()) {
+        raw->code = core_.create_buffer((job->code.size() + 15) & ~size_t{15}, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        if (raw->code.mapped) std::memcpy(raw->code.mapped, job->code.data(), job->code.size());
+        raw->code_bytes = job->code;
+      }
+      if (!raw->error.empty()) XBEM_WARN("gpu", "compute shader {:016x}: {}", job->hash, raw->error);
+      raw->state.store(raw->pipeline ? 2 : 3, std::memory_order_release);
+    });
     return raw;
-  }
-
-  VkPipeline compute_pipeline(uint64_t hash, VkShaderModule module) {
-    if (auto it = compute_pipelines_.find(hash); it != compute_pipelines_.end()) return it->second;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module,
-                "main", nullptr};
-    ci.layout = compute_layout_;
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (core_.fn().vkCreateComputePipelines(core_.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) {
-      note(std::format("compute pipeline {:016x} creation failed", hash));
-      pipe = VK_NULL_HANDLE;
-    }
-    return compute_pipelines_[hash] = pipe;
   }
 
   void dispatch(uint32_t x, uint32_t y, uint32_t z) {
@@ -1474,9 +1530,10 @@ class Renderer {
     if (!p) return skip_dispatch("no compute pipeline");
     if (!x || !y || !z) return;
     ShaderEntry* cs = compute_shader(*p);
-    if (!cs->module) return skip_dispatch(std::format("cs {:016x} not translated", p->cs_hash));
-    VkPipeline pipe = compute_pipeline(p->cs_hash, cs->module);
-    if (!pipe) return skip_dispatch("pipeline creation failed");
+    const int state = cs->state.load(std::memory_order_acquire);
+    if (state < 2) return skip_dispatch("compute shader being prepared");
+    if (state != 2) return skip_dispatch(std::format("cs {:016x} not translated", p->cs_hash));
+    VkPipeline pipe = cs->pipeline;
     end_rendering();
     Tokens tokens;
     tokens.windows = &windows_;

@@ -261,7 +261,9 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
       if (it != f->second.begin() && offset - *std::prev(it) <= kMaxChunkShift) {
         const uint64_t candidate = *std::prev(it);
         c = decoded_chunk(file, candidate, compressed);
-        if (c && c->data.size() >= offset - candidate + skip + size) g_chunk_start[key] = start = candidate;
+        // (The title asks for the chunk's full size even from inside it: the
+        // piece gets what the chunk still holds.)
+        if (c && c->data.size() > offset - candidate + skip) g_chunk_start[key] = start = candidate;
         else c = nullptr;
       }
     }
@@ -280,7 +282,7 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
         const uint8_t* h = window.data() + (back - shift);
         if ((h[0] & 0x0f) != 8 || ((h[0] << 8) | h[1]) % 31 != 0) continue;
         c = decoded_chunk(file, offset - shift, compressed);
-        if (c && c->data.size() < shift + skip + size) c = nullptr;  // decodes, but too short to hold the piece
+        if (c && c->data.size() <= shift + skip) c = nullptr;  // decodes, but ends before the piece
         if (c) g_chunk_start[key] = start = offset - shift;
       }
     }
@@ -290,7 +292,7 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
       const uint8_t* h = window.data() + (back - shift);
       if ((h[0] & 0x0f) == 8 && ((h[0] << 8) | h[1]) % 31 == 0) continue;  // tried above
       c = decoded_chunk(file, offset - shift, compressed);
-      if (c && c->data.size() < shift + skip + size) c = nullptr;
+      if (c && c->data.size() <= shift + skip) c = nullptr;
       if (c) g_chunk_start[key] = start = offset - shift;
     }
     // Remember failures too: the title retries such requests.
