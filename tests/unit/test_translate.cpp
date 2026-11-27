@@ -102,7 +102,7 @@ TEST(translate_compute_divergent_branch) {
       translate_cs({0x7d880084, 0xbe803c6a, 0xbf880001, 0x7e0202f2, 0x887e007e, kEndpgm}, 0);
   CHECK(t.ok);
   CHECK(has(t, "local_size_x = 64"));
-  CHECK(has(t, "vcc_lo = subgroupBallot(cmpv).x;"));         // the compare becomes a lane mask
+  CHECK(has(t, "vcc_lo = subgroupBallot(cmpv && lane_on()).x;"));  // the compare becomes a lane mask
   CHECK(has(t, "exec_lo = (vcc_lo & exec_lo) & wave_lanes;")); // saveexec narrows exec
   CHECK(has(t, "if (exec_lo == 0u) { blk = 2u; } else { blk = 1u; } }"));  // execz skips the block
   CHECK(has(t, "if (blk == 2u) {"));                          // blocks in program order, no loop
@@ -145,7 +145,7 @@ TEST(translate_compute_vop3_compare_into_an_sgpr_pair) {
   // 0-7, not bits 8-14) ; s_endpgm
   const TranslatedShader t = translate_cs({0xd4c40008, 0x000200c0, kEndpgm}, 0);
   CHECK(t.ok);
-  CHECK(has(t, "s8 = subgroupBallot(cmpv).x;"));
+  CHECK(has(t, "s8 = subgroupBallot(cmpv && lane_on()).x;"));
 }
 
 TEST(translate_pixel_loop_falls_back_to_wave_mode) {

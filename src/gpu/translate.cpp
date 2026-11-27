@@ -466,7 +466,7 @@ class Translator {
                       n != "ds_bpermute_b32" && n != "ds_permute_b32";
     if (both) line("for (wh = 0u; wh < 2u; ++wh) { lane = lane0 + 32u * wh;");
     if (!emit_vector_lane(insn)) return false;
-    if (both) line("if (wh == 0u) cmph0 = cmpv; else cmph1 = cmpv; }");
+    if (both) line("if (wh == 0u) cmph0 = cmpv && lane_on(); else cmph1 = cmpv && lane_on(); }");
     for (const std::string& p : post_) line(p);
     post_.clear();
     return true;
@@ -552,7 +552,8 @@ class Translator {
       line(std::format("  if (lane_on()) {} = on ? val : {}; }}", vreg(v.dst), bc ? "0u" : vreg(v.dst)));
       return true;
     }
-    if (starts(n, "v_cmp") || n.find("_co_") != std::string_view::npos) line("cmpv = false;");
+    // Compare results (cmpv) of inactive lanes are masked where they are
+    // read (ballot_store), so no reset here: it would split the lane guards.
     // DPP16: the source operand comes from another lane of the row (a
     // shuffle, so outside the lane guard).
     if (insn.extension == rdna2::Instruction::Extension::Dpp16) {
@@ -1476,7 +1477,7 @@ class Translator {
   }
 
   std::string ballot_store(uint32_t dst) {
-    const std::string lo = wave64_ ? "subgroupBallot(cmph0).x" : "subgroupBallot(cmpv).x";
+    const std::string lo = wave64_ ? "subgroupBallot(cmph0).x" : "subgroupBallot(cmpv && lane_on()).x";
     const std::string hi = wave64_ ? "subgroupBallot(cmph1).x" : "0u";
     if (dst == kVccLo) return std::format("vcc_lo = {}; vcc_hi = {};", lo, hi);
     if (dst == kExecLo) return std::format("exec_lo = {}; exec_hi = {};", lo, hi);
