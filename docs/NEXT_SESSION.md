@@ -20,33 +20,28 @@ and commits in English.
   game, ideally ~30 fps; they also saw a fully green screen at the start
   (not reproduced in screenshots yet - ask when it appears).
 
-## Where things stand (2026-11-27, later)
+## Where things stand (2026-11-27, evening)
 
-- Compute coverage 98.5 % (2641/2680, all valid GLSL); wave64 programs
-  (~800) run two lanes per invocation; loop guard 2^15 + report.
-- Story loading screen -> scene: with asynchronous DirectStorage queues
-  ~60 % of runs get past it (a race; the status-array fix 82c36f7 did not
-  remove it); with XBEM_DSTORAGE_SYNC=1 4 of 4 runs started the world
-  streaming but the main loop then stalls into the title's watchdog -
-  `--skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11` skip its two
-  deliberate crashes.
-- In the scene the streaming worker (guest thread 340, fn 0x2592c50 ->
-  0x2593560) crashes in varying places (+0x2593e91 callees, +0xf6349):
-  most likely corrupt streamed data - texture pieces that start inside a
-  compressed chunk (int3 +0x4ffd868/879; our GetResourceTiling answers do
-  not match the console's) fail or are recovered (XBEM_CHUNK_RECOVERY=1).
-  Run 28 (sync + recovery + skip-fault) was the next experiment.
-- Other fixes today: XMem scatter batches no longer stop at a bad frame,
-  XDspActivate fails explicitly, XApu acknowledges commands, scalar reads of
-  GPU-written buffers flush first, compute shaders compile on workers.
+- `tools/gta6_press_run.sh LOG 600` (synchronous DirectStorage, both
+  watchdog skip-faults, no thread dumps unless XBEM_RUN_DUMPS) gets through
+  the menus into the story load in most runs; the press timing still varies
+  (run 190 stayed on LEGAL TERMS - add a screenshot at ~215 s, black =
+  loading started). Runs 189/192 lasted 600 s without a crash.
+- Fixed today (see docs/HANDOFF.md "SCENE STABILITY"): pieces inside
+  compressed chunks served from the .ttpf chunk table (virtual offset in
+  request word 9); wave64 compute pipelines (dzn) - compute dispatches now
+  run in the game; pread EINTR; word-precise GPU write-back; MRT; XG
+  GetResourceTiling = addrlib 64KB_S (tail first).
+- The scene stays black (draws and dispatches run). No depth buffers; the
+  console pipeline state blobs are not decoded. Menu icons/check marks are
+  BCPack-like formats (2/14) we cannot decode - the "weird menu" without
+  ticks or text bodies.
 
 ## Next steps (suggested order)
 
-1. Run `XBEM_DSTORAGE_SYNC=1 tools/gta6_press_run.sh ~/xbem-runs/runN.log 540
-   --skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11` (try with/without XBEM_CHUNK_RECOVERY=1) and
-   fix the streaming-worker crashes; the real fix is console-accurate
-   GetResourceTiling / layouts (docs/HANDOFF.md "Texture layout still
-   disagrees with the files").
-2. Find the async DirectStorage race (then drop the sync requirement).
-3. Rendering of the scene (black; unknown pipelines are dumped in the log),
-   then performance (submissions wait for the GPU each time).
+1. Look at what a loading/scene frame draws (`--capture-commands
+   FILE@440:200`, screenshot) and why the display image is black.
+2. Depth buffers: decode depth state from gfx-state-a/b (or the D3D12 desc
+   of slot 55 variants), create depth images for DSVs.
+3. Async DirectStorage race (then drop XBEM_DSTORAGE_SYNC).
+4. Performance (each submission waits for the GPU).
