@@ -585,7 +585,12 @@ class Translator {
       line("}");
       dpp_ = true;
     }
-    line("if (lane_on()) {");
+    // Consecutive vector instructions share one guard (nothing between
+    // them changes exec): a separate branch per instruction made programs
+    // with tens of thousands of them that drivers take minutes to build.
+    static const std::string kGuardEnd = "  }  // lanes\n";
+    if (body_.ends_with(kGuardEnd)) body_.resize(body_.size() - kGuardEnd.size());
+    else line("if (lane_on()) {");
     post_.clear();
     bool ok;
     switch (insn.format) {
@@ -597,7 +602,7 @@ class Translator {
       default: ok = emit(insn); break;
     }
     if (!ok) return false;
-    line("}");
+    line("}  // lanes");
     return true;
   }
 
