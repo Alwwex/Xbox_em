@@ -69,6 +69,7 @@ namespace xbem::gpu::vk {
   X(vkCmdPipelineBarrier)                        \
   X(vkCmdCopyBufferToImage)                      \
   X(vkCmdCopyImageToBuffer)                      \
+  X(vkCmdBlitImage)                              \
   X(vkCmdCopyBuffer)                             \
   X(vkCmdClearColorImage)                        \
   X(vkCmdClearDepthStencilImage)                 \

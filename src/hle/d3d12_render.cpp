@@ -387,10 +387,33 @@ class Renderer {
       if (!rb.mapped) return;
     }
     begin();
+    // The readback is RGBA8: other display formats (10-bit, half float -
+    // GTA VI's scene) are converted by a blit first; copying them as they
+    // are wrote past the 4-byte-per-pixel buffer.
+    VkImage source = g.image.image;
+    if (g.image.format != VK_FORMAT_R8G8B8A8_UNORM && g.image.format != VK_FORMAT_R8G8B8A8_SRGB) {
+      if (present_rgba_.width != w || present_rgba_.height != h) {
+        const auto& f = core_.fn();
+        if (present_rgba_.view) f.vkDestroyImageView(core_.device(), present_rgba_.view, nullptr);
+        if (present_rgba_.image) f.vkDestroyImage(core_.device(), present_rgba_.image, nullptr);
+        if (present_rgba_.memory) f.vkFreeMemory(core_.device(), present_rgba_.memory, nullptr);
+        present_rgba_ = core_.create_image(w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (!present_rgba_.image) return;
+        transition(present_rgba_.image, VK_IMAGE_ASPECT_COLOR_BIT);
+      }
+      VkImageBlit blit{};
+      blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.srcOffsets[1] = blit.dstOffsets[1] = {static_cast<int32_t>(w), static_cast<int32_t>(h), 1};
+      core_.fn().vkCmdBlitImage(cmd_, g.image.image, VK_IMAGE_LAYOUT_GENERAL, present_rgba_.image,
+                                VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+      full_barrier();
+      source = present_rgba_.image;
+    }
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {w, h, 1};
-    core_.fn().vkCmdCopyImageToBuffer(cmd_, g.image.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &region);
+    core_.fn().vkCmdCopyImageToBuffer(cmd_, source, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &region);
     submit();
     platform::window_set_surface(rb.mapped, w, h, uint64_t{w} * 4, display_format_);
     ++presents_;
@@ -2129,6 +2152,7 @@ class Renderer {
   GpuImage* display_ = nullptr;
   uint32_t display_format_ = 28;
   Buffer readback_[2];
+  Image present_rgba_;  // the display image converted to RGBA8 (other display formats)
   int readback_index_ = 0;
   uint64_t render_serial_ = 0, draws_ = 0, skipped_ = 0, presents_ = 0;
   std::map<std::string, uint64_t> skip_reasons_;  // why draws were skipped, with counts
