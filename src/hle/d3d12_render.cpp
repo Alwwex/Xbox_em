@@ -19,6 +19,7 @@
 
 #include "hle/d3d12_internal.h"
 #include "hle/discovery.h"
+#include "hle/heap.h"
 
 #if defined(XBEM_HAVE_VULKAN)
 
@@ -1395,22 +1396,43 @@ class Renderer {
   void resolve(gpu::SlotKind kind, const uint32_t* w, uint32_t* out, const Tokens& tokens) {
     switch (kind) {
       case gpu::SlotKind::Buffer: {
-        const uint64_t base = w[0] | (uint64_t{w[1] & 0xffff} << 32);
-        const uint32_t stride = (w[1] >> 16) & 0x3fff;
-        const uint64_t size = stride ? uint64_t{w[2]} * stride : w[2];
+        uint64_t base = w[0] | (uint64_t{w[1] & 0xffff} << 32);
+        uint32_t stride = (w[1] >> 16) & 0x3fff;
+        uint64_t size = stride ? uint64_t{w[2]} * stride : w[2];
+        uint32_t v2 = w[2], v3 = w[3];
+        // A view the title made with the device's Create*View (the emulator's
+        // own descriptor, "XBDS", not an AMD V#): the whole resource, raw.
+        uint32_t ours[4];
+        std::memcpy(ours, w, sizeof ours);
+        if (ours[0] == kDescriptorMagic) {
+          const uint64_t object = ours[2] | (uint64_t{ours[3]} << 32);
+          const ResourceState* r = resource_of(object);
+          base = r ? r->gpu_va : 0;
+          size = r ? std::min<uint64_t>(r->size, 0xffffffffu) : 0;
+          stride = 0;
+          v2 = static_cast<uint32_t>(size);
+          v3 = 0x0002403c;  // dst_sel xyzw, 32-bit format (as vertex buffer views)
+        }
         uint64_t host = base;
         if (base < 0x100000000ull && base >= 0x10000000u)
           if (const uint64_t h = tokens.host_of(base)) host = h;
         // Guest memory is read through the GPU's copy (the slot holds the
         // guest address); anything else is copied into the ring.
         const uint64_t limited = std::min<uint64_t>(size, 64ull << 20);
-        const uint64_t a = size && host && memory_.require(host, limited) ? host
-                           : (size && host ? upload(host, size) : ring_.address) | gpu::mem::kDirect;
+        const bool mirrored = size && host && memory_.require(host, limited);
+        const uint64_t a = mirrored ? host : (size && host ? upload(host, size) : ring_.address) | gpu::mem::kDirect;
+        if (!mirrored && size && host) {
+          char where[256] = {};
+          if (!describe_virtual_memory(host, where, sizeof where)) describe_xmem_allocation(host, where, sizeof where);
+          note(std::format("buffer at {:#x} ({:#x} bytes) is not in the GPU's copy of guest memory - a copy is used, "
+                           "shader writes to it are lost ({})", host & ~0xffffffull, size,
+                           where[0] ? where : "memory of no known allocation"));
+        }
         out[0] = static_cast<uint32_t>(a);
         out[1] = static_cast<uint32_t>(a >> 32);
         out[2] = stride;
-        out[3] = w[2];
-        out[4] = w[3];
+        out[3] = v2;
+        out[4] = v3;
         break;
       }
       case gpu::SlotKind::Texture: {
