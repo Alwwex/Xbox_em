@@ -190,7 +190,7 @@ bool scalar_step(const rdna2::Instruction& insn, ScalarRun& run, bool& scc, bool
 
 class Translator {
  public:
-  Translator(TranslatedShader& out) : out_(out), wave_(out.stage == ShaderStage::Compute) {}
+  Translator(TranslatedShader& out, bool wave) : out_(out), wave_(wave) { out_.wave = wave; }
 
   // Basic blocks: split at branch targets and after branches. Only forward
   // branches (no loops); each block's code runs when the scalar run (which
@@ -930,7 +930,7 @@ class Translator {
         case Format::Vop3: case Format::Vop1:
           if (n == "v_readlane_b32") d = i.words[0] & 0xff, count = 1;
           else if (n == "v_readfirstlane_b32") d = (w0 >> 17) & 0xff, count = 1;
-          else if (i.format == Format::Vop3 && starts(n, "v_cmp")) d = (w0 >> 8) & 0x7f, count = 2;
+          else if (i.format == Format::Vop3 && starts(n, "v_cmp")) d = w0 & 0xff, count = 2;  // VOP3a: vdst
           break;
         case Format::Vopc:  // SDWA: an SGPR destination when SD is set
           if ((w0 & 0x1ff) == 0xf9 && ((i.words[1] >> 15) & 1)) d = (i.words[1] >> 8) & 0x7f, count = 1;
@@ -1183,13 +1183,21 @@ class Translator {
                     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
                     "#extension GL_EXT_shader_image_load_formatted : enable\n";
     const uint32_t threads = c.local_size[0] * c.local_size[1] * c.local_size[2];
-    if (wave64_)  // two lanes per invocation, one 32-wide subgroup per wave64
+    const bool graphics = out_.stage != ShaderStage::Compute;
+    if (graphics)
+      ;  // one invocation per vertex / pixel
+    else if (wave64_)  // two lanes per invocation, one 32-wide subgroup per wave64
       g += std::format("layout(local_size_x = {}) in;\n", std::max<uint32_t>((threads + 63) / 64, 1) * 32);
     else
       g += std::format("layout(local_size_x = {}, local_size_y = {}, local_size_z = {}) in;\n", c.local_size[0],
                        c.local_size[1], c.local_size[2]);
-    g += "layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };\n"
-         "layout(push_constant) uniform Push { uint64_t data; uint64_t mem; } pc;\n";
+    g += "layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };\n";
+    // Push constants: compute's words and table; the vertex stage's per-draw
+    // words at offset 0, the pixel stage's at 8, the table at 16.
+    if (!graphics) g += "layout(push_constant) uniform Push { uint64_t data; uint64_t mem; } pc;\n";
+    else if (out_.stage == ShaderStage::Vertex)
+      g += "layout(push_constant) uniform Push { uint64_t data; layout(offset = 16) uint64_t mem; } pc;\n";
+    else g += "layout(push_constant) uniform Push { layout(offset = 8) uint64_t data; uint64_t mem; } pc;\n";
     g += mem::glsl_helpers(true);
     g += ""
          "layout(set = 0, binding = 0) uniform texture2D textures[];\n"
@@ -1264,7 +1272,17 @@ class Translator {
     g += "uint lane, lane0, wh;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes, wave_lanes_hi, dppv, dsapp;\n"
          "bool scc, cmpv;\n// (two scalars: dzn fails to build pipelines that ballot elements of a local bool array)\nbool cmph0, cmph1;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("uint s{};\n", k);
-    const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 3);
+    if (out_.stage == ShaderStage::Vertex) {
+      g += "vec4 pos;\n";
+      for (uint32_t k = 0; k < out_.outputs; ++k) g += std::format("layout(location = {}) out vec4 o_{};\n", k, k);
+    } else if (out_.stage == ShaderStage::Pixel) {
+      for (uint32_t k = 0; k < out_.inputs; ++k)
+        g += std::format("layout(location = {}) {}in vec4 a_{};\n", k, flat_inputs_.count(k) ? "flat " : "", k);
+      for (uint32_t k = 0; k < 8; ++k)
+        if (out_.color_targets & (1u << k)) g += std::format("layout(location = {}) out vec4 c_{};\n", k, k);
+      g += "bool exported;\n";
+    }
+    const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, graphics ? 4 : 3);
     for (uint32_t k = 0; k < vgprs; ++k) g += wave64_ ? std::format("uint v{}[2];\n", k) : std::format("uint v{};\n", k);
     // Lane masks: lanes 0-31 in the low word, 32-63 (wave64) in the high one.
     g += "bool lane_in(uint lo, uint hi) { return ((((lane < 32u) ? lo : hi) >> (lane & 31u)) & 1u) != 0u; }\n"
@@ -1274,7 +1292,25 @@ class Translator {
          "  lane0 = gl_SubgroupInvocationID; lane = lane0; wh = 0u; dsapp = 0u;\n"
          "  vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false; cmph0 = false; cmph1 = false;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("  s{} = 0u;\n", k);
-    if (wave64_) {
+    if (graphics) {
+      // One lane per vertex / pixel; wave64 code runs its low half only.
+      g += "  wave_lanes = subgroupBallot(true).x; wave_lanes_hi = 0u;\n"
+           "  exec_lo = wave_lanes; exec_hi = 0u;\n";
+      for (uint32_t k = 0; k < vgprs; ++k)
+        g += wave64_ ? std::format("  v{0}[0] = 0u; v{0}[1] = 0u;\n", k) : std::format("  v{} = 0u;\n", k);
+      const std::string v0 = wave64_ ? "v0[0]" : "v0", v2 = wave64_ ? "v2[0]" : "v2", v3 = wave64_ ? "v3[0]" : "v3";
+      if (out_.stage == ShaderStage::Vertex) {
+        g += "  pos = vec4(0.0, 0.0, 0.0, 1.0);\n";
+        g += std::format("  {} = uint(gl_VertexIndex); {} = uint(gl_InstanceIndex);\n", v0, v3);
+        for (uint32_t k = 0; k < out_.outputs; ++k) g += std::format("  o_{} = vec4(0.0);\n", k);
+      } else {
+        g += "  exported = false;\n";
+        for (uint32_t k = 0; k < 8; ++k)
+          if (out_.color_targets & (1u << k)) g += std::format("  c_{} = vec4(0.0);\n", k);
+        // (as the per-lane translation: POS_FIXED_PT after the barycentrics)
+        g += std::format("  {} = uint(gl_FragCoord.x) | (uint(gl_FragCoord.y) << 16);\n", v2);
+      }
+    } else if (wave64_) {
       // Wave w of the workgroup holds threads 64w..64w+63 (x fastest);
       // invocation lane0 of subgroup w runs lanes lane0 and lane0 + 32.
       for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{0}[0] = 0u; v{0}[1] = 0u;\n", k);
@@ -1296,6 +1332,9 @@ class Translator {
       if (c.tidig_comps >= 2) g += "  v2 = gl_LocalInvocationID.z;\n";
     }
     g += body_;
+    if (out_.stage == ShaderStage::Vertex) g += "  gl_Position = vec4(pos.x, -pos.y, pos.z, pos.w);\n";
+    // Pixels whose lane exported no colour were killed (v_cmpx / exec).
+    if (out_.stage == ShaderStage::Pixel && out_.color_targets) g += "  if (!exported) discard;\n";
     g += "}\n";
     out_.glsl = std::move(g);
   }
@@ -1995,6 +2034,25 @@ class Translator {
     return true;
   }
 
+  // 16-bit attributes (VOP3): v_interp_p1ll_f16 / p1lv_f16 D, attr, i and
+  // v_interp_p2_f16 D, attr, j, p1. src0 holds the attribute (bits 0-5) and
+  // channel (bits 6-7); p2 writes the interpolated half into D's low half
+  // (opsel bit 3: the high half), keeping the other.
+  bool emit_interp_f16(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    const uint32_t w0 = insn.words[0], w1 = insn.words[1];
+    const uint32_t dst = w0 & 0xff, raw = w1 & 0x1ff, attr = raw & 0x3f, chan = (raw >> 6) & 3;
+    const uint32_t opsel = (w0 >> 11) & 0xf;
+    out_.inputs = std::max(out_.inputs, attr + 1);
+    if (n == "v_interp_p1ll_f16" || n == "v_interp_p1lv_f16") return true;  // the p2 writes the value
+    if (n != "v_interp_p2_f16") return fail("");
+    const std::string d = vreg(dst);
+    const std::string h = std::format("(packHalf2x16(vec2(a_{}.{}, 0.0)) & 0xffffu)", attr, "xyzw"[chan]);
+    if (opsel & 8) line(std::format("{0} = ({0} & 0xffffu) | ({1} << 16);", d, h));
+    else line(std::format("{0} = ({0} & 0xffff0000u) | {1};", d, h));
+    return true;
+  }
+
   // Buffer address arithmetic common to MUBUF and MTBUF.
   // `dword3`: the descriptor's dword 3 (format, swizzles). The descriptor is
   // a CPU-resolved Buffer slot, or (gpu_desc_) the V# in the SGPRs.
@@ -2237,7 +2295,7 @@ class Translator {
     };
     // Coordinate i (a 1D image's y is a constant: 0.5 for sampling, 0 for loads;
     // later operands such as the lod shift down by one).
-    const bool sampling = starts(n, "image_sample") || starts(n, "image_gather");
+    const bool sampling = starts(n, "image_sample") || starts(n, "image_gather") || n == "image_get_lod";
     const auto A = [&](uint32_t i) {
       if (!one_d) return addr_reg(i);
       if (i == 1) return std::string(sampling ? "0x3f000000u" : "0u");
@@ -2286,22 +2344,37 @@ class Translator {
     };
     const int coords = dim == 1 ? 2 : 3;
     std::string value;
-    if (starts(n, "image_sample") || starts(n, "image_gather4")) {
-      // Name: image_sample|image_gather4 [_c] [_lz|_l|_b] [_o]. Address
+    if (starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod") {
+      // Name: image_sample|image_gather4 [_c] [_lz|_l|_b|_d] [_o]. Address
       // operands in order: offset (_o), bias (_b), depth reference (_c),
-      // coordinates, lod (_l).
-      const bool gather = starts(n, "image_gather4");
-      std::string_view rest = n.substr(gather ? 13 : 12);
+      // gradients (_d: d/dx then d/dy of each coordinate but the array
+      // slice), coordinates, lod (_l). image_get_lod: the coordinates.
+      const bool gather = starts(n, "image_gather4"), get_lod = n == "image_get_lod";
+      std::string_view rest = get_lod ? std::string_view() : n.substr(gather ? 13 : 12);
       const bool has_offset = rest.ends_with("_o");
       if (has_offset) rest.remove_suffix(2);
       const bool compare = starts(rest, "_c") && !starts(rest, "_cl");
       if (compare) rest.remove_prefix(2);
-      if (!rest.empty() && rest != "_lz" && rest != "_l" && rest != "_b") return fail("");
+      if (!rest.empty() && rest != "_lz" && rest != "_l" && rest != "_b" && rest != "_d") return fail("");
       if (dim == 2 && (gather || compare)) return fail("gather or compare on a 3D image");
       uint32_t a = 0;
       const std::string offset = has_offset ? addr_reg(a++) : "";
       const std::string bias = rest == "_b" ? addr_reg(a++) : "";
       const std::string ref = compare ? addr_reg(a++) : "";
+      // Gradients: one per spatial coordinate (1D 1, 2D and 2D arrays 2, 3D and cubes 3).
+      const uint32_t gdims = one_d ? 1 : (dim == 2 || cube) ? 3 : 2;
+      std::string grad_x, grad_y;
+      if (rest == "_d") {
+        const auto grad = [&](uint32_t first) {
+          std::string v = std::format("vec{}(", cube ? 2u : gdims == 1 ? 2u : gdims);
+          for (uint32_t k = 0; k < (cube ? 2 : gdims); ++k) v += std::format("{}uintBitsToFloat({})", k ? ", " : "", addr_reg(first + k));
+          if (gdims == 1) v += ", 0.0";
+          return v + ")";
+        };
+        grad_x = grad(a);
+        grad_y = grad(a + gdims);
+        a += 2 * gdims;
+      }
       // Coordinate j after the prefix operands (a 1D image's y is constant;
       // later operands such as the lod shift down by one).
       const uint32_t base = a;
@@ -2347,6 +2420,10 @@ class Translator {
       } else if (gather) {
         const int comp = dmask & 1 ? 0 : dmask & 2 ? 1 : dmask & 4 ? 2 : 3;
         value = std::format("textureGather({}, uv, {})", sampler, comp);
+      } else if (get_lod) {
+        value = std::format("vec4(textureQueryLod({}, uv.xy), 0.0, 0.0)", sampler);
+      } else if (rest == "_d") {
+        value = std::format("textureGrad({}, uv, {}, {})", sampler, grad_x, grad_y);
       } else if (rest == "_lz" || rest == "_l") {
         value = std::format("textureLod({}, uv, {})", sampler, lod);
       } else if (rest == "_b") {
@@ -2419,6 +2496,7 @@ class Translator {
       if (target < 8) {
         out_.color_targets |= 1u << target;
         write(std::format("c_{}", target));
+        if (wave_) line("exported = true;");
       } else if (target == 8 || target == 9) {
         // mrtz / null: depth is not exported yet
       } else {
@@ -2432,6 +2510,7 @@ class Translator {
     if (!insn.name) return fail("unknown opcode");
     switch (insn.format) {
       case Format::Vop1: case Format::Vop2: case Format::Vop3: case Format::Vop3p: case Format::Vopc:
+        if (insn.format == Format::Vop3 && starts(name_of(insn), "v_interp_")) return emit_interp_f16(insn);
         return emit_valu(insn);
       case Format::Vintrp: return emit_interp(insn);
       case Format::Mubuf: return emit_mubuf(insn);
@@ -2841,14 +2920,37 @@ TranslatedShader translate_shader(const uint8_t* code, size_t size, ShaderStage 
     }
   }
   note_targets(0);
-  Translator t(out);
-  out.ok = t.run();
+  const bool compute_stage = stage == ShaderStage::Compute;
+  {
+    Translator t(out, compute_stage);
+    out.ok = t.run();
+  }
+  // A vertex/pixel shader the per-lane translation cannot take: wave
+  // semantics as for compute (one invocation per lane, wave32 or wave64 with
+  // the high half empty); its user SGPRs (s0-s31) come from the draw.
+  static const bool gfx_wave = [] {
+    const char* e = std::getenv("XBEM_GFX_WAVE");
+    return !e || *e != '0';
+  }();
+  if (!out.ok && !compute_stage && gfx_wave) {
+    TranslatedShader w;
+    w.stage = stage;
+    w.tag = out.tag;
+    w.program = out.program;
+    w.compute.user_sgprs = 32;
+    w.compute.tgid[0] = w.compute.tgid[1] = w.compute.tgid[2] = false;
+    w.compute.tidig_comps = 0;
+    Translator t(w, true);
+    w.ok = t.run();
+    if (w.ok) return w;
+    out.error += std::format("; wave mode: {}", w.error);
+  }
   return out;
 }
 
 bool run_scalar(const TranslatedShader& shader, ScalarRun& run, std::vector<uint32_t>& words) {
   words.assign(shader.slot_words, 0);
-  if (shader.stage == ShaderStage::Compute) {
+  if (shader.wave) {
     // Wave-mode shaders: the scalar program runs once in program order
     // (branches ignored) for the values the CPU must provide - SMEM results
     // and descriptors, whose inputs the translator checked are known that

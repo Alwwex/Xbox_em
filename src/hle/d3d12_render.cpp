@@ -227,7 +227,7 @@ class Renderer {
                             : i >= 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                                      : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       b[i].descriptorCount = counts[i];
-      b[i].stageFlags = i >= 4 ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+      b[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;  // (pixel shaders write UAVs too)
     }
     const VkDescriptorBindingFlags bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
     VkDescriptorBindingFlags bflags[7] = {bound, 0, bound, bound, bound, bound, bound};

@@ -145,3 +145,12 @@ TEST(translate_compute_vop3_compare_into_an_sgpr_pair) {
   CHECK(t.ok);
   CHECK(has(t, "s8 = subgroupBallot(cmpv).x;"));
 }
+
+TEST(translate_pixel_loop_falls_back_to_wave_mode) {
+  // s_branch -1 (a loop the per-lane translation refuses) ; s_endpgm: the
+  // wave translation takes it (block loop), as for compute.
+  const TranslatedShader t = translate({0xbf82ffff, kEndpgm}, ShaderStage::Pixel);
+  CHECK(t.ok);
+  CHECK(t.wave);
+  CHECK(has(t, "switch (blk)"));
+}
