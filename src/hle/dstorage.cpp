@@ -139,6 +139,11 @@ struct StatusState {
   std::mutex mutex;
   std::vector<uint8_t> complete;
   std::vector<HRESULT> result;
+  // Status entries enqueued and not reached yet, per index: an entry is
+  // complete only when the queue reached the last one (GTA VI reuses a
+  // one-entry array; the queue reaching the previous batch's entry after the
+  // next one was enqueued marked the new batch complete before its reads).
+  std::vector<uint32_t> pending;
 };
 
 BOOL XBEM_GUEST_ABI status_is_complete(ProbeObject* self, uint32_t index) {
@@ -625,7 +630,8 @@ void run_status(QueueState* q, ProbeObject* array, uint32_t index) {
   }
   std::lock_guard lock(s->mutex);
   if (index < s->complete.size()) {
-    s->complete[index] = 1;
+    if (s->pending[index]) --s->pending[index];
+    if (!s->pending[index]) s->complete[index] = 1;
     s->result[index] = hr;
   }
 }
@@ -674,7 +680,10 @@ void XBEM_GUEST_ABI queue_enqueue_status(ProbeObject* self, ProbeObject* array, 
     // The entry is incomplete until the queue gets there.
     auto* s = static_cast<StatusState*>(array->state);
     std::lock_guard lock(s->mutex);
-    if (index < s->complete.size()) s->complete[index] = 0;
+    if (index < s->complete.size()) {
+      s->complete[index] = 0;
+      ++s->pending[index];
+    }
   }
   enqueue(q, {QueueState::Pending::Status, {}, reinterpret_cast<uint64_t>(array), index, 0});
 }
@@ -832,6 +841,7 @@ HRESULT XBEM_GUEST_ABI factory_create_status_array(ProbeObject* self, uint32_t c
   }
   state->complete.assign(std::min<uint32_t>(capacity, 1 << 20), 0);
   state->result.assign(state->complete.size(), S_OK);
+  state->pending.assign(state->complete.size(), 0);
   probe_log(self, 5, std::format("CreateStatusArray({})", capacity), XBEM_RETURN_ADDRESS());
   return out_object(out, make_probe_object("dstorage.status_array", &status_vtable(), state));
 }
