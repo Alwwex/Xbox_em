@@ -30,6 +30,10 @@ bool describe_xmem_allocation(uint64_t address, char* out, size_t out_size);
 // units, as XMemAllocatePhysicalPages hands them out) at `offset` bytes from
 // the start of its 64 KiB page. False for pages that are not allocated.
 bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size);
+// Remembers which DirectStorage request last wrote the page of `pfn` (`how`:
+// 0 inflated, 1 copied, 2 from a decoded chunk, 3 zeros); crash reports
+// name it. `file` must stay valid.
+void note_physical_write(uint64_t pfn, const char* file, uint64_t offset, uint64_t virt, uint32_t how);
 // Emulated physical memory: which physical page `address` maps and where else
 // that page is mapped (never blocks); and every address the byte at `address`
 // is mapped at (a platform::ViewFinder for watchpoints).

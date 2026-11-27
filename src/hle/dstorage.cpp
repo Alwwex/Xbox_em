@@ -498,12 +498,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   ++q->requests;
   q->bytes_read += source_size;
   // Writes [from, from + n) of the destination's bytes into its physical pages.
+  // How the data was made, for crash reports (note_physical_write).
+  uint32_t how = compression == 0 ? 1 : 0;
   const auto to_physical = [&](const uint8_t* data, uint64_t from, uint64_t n) {
     bool ok = true;
     while (n) {
       const uint64_t page = from >> 16, in_page = from & 0xffff, chunk = std::min<uint64_t>(n, 0x10000 - in_page);
       uint64_t pfn = 0;
       ok &= platform::safe_read(w[1] + page * 8, &pfn, 8) && write_physical_page(pfn, in_page, data, chunk);
+      note_physical_write(pfn, file->guest_path.c_str(), offset, w[9], how);
       data += chunk;
       from += chunk;
       n -= chunk;
@@ -522,12 +525,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       if (compression == 1 && inside_chunk(file, offset, w[9]) &&
           shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9])) {
         r = InflateResult::Ok;
+        how = 2;
       } else {
         r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
         if (r == InflateResult::OutputFull) r = InflateResult::Ok;
         if (r != InflateResult::Ok && compression == 1 &&
-            shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9]))
+            shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9])) {
           r = InflateResult::Ok;
+          how = 2;
+        }
       }
     }
     if (r == InflateResult::Ok) {
@@ -609,6 +615,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     }();
     if (!strict && compression != 1) {
       const std::vector<uint8_t> zeros(dest_size);
+      how = 3;
       if (physical) to_physical(zeros.data(), skip, zeros.size());
       else deliver(zeros.data(), zeros.size());
       return S_OK;

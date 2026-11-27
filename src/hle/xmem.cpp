@@ -220,6 +220,10 @@ constexpr uint64_t page_of_pfn(uint64_t pfn) { return pfn / kFramesPerPage - kPf
 struct PageState {
   bool allocated = false;
   std::vector<uint64_t> vas;  // where the page is mapped now (64 KiB aligned)
+  // The last DirectStorage request that wrote the page (for crash reports).
+  const char* written_by = nullptr;
+  uint64_t written_offset = 0, written_virtual = 0;
+  uint32_t written_how = 0;
 };
 
 // What the title does with its physical pages that may lose data: a page
@@ -257,6 +261,16 @@ struct PhysicalMemory {
 PhysicalMemory g_phys;
 
 }  // namespace
+
+void note_physical_write(uint64_t pfn, const char* file, uint64_t offset, uint64_t virt, uint32_t how) {
+  std::lock_guard lock(g_phys.mutex);
+  if (!g_phys.valid(pfn)) return;
+  PageState& st = g_phys.state(pfn);
+  st.written_by = file;
+  st.written_offset = offset;
+  st.written_virtual = virt;
+  st.written_how = how;
+}
 
 bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size) {
   std::lock_guard lock(g_phys.mutex);
@@ -589,6 +603,11 @@ bool describe_physical_page(uint64_t address, char* out, size_t out_size) {
   for (size_t k = 0; k < st.vas.size() && k < 4 && used + 24 < out_size; ++k)
     used += static_cast<size_t>(std::snprintf(out + used, out_size - used, "%s%#llx", k ? ", " : ": ",
                                               static_cast<unsigned long long>(st.vas[k] + (address - va))));
+  static const char* const kHow[] = {"inflated", "copied", "from a decoded chunk (piece inside it)", "zeros (format not decoded)"};
+  if (st.written_by && used + 64 < out_size)
+    std::snprintf(out + used, out_size - used, "; last DirectStorage write: %s at %#llx (virtual %#llx), %s",
+                  st.written_by, static_cast<unsigned long long>(st.written_offset),
+                  static_cast<unsigned long long>(st.written_virtual), kHow[st.written_how & 3]);
   return true;
 }
 
