@@ -8,7 +8,7 @@
 # in ~/xbem-runs, never in the repository.
 #
 # The menus' timing varies between runs: a screenshot at 215 s (LOG.check.ppm)
-# shows whether the story load started (black); when it did not, the run is
+# shows whether the story load started (no white menu text); when it did not, the run is
 # stopped and started again (up to XBEM_RUN_TRIES times, default 3).
 set -u
 cd "$(dirname "$0")/.."
@@ -21,7 +21,8 @@ P="A@45,A@95,A@105,A@115,A@125,A@135,A@150,DOWN@158,A@161,DOWN@168,DOWN@170,A@17
 # emulator's heavy streaming causes: both crash instructions are skipped.
 export XBEM_DSTORAGE_SYNC=${XBEM_DSTORAGE_SYNC:-1}
 CHECK="$LOG.check.ppm"
-# Mean brightness of a PPM (0-255); the black loading screen is ~0.
+# Per mille of bright pixels in a PPM: the menus have white text (~20+), the
+# loading screen (black or dark red with a small spinner) next to none.
 brightness() {
   python3 -I -c '
 import sys
@@ -33,7 +34,9 @@ while len(tok) < 4:
     while not d[j:j+1].isspace(): j += 1
     tok.append(d[i:j]); i = j
 px = d[i+1:]
-print(sum(px[::97]) // max(1, len(px[::97])))' "$1" 2>/dev/null || echo 255
+n = len(px) // 3
+bright = sum(1 for k in range(0, n, 7) if px[3*k] > 200 and px[3*k+1] > 200 and px[3*k+2] > 200)
+print(bright * 1000 * 7 // max(1, n))' "$1" 2>/dev/null || echo 1000
 }
 for try in $(seq 1 "${XBEM_RUN_TRIES:-3}"); do
   rm -f "$CHECK"
@@ -45,7 +48,7 @@ for try in $(seq 1 "${XBEM_RUN_TRIES:-3}"); do
   PID=${PID:-$RUN}
   until [ -s "$CHECK" ] || ! kill -0 "$PID" 2>/dev/null; do sleep 2; done
   sleep 1
-  if [ -s "$CHECK" ] && [ "$(brightness "$CHECK")" -gt 4 ]; then
+  if [ -s "$CHECK" ] && [ "$(brightness "$CHECK")" -gt 5 ]; then
     echo "try $try: still in the menus at 215 s - starting again" >&2
     kill -INT "$PID" 2>/dev/null
     wait $RUN

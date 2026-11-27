@@ -23,6 +23,7 @@
 #if defined(XBEM_HAVE_VULKAN)
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1254,13 +1255,15 @@ class Renderer {
         break;
       }
       case 51: {
-        // ClearDepthStencilView: the depth value is a float argument (not
-        // recorded); GTA VI's passes test GREATER_EQUAL (reverse Z), cleared to 0.
-        if (c.blob.size() < kDescriptorSize) break;
+        // ClearDepthStencilView(dsv, flags, depth bits, stencil): flag 1 depth.
+        if (c.blob.size() < kDescriptorSize || !(u32(1) & 1)) break;
         GpuImage* d = depth_from_descriptor(c.blob.data());
         if (!d) break;
         end_rendering();
-        VkClearDepthStencilValue v{0.0f, 0};
+        float depth;
+        const uint32_t bits = u32(2);
+        std::memcpy(&depth, &bits, 4);
+        VkClearDepthStencilValue v{std::isfinite(depth) ? std::clamp(depth, 0.0f, 1.0f) : 0.0f, u32(3) & 0xff};
         VkImageSubresourceRange range{depth_aspects(d->image.format), 0, 1, 0, 1};
         core_.fn().vkCmdClearDepthStencilImage(cmd_, d->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
         full_barrier();

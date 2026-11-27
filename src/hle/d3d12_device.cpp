@@ -665,7 +665,13 @@ std::string decode_command(int slot, const uint64_t* a) {
       if (a[3]) s += ", dsv " + describe_descriptor(read_guest<uint64_t>(a[3]));
       return s + ")";
     }
-    case 51: return std::format("ClearDepthStencilView({}, flags {:#x})", describe_descriptor(a[0]), u32(1));
+    case 51: {
+      float depth;
+      const uint32_t bits = u32(2);
+      std::memcpy(&depth, &bits, 4);
+      return std::format("ClearDepthStencilView({}, flags {:#x}, depth {}, stencil {})", describe_descriptor(a[0]),
+                         u32(1), depth, u32(3) & 0xff);
+    }
     case 52: {
       float c[4] = {};
       platform::safe_read(a[1], c, sizeof c);
@@ -750,6 +756,19 @@ uint64_t XBEM_GUEST_ABI list_method(ProbeObject* self, uint64_t a1, uint64_t a2,
   const uint64_t args[6] = {a1, a2, a3, a4, a5, a6};
   if (self && self->magic == kProbeMagic) record_command(self, Slot, args);
   return probe_dispatch(self, Slot, args, XBEM_RETURN_ADDRESS(), false);
+}
+
+// 51 ClearDepthStencilView(DSV, flags, FLOAT depth, UINT8 stencil, rects,
+// rect pointer): the depth value is the third argument after `this` - in
+// xmm3 under the Windows x64 convention, which list_method cannot see. Its
+// bits are recorded in place of that argument.
+uint64_t XBEM_GUEST_ABI list_clear_depth_stencil(ProbeObject* self, uint64_t dsv, uint64_t flags, float depth,
+                                                 uint64_t stencil, uint64_t rects, uint64_t rect_list) {
+  uint32_t bits;
+  std::memcpy(&bits, &depth, 4);
+  const uint64_t args[6] = {dsv, flags, bits, stencil, rects, rect_list};
+  if (self && self->magic == kProbeMagic) record_command(self, 51, args);
+  return probe_dispatch(self, 51, args, XBEM_RETURN_ADDRESS(), false);
 }
 
 std::string describe_resource(uint64_t p) {
@@ -1067,6 +1086,7 @@ ProbeVtable make_command_list_vtable(std::integer_sequence<int, Slots...>) {
   v[12] = fn(&list_draw_instanced);
   v[13] = fn(&list_draw_indexed_instanced);
   v[14] = fn(&list_dispatch);
+  v[51] = fn(&list_clear_depth_stencil);
   v[148] = fn(&list_allocate_transient);
   return v;
 }
