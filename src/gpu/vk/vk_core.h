@@ -133,6 +133,7 @@ class Core {
   Image create_image(uint32_t width, uint32_t height, uint32_t depth, uint32_t layers, bool volume, VkFormat format,
                      VkImageUsageFlags usage);
   bool format_supported(VkFormat format, VkFormatFeatureFlags features) const;
+  uint32_t max_allocations() const { return max_allocations_; }
 
  private:
   uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags flags) const;
@@ -143,6 +144,7 @@ class Core {
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t queue_family_ = 0;
+  uint32_t max_allocations_ = 0;
   VkPhysicalDeviceMemoryProperties memory_{};
   std::string device_name_;
 };

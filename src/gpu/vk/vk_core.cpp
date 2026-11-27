@@ -77,6 +77,7 @@ bool Core::init(std::string& reason) {
       best = score;
       physical_ = d;
       device_name_ = props.deviceName;
+      max_allocations_ = props.limits.maxMemoryAllocationCount;
     }
   }
   if (!physical_) {

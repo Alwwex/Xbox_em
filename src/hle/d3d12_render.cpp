@@ -1090,7 +1090,20 @@ class Renderer {
       const char* e = std::getenv("XBEM_IMAGE_BUDGET_MB");
       return (e ? std::strtoull(e, nullptr, 10) : 3072ull) << 20;
     }();
-    if (image_bytes_ <= budget || (presents_ & 15) != 0) return;
+    // Each image is a memory allocation of its own, and the device's count is
+    // limited (creation of 1x1 images failed near 4000): a count budget too.
+    static const size_t max_count = [] {
+      const char* e = std::getenv("XBEM_IMAGE_COUNT_MAX");
+      return e ? std::strtoull(e, nullptr, 10) : 2500ull;
+    }();
+    static const bool logged = [&] {
+      XBEM_INFO("gpu", "image budget: {} MiB, {} images (the device allows {} memory allocations)", budget >> 20,
+                max_count, core_.max_allocations());
+      return true;
+    }();
+    (void)logged;
+    const size_t count_now = images_.size() + depth_images_.size();
+    if ((image_bytes_ <= budget && count_now <= max_count) || (presents_ & 15) != 0) return;
     std::vector<std::pair<uint64_t, std::pair<bool, const ResourceState*>>> old;
     for (const auto& [r, g] : images_)
       if (g && g->last_used + 32 < presents_ && g.get() != display_) old.push_back({g->last_used, {false, r}});
@@ -1100,7 +1113,7 @@ class Renderer {
     const auto& f = core_.fn();
     uint64_t freed = 0, count = 0;
     for (const auto& [used, which] : old) {
-      if (image_bytes_ <= budget * 3 / 4) break;
+      if (image_bytes_ <= budget * 3 / 4 && images_.size() + depth_images_.size() <= max_count * 3 / 4) break;
       auto& map = which.first ? depth_images_ : images_;
       auto it = map.find(which.second);
       if (it == map.end() || !it->second) continue;
