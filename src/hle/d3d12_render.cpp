@@ -166,6 +166,14 @@ CompilePool& compile_pool() {
   return *pool;
 }
 
+// Graphics pipelines have their own workers: compute programs can take the
+// shared ones for minutes each, and the frame's draws (the final composite
+// among them) waited behind them.
+CompilePool& graphics_compile_pool() {
+  static CompilePool* pool = new CompilePool(2);
+  return *pool;
+}
+
 struct PipelineKey {
   uint64_t vs, ps, blend;
   uint64_t format;  // the bound targets' formats (8 bits each), slot 0 lowest
@@ -1203,7 +1211,7 @@ class Renderer {
       return entry->pipeline;
     }
     building = true;
-    compile_pool().run(build);
+    graphics_compile_pool().run(build);
     return VK_NULL_HANDLE;
   }
 
@@ -1236,7 +1244,7 @@ class Renderer {
   };
 
   void note(const std::string& what) {
-    if (notes_.insert(what).second && notes_.size() < 64) XBEM_WARN("gpu", "{}", what);
+    if (notes_.insert(what).second && notes_.size() < 256) XBEM_WARN("gpu", "{}", what);
   }
 
   // GPU images of resources unused for a while are dropped when their
@@ -1787,6 +1795,26 @@ class Renderer {
         uint8_t bytes[32];
         std::memcpy(bytes, w, 32);
         GpuImage* g = image_from_descriptor(bytes, false);
+        if (trace_textures_) {
+          // XBEM_TRACE_PS: what the draw samples, and whether guest memory
+          // under the texture holds anything (8 probes of 256 bytes).
+          const uint64_t base = (uint64_t{w[0]} | (uint64_t{w[1] & 0xff} << 32)) << 8;
+          uint64_t nonzero = 0, probed = 0;
+          const uint64_t span = g ? uint64_t{g->image.width} * g->image.height : 0;
+          uint8_t buf[256];
+          for (int k = 0; k < 8 && base; ++k)
+            if (platform::safe_read(base + span / 8 * k, buf, sizeof buf)) {
+              probed += sizeof buf;
+              for (uint8_t b : buf) nonzero += b != 0;
+            }
+          XBEM_INFO("gpu", "  texture T# {:08x} {:08x} {:08x} {:08x}: base {:#x} -> {}; guest memory {} of {} probed "
+                    "bytes non-zero", w[0], w[1], w[2], w[3], base,
+                    g ? std::format("{}x{} vk format {}, {}, index {}", g->image.width, g->image.height,
+                                    static_cast<int>(g->image.format), g->rendered ? "GPU-written" : "from memory",
+                                    g->texture_index)
+                      : std::string("unresolved"),
+                    nonzero, probed);
+        }
         out[0] = g ? g->texture_index : 0;
         out[1] = g ? (g->image.width | (g->image.height << 16)) : 0x00010001;
         out[2] = g ? g->array_index : 0;
@@ -1897,7 +1925,11 @@ class Renderer {
       if (!state_.target) return skip("clear without a render target");
       return stream_clear();
     }
-    if (p->vs_code.empty()) return skip("pipeline without shader code");
+    if (p->vs_code.empty()) {
+      note(std::format("pipeline {} (vs {:016x}, ps {:016x}, {} bytes of pixel code) has no vertex shader code - its "
+                       "draws are skipped", state_.pipeline_name, p->vs_hash, p->ps_hash, p->ps_code.size()));
+      return skip("pipeline without shader code");
+    }
     // Without a pixel shader: a depth-only draw (needs a depth target).
     if (p->ps_code.empty() && !state_.depth) return skip("pipeline without a pixel shader, no depth target");
     ShaderEntry* vs = shader(p->vs_code, p->vs_hash, gpu::ShaderStage::Vertex);
@@ -1950,7 +1982,16 @@ class Renderer {
         return ok;
       };
       run.resolve = [&](gpu::SlotKind kind, const uint32_t* w, uint32_t* out) { resolve(kind, w, out, tokens); };
-      if (!gpu::run_scalar(*stages[k], run, words[k])) {
+      static const uint64_t trace_ps = [] {
+        const char* t = std::getenv("XBEM_TRACE_PS");
+        return t ? std::strtoull(t, nullptr, 16) : 0ull;
+      }();
+      static uint64_t ps_draws = 0;  // traced at draws 1, 2, 4, 8, ... of that shader
+      trace_textures_ = k == 1 && trace_ps && trace_ps == p->ps_hash && std::has_single_bit(++ps_draws);
+      if (trace_textures_) XBEM_INFO("gpu", "draw #{} with ps {:016x}:", ps_draws, p->ps_hash);
+      const bool ok_run = gpu::run_scalar(*stages[k], run, words[k]);
+      trace_textures_ = false;
+      if (!ok_run) {
         note(std::format("scalar run of {:016x}: {}", k == 0 ? p->vs_hash : p->ps_hash, run.error));
         return skip(std::format("scalar run of {:016x}", k == 0 ? p->vs_hash : p->ps_hash));
       }
@@ -2290,6 +2331,7 @@ class Renderer {
   std::map<uint64_t, bool> submitted_ps_;  // pixel shaders of the submission's draws (wave mode or not)
   uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0, wave_draws_ = 0;
   std::string last_draw_;
+  bool trace_textures_ = false;
   uint64_t gpu_wait_us_ = 0, gpu_submissions_ = 0;
   std::mutex tags_mutex_;
   std::map<uint32_t, uint64_t> shader_tags_;  // translated code tag -> compute shader hash
