@@ -463,9 +463,11 @@ class Renderer {
       if (logged++ < 20) {
         std::string list;
         for (uint64_t h : submitted_cs_) list += std::format(" {:016x}", h);
-        XBEM_WARN("gpu", "submission {} after {} ms ({} draws, {} dispatches); compute shaders:{}",
+        std::string ps;
+        for (const auto& [h, wave] : submitted_ps_) ps += std::format(" {:016x}{}", h, wave ? "(wave)" : "");
+        XBEM_WARN("gpu", "submission {} after {} ms ({} draws, {} dispatches); compute shaders:{}; pixel shaders:{}",
                   r == VK_SUCCESS ? "done" : std::format("FAILED ({})", static_cast<int>(r)), ms, submitted_draws_,
-                  submitted_dispatches_, list.empty() ? " none" : list);
+                  submitted_dispatches_, list.empty() ? " none" : list, ps.empty() ? " none" : ps);
       }
     }
     // A compute shader ended by its loop guard (a loop that would not end).
@@ -484,6 +486,7 @@ class Renderer {
       }
     }
     submitted_cs_.clear();
+    submitted_ps_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
     gpu_output_.clear();
     // Every ~10 s: how much of the time went into waiting for the GPU.
@@ -870,6 +873,10 @@ class Renderer {
     if (it != shaders_.end()) return it->second.get();
     auto e = std::make_unique<ShaderEntry>();
     e->shader = gpu::translate_shader(code.data(), code.size(), stage);
+    {
+      std::lock_guard lock(tags_mutex_);  // (the loop guard reports wave-mode vertex/pixel shaders too)
+      shader_tags_[e->shader.tag] = hash;
+    }
     if (!e->shader.ok) e->error = e->shader.error;
     else e->module = compile(e->shader.glsl, stage == gpu::ShaderStage::Vertex ? "vert" : "frag", e->error);
     // The GLSL (megabytes for large wave-mode programs) is not needed any more.
@@ -1904,6 +1911,7 @@ class Renderer {
       }
     ++draws_;
     ++submitted_draws_;
+    if (ps && submitted_ps_.size() < 32) submitted_ps_[p->ps_hash] = ps->shader.wave;
     if (is_display_target()) {
       display_ = state_.target;
       display_format_ = 28;
@@ -2099,6 +2107,7 @@ class Renderer {
   Buffer ring_;
   // What the command buffer being recorded runs (for slow / failed submissions).
   std::set<uint64_t> submitted_cs_;
+  std::map<uint64_t, bool> submitted_ps_;  // pixel shaders of the submission's draws (wave mode or not)
   uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0;
   uint64_t gpu_wait_us_ = 0, gpu_submissions_ = 0;
   std::mutex tags_mutex_;
