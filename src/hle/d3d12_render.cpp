@@ -1009,7 +1009,7 @@ class Renderer {
   }
 
   // mode: 0 triangle list, 1 RECTLIST (geometry shader), 2 triangle strip.
-  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry* ps, uint32_t mode) {
+  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry* ps, uint32_t mode, bool& building) {
     const bool rect = mode == 1;
     // Attachment formats: the bound targets'.
     const uint32_t slots = bound_slots();
@@ -1057,14 +1057,23 @@ class Renderer {
     const uint32_t depth_control = state_.depth && p.has_registers ? p.db_depth_control & 0x77u : 0;
     format_key = format_key * 1000003u + static_cast<uint64_t>(depth_format) * 131u + depth_control;
     const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof(uint32_t) * 10 * slots), format_key, mode};
-    if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
+    if (auto it = pipelines_.find(key); it != pipelines_.end()) {
+      const int st = it->second->state.load(std::memory_order_acquire);
+      if (st == 0) building = true;
+      return st == 1 ? it->second->pipeline : VK_NULL_HANDLE;
+    }
     VkPipelineShaderStageCreateInfo stages[3]{};
     uint32_t count = 0;
     stages[count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
                        vs.module, "main", nullptr};
     if (rect) {
       VkShaderModule gs = rect_geometry(vs.shader.outputs);
-      if (!gs) return pipelines_[key] = VK_NULL_HANDLE;
+      if (!gs) {
+        auto failed = std::make_shared<PendingPipeline>();
+        failed->state = 2;
+        pipelines_[key] = failed;
+        return VK_NULL_HANDLE;
+      }
       stages[count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT,
                          gs, "main", nullptr};
     }
@@ -1123,30 +1132,79 @@ class Renderer {
     ri.colorAttachmentCount = slots;
     ri.pColorAttachmentFormats = formats;
     ri.depthAttachmentFormat = depth_format;
-    VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gci.pNext = &ri;
-    gci.stageCount = count;
-    gci.pStages = stages;
-    gci.pVertexInputState = &vi;
-    gci.pInputAssemblyState = &ia;
-    gci.pViewportState = &vp;
-    gci.pRasterizationState = &rs;
-    gci.pMultisampleState = &ms;
-    gci.pDepthStencilState = &ds;
-    gci.pColorBlendState = &cb;
-    gci.pDynamicState = &dy;
-    gci.layout = layout_;
-    VkPipeline pipe = VK_NULL_HANDLE;
-    const auto t_pipe = std::chrono::steady_clock::now();
-    const VkResult made = core_.fn().vkCreateGraphicsPipelines(core_.device(), pipeline_cache_, 1, &gci, nullptr, &pipe);
-    add_us(pipeline_us_, t_pipe);
-    add_us(graphics_pipeline_us_, t_pipe);
-    ++pipelines_created_;
-    ++graphics_pipelines_;
-    if (made != VK_SUCCESS)
-      XBEM_WARN("gpu", "pipeline vs {:016x} ps {:016x}: vkCreateGraphicsPipelines failed", p.vs_hash, p.ps_hash);
-    pipelines_[key] = pipe;
-    return pipe;
+    auto entry = std::make_shared<PendingPipeline>();
+    pipelines_[key] = entry;
+    // Everything the create info points at, copied for the worker.
+    struct Job {
+      VkPipelineShaderStageCreateInfo stages[3];
+      uint32_t count;
+      VkPipelineVertexInputStateCreateInfo vi;
+      VkPipelineInputAssemblyStateCreateInfo ia;
+      VkPipelineViewportStateCreateInfo vp;
+      VkPipelineRasterizationStateCreateInfo rs;
+      VkPipelineMultisampleStateCreateInfo ms;
+      VkPipelineDepthStencilStateCreateInfo ds;
+      VkPipelineColorBlendAttachmentState att[8];
+      VkPipelineColorBlendStateCreateInfo cb;
+      VkDynamicState dyn[2];
+      VkPipelineDynamicStateCreateInfo dy;
+      VkFormat formats[8];
+      VkPipelineRenderingCreateInfoKHR ri;
+      uint64_t vs_hash, ps_hash;
+    };
+    auto job = std::make_shared<Job>();
+    std::memcpy(job->stages, stages, sizeof stages);
+    job->count = count;
+    job->vi = vi, job->ia = ia, job->vp = vp, job->rs = rs, job->ms = ms, job->ds = ds;
+    std::memcpy(job->att, att, sizeof att);
+    job->cb = cb;
+    job->cb.pAttachments = job->att;
+    std::memcpy(job->dyn, dyn, sizeof dyn);
+    job->dy = dy;
+    job->dy.pDynamicStates = job->dyn;
+    std::memcpy(job->formats, formats, sizeof formats);
+    job->ri = ri;
+    job->ri.pColorAttachmentFormats = job->formats;
+    job->vs_hash = p.vs_hash, job->ps_hash = p.ps_hash;
+    const auto build = [this, entry, job] {
+      VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+      gci.pNext = &job->ri;
+      gci.stageCount = job->count;
+      gci.pStages = job->stages;
+      gci.pVertexInputState = &job->vi;
+      gci.pInputAssemblyState = &job->ia;
+      gci.pViewportState = &job->vp;
+      gci.pRasterizationState = &job->rs;
+      gci.pMultisampleState = &job->ms;
+      gci.pDepthStencilState = &job->ds;
+      gci.pColorBlendState = &job->cb;
+      gci.pDynamicState = &job->dy;
+      gci.layout = layout_;
+      VkPipeline pipe = VK_NULL_HANDLE;
+      const auto t_pipe = std::chrono::steady_clock::now();
+      const VkResult made = core_.fn().vkCreateGraphicsPipelines(core_.device(), pipeline_cache_, 1, &gci, nullptr, &pipe);
+      add_us(pipeline_us_, t_pipe);
+      add_us(graphics_pipeline_us_, t_pipe);
+      ++pipelines_created_;
+      ++graphics_pipelines_;
+      if (made != VK_SUCCESS) {
+        XBEM_WARN("gpu", "pipeline vs {:016x} ps {:016x}: vkCreateGraphicsPipelines failed", job->vs_hash, job->ps_hash);
+        pipe = VK_NULL_HANDLE;
+      }
+      entry->pipeline = pipe;
+      entry->state.store(pipe ? 1 : 2, std::memory_order_release);
+    };
+    static const bool sync = [] {
+      const char* e = std::getenv("XBEM_SYNC_PIPELINES");
+      return e && *e == '1';
+    }();
+    if (sync) {
+      build();
+      return entry->pipeline;
+    }
+    building = true;
+    compile_pool().run(build);
+    return VK_NULL_HANDLE;
   }
 
   // ---------------------------------------------------------- state
@@ -1853,8 +1911,9 @@ class Renderer {
       note(std::format("topology {:#x} not supported - draws skipped", state_.topology));
       return skip(std::format("topology {:#x}", state_.topology));
     }
-    VkPipeline pipe = pipeline(*p, *vs, ps, rect ? 1 : strip ? 2 : 0);
-    if (!pipe) return skip("pipeline creation failed");
+    bool building = false;
+    VkPipeline pipe = pipeline(*p, *vs, ps, rect ? 1 : strip ? 2 : 0, building);
+    if (!pipe) return skip(building ? "pipeline being built" : "pipeline creation failed");
     // Vertex buffer table: one V# per view (base, stride, records).
     std::vector<uint8_t> vb_table(std::max<size_t>(state_.vertex_buffers.size(), 16));
     for (size_t i = 0; i + 16 <= state_.vertex_buffers.size(); i += 16) {
@@ -2277,7 +2336,13 @@ class Renderer {
   std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> depth_images_;
   std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> shaders_;
   std::map<uint32_t, VkShaderModule> rect_gs_;
-  std::map<PipelineKey, VkPipeline> pipelines_;
+  // Graphics pipelines: built on the compile pool (seconds each on dzn for
+  // large wave-mode shaders); draws are skipped until theirs is ready.
+  struct PendingPipeline {
+    std::atomic<int> state{0};  // 0 building, 1 ready, 2 failed
+    VkPipeline pipeline = VK_NULL_HANDLE;
+  };
+  std::map<PipelineKey, std::shared_ptr<PendingPipeline>> pipelines_;
   fs::path cache_dir_;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::atomic<uint64_t> pipelines_created_{0}, pipelines_saved_{0};
