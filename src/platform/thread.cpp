@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "platform/thread.h"
 
 #include <thread>
@@ -89,6 +90,10 @@ void join_thread(NativeThread& t) {
   t.handle = 0;
 }
 
+bool set_thread_affinity(const NativeThread& t, uint64_t mask) {
+  return t.handle && SetThreadAffinityMask(reinterpret_cast<HANDLE>(t.handle), static_cast<DWORD_PTR>(mask)) != 0;
+}
+
 void detach_thread(NativeThread& t) {
   if (!t.handle) return;
   CloseHandle(reinterpret_cast<HANDLE>(t.handle));
@@ -149,7 +154,7 @@ bool start_thread(size_t stack_size, ThreadFn fn, void* arg, NativeThread& out) 
     delete sb;
     return false;
   }
-  out.handle = static_cast<uintptr_t>(tid);
+  out.handle = out.id = static_cast<uintptr_t>(tid);
   return true;
 }
 
@@ -157,6 +162,17 @@ void join_thread(NativeThread& t) {
   if (!t.handle) return;
   pthread_join(static_cast<pthread_t>(t.handle), nullptr);
   t.handle = 0;
+}
+
+bool set_thread_affinity(const NativeThread& t, uint64_t mask) {
+  if (!t.id) return false;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  const unsigned n = std::min(64u, hardware_threads());
+  for (unsigned i = 0; i < n; ++i)
+    if (mask & (1ull << i)) CPU_SET(i, &set);
+  if (CPU_COUNT(&set) == 0) return false;
+  return pthread_setaffinity_np(static_cast<pthread_t>(t.id), sizeof set, &set) == 0;
 }
 
 void detach_thread(NativeThread& t) {

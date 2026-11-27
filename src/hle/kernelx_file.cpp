@@ -281,6 +281,7 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
       got = std::fread(buffer, 1, count, f->file);
     }
   }
+  note_io_write(reinterpret_cast<uint64_t>(buffer), got, f->guest_path.c_str(), offset);
   if (ov) complete_overlapped(ov, got);
   count_readfile_bytes(got);
   // A synchronous handle keeps its file pointer after the bytes read, also

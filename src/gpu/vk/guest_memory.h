@@ -16,6 +16,8 @@
 // buffers the CPU never saw) are reported by the shaders and copied in after
 // the submission, so from the next one on they read right.
 
+#include "platform/page_tracker.h"
+#include <functional>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -56,10 +58,14 @@ class GuestMemory {
   void alias(uint64_t window, uint64_t real, uint64_t size);
 
   struct Stats {
-    uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, merged = 0, evicted = 0, unmapped = 0;
+    uint64_t resident = 0, uploaded = 0, refreshed = 0, written_back = 0, merged = 0, evicted = 0, unmapped = 0,
+             conflicts = 0;
     uint64_t misses = 0, misses_dropped = 0;  // pages shaders reached without a copy
   };
   const Stats& stats() const { return stats_; }
+  // Called for each page the GPU wrote before it is copied back (a guest
+  // address it is mapped at, the 4 KiB parts) - for diagnostics.
+  std::function<void(uint64_t va, uint16_t mask)> on_write_back;
   // The tag a compute shader left when its loop guard ended it (0: none);
   // cleared. Call after a submission finished.
   uint32_t take_guard_tag(uint32_t* block = nullptr) {
@@ -86,6 +92,9 @@ class GuestMemory {
   };
 
   std::unordered_map<uint32_t, std::vector<uint8_t>> snapshots_;  // page index -> its copy before the GPU ran
+  // What changed while the GPU ran (collected at the end of a submission to
+  // find parts both sides wrote; handled at the next begin_submission).
+  xbem::platform::pages::Changes pending_;
   uint64_t snapshot_bytes_ = 0;
 
   uint32_t* words() const { return static_cast<uint32_t*>(table_.mapped); }

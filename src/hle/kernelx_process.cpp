@@ -398,7 +398,8 @@ BOOL XBEM_GUEST_ABI hle_SetThreadGroupAffinity(HANDLE h, const uint8_t* affinity
     const uint64_t old = t->affinity_mask & all_mask(topology());
     std::memcpy(previous, &old, 8);
   }
-  std::memcpy(&t->affinity_mask, affinity, 8);  // recorded; host scheduling is left to the OS
+  std::memcpy(&t->affinity_mask, affinity, 8);
+  apply_thread_affinity(*t, "SetThreadGroupAffinity");
   return TRUE;
 }
 

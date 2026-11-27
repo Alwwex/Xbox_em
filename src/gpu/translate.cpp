@@ -554,6 +554,9 @@ class Translator {
     }
     // Compare results (cmpv) of inactive lanes are masked where they are
     // read (ballot_store), so no reset here: it would split the lane guards.
+    // XBEM_WAVE_LEGACY_GUARDS=1: the reset and one guard per instruction.
+    static const bool legacy = std::getenv("XBEM_WAVE_LEGACY_GUARDS") != nullptr;
+    if (legacy && (starts(n, "v_cmp") || n.find("_co_") != std::string_view::npos)) line("cmpv = false;");
     // DPP16: the source operand comes from another lane of the row (a
     // shuffle, so outside the lane guard).
     if (insn.extension == rdna2::Instruction::Extension::Dpp16) {
@@ -590,7 +593,7 @@ class Translator {
     // them changes exec): a separate branch per instruction made programs
     // with tens of thousands of them that drivers take minutes to build.
     static const std::string kGuardEnd = "  }  // lanes\n";
-    if (body_.ends_with(kGuardEnd)) body_.resize(body_.size() - kGuardEnd.size());
+    if (!legacy && body_.ends_with(kGuardEnd)) body_.resize(body_.size() - kGuardEnd.size());
     else line("if (lane_on()) {");
     post_.clear();
     bool ok;

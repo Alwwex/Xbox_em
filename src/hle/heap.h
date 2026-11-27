@@ -34,11 +34,18 @@ bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t
 // 0 inflated, 1 copied, 2 from a decoded chunk, 3 zeros); crash reports
 // name it. `file` must stay valid.
 void note_physical_write(uint64_t pfn, const char* file, uint64_t offset, uint64_t virt, uint32_t how);
+// A file read into guest memory at [va, va + size) (for crash reports: the
+// physical pages mapped there remember it).
+void note_io_write(uint64_t va, uint64_t size, const char* file, uint64_t offset);
 // Emulated physical memory: which physical page `address` maps and where else
 // that page is mapped (never blocks); and every address the byte at `address`
 // is mapped at (a platform::ViewFinder for watchpoints).
 bool describe_physical_page(uint64_t address, char* out, size_t out_size);
 int physical_views(uint64_t address, uint64_t* out, int max, bool may_block);
+// XBEM_CHECK_GPU_WRITES: logs writes the emulator makes for GPU work (copies,
+// list writes) to pages that are also mapped in the title's CPU heap range
+// (0x1000000000-0x1600000000) - a suspect for corrupted CPU objects.
+void check_gpu_write(uint64_t va, uint64_t size, const char* what);
 size_t virtual_query(const void* address, uint8_t* mbi, size_t length);  // fills a 48-byte MEMORY_BASIC_INFORMATION
 
 // run --watch alloc:CALLER+OFFSET: a data watchpoint armed at `offset` into

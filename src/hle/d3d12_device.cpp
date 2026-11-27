@@ -836,9 +836,11 @@ void perform_list_writes(uint64_t count, uint64_t lists) {
       if (w.timestamp) {
         const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch()).count() / 10);  // 100 MHz
+        check_gpu_write(w.address, 8, "list timestamp write (slot 72)");
         platform::safe_write(w.address, &ticks, 8);
       } else {
         const uint32_t v = static_cast<uint32_t>(w.value);
+        check_gpu_write(w.address, 4, "list value write (slot 71)");
         platform::safe_write(w.address, &v, 4);
       }
     }

@@ -236,6 +236,8 @@ class Renderer {
       const uint64_t budget = (mb ? std::strtoull(mb, nullptr, 10) : 2048ull) << 20;
       std::string why;
       if (!memory_.init(core_, budget, why)) XBEM_WARN("gpu", "{} - guest buffers are copied per submission", why);
+      if (std::getenv("XBEM_CHECK_GPU_WRITES"))
+        memory_.on_write_back = [this](uint64_t va, uint16_t mask) { check_write_back(va, mask); };
     }
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -376,7 +378,9 @@ class Renderer {
       VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
       pci.initialDataSize = blob.size();
       pci.pInitialData = blob.empty() ? nullptr : blob.data();
-      if (core_.fn().vkCreatePipelineCache(core_.device(), &pci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+      if (std::getenv("XBEM_NO_PIPELINE_CACHE")) {
+        pipeline_cache_ = VK_NULL_HANDLE;
+      } else if (core_.fn().vkCreatePipelineCache(core_.device(), &pci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
         pci.initialDataSize = 0, pci.pInitialData = nullptr;
         core_.fn().vkCreatePipelineCache(core_.device(), &pci, nullptr, &pipeline_cache_);
       }
@@ -461,6 +465,21 @@ class Renderer {
  private:
   // ---------------------------------------------------------- submission
 
+  // GLSL sizes of translated shaders (KiB), to name large programs whose
+  // pipeline builds take minutes or crash the driver.
+  static constexpr uint32_t kBigGlslKb = 256;
+  std::mutex glsl_kb_mutex_;
+  std::unordered_map<uint64_t, uint32_t> glsl_kb_;
+  void note_glsl_size(uint64_t hash, size_t bytes) {
+    std::lock_guard lock(glsl_kb_mutex_);
+    glsl_kb_[hash] = static_cast<uint32_t>(bytes >> 10);
+  }
+  uint32_t glsl_kb(uint64_t hash) {
+    std::lock_guard lock(glsl_kb_mutex_);
+    auto it = glsl_kb_.find(hash);
+    return it == glsl_kb_.end() ? 0 : it->second;
+  }
+
   void begin() {
     if (recording_) return;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -468,6 +487,25 @@ class Renderer {
     core_.fn().vkBeginCommandBuffer(cmd_, &bi);
     recording_ = true;
     memory_.begin_submission();
+  }
+
+  // XBEM_CHECK_GPU_WRITES: GPU writes copied back to pages the title also
+  // maps in its CPU heap (0x1000000000-0x1600000000), with the shaders of
+  // the submission.
+  void check_write_back(uint64_t va, uint16_t mask) {
+    uint64_t views[8];
+    const int n = physical_views(va, views, 8, true);
+    for (int i = 0; i < n; ++i) {
+      if (views[i] < 0x1000000000ull || views[i] >= 0x1600000000ull) continue;
+      static uint64_t hits = 0;
+      if (++hits <= 40 || std::has_single_bit(hits)) {
+        std::string cs;
+        for (uint64_t h : submitted_cs_) cs += std::format(" {:016x}", h);
+        XBEM_WARN("gpu", "GPU wrote parts {:#06x} of page {:#x}, the CPU heap's {:#x} (#{}); compute shaders:{}; last draw {}",
+                  mask, va, views[i], hits, cs.empty() ? " none" : cs, last_draw_);
+      }
+      return;
+    }
   }
 
   void submit() {
@@ -945,6 +983,7 @@ class Renderer {
     }
     if (!e->shader.ok) e->error = e->shader.error;
     else e->module = compile(e->shader.glsl, stage == gpu::ShaderStage::Vertex ? "vert" : "frag", e->error);
+    note_glsl_size(hash, e->shader.glsl.size());
     // The GLSL (megabytes for large wave-mode programs) is not needed any more.
     std::string().swap(e->shader.glsl);
     if (!e->error.empty())
@@ -1189,8 +1228,14 @@ class Renderer {
       gci.pDynamicState = &job->dy;
       gci.layout = layout_;
       VkPipeline pipe = VK_NULL_HANDLE;
+      const uint32_t kb = glsl_kb(job->vs_hash) + glsl_kb(job->ps_hash);
+      if (kb >= kBigGlslKb)
+        XBEM_INFO("gpu", "pipeline vs {:016x} ps {:016x}: building ({} KiB of GLSL)", job->vs_hash, job->ps_hash, kb);
       const auto t_pipe = std::chrono::steady_clock::now();
       const VkResult made = core_.fn().vkCreateGraphicsPipelines(core_.device(), pipeline_cache_, 1, &gci, nullptr, &pipe);
+      if (kb >= kBigGlslKb)
+        XBEM_INFO("gpu", "pipeline vs {:016x} ps {:016x}: built in {} ms", job->vs_hash, job->ps_hash,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_pipe).count());
       add_us(pipeline_us_, t_pipe);
       add_us(graphics_pipeline_us_, t_pipe);
       ++pipelines_created_;
@@ -1330,7 +1375,7 @@ class Renderer {
       return;
     std::vector<uint8_t> tmp(bytes);
     if (platform::safe_read(src->gpu_va + src_offset, tmp.data(), bytes))
-      platform::safe_write(dst->gpu_va + dst_offset, tmp.data(), bytes);
+      check_gpu_write(dst->gpu_va + dst_offset, bytes, "CopyBufferRegion"), platform::safe_write(dst->gpu_va + dst_offset, tmp.data(), bytes);
     ++copies_;
   }
 
@@ -1388,8 +1433,10 @@ class Renderer {
       const uint64_t buf_at = (upload ? sr : dr)->gpu_va + fp.offset + uint64_t{y0 / block + r} * fp.row_pitch +
                               uint64_t{x0 / block} * e;
       if (upload) {
-        if (platform::safe_read(buf_at, row.data(), row_bytes)) platform::safe_write(tex_at, row.data(), row_bytes);
+        if (platform::safe_read(buf_at, row.data(), row_bytes))
+          check_gpu_write(tex_at, row_bytes, "CopyTextureRegion"), platform::safe_write(tex_at, row.data(), row_bytes);
       } else if (platform::safe_read(tex_at, row.data(), row_bytes)) {
+        check_gpu_write(buf_at, row_bytes, "CopyTextureRegion readback");
         platform::safe_write(buf_at, row.data(), row_bytes);
       }
     }
@@ -2162,6 +2209,10 @@ class Renderer {
       }
       if (!raw->shader.ok) raw->error = raw->shader.error;
       else raw->module = compile(raw->shader.glsl, "comp", raw->error);
+      note_glsl_size(job->hash, raw->shader.glsl.size());
+      const uint32_t big_kb = glsl_kb(job->hash);
+      if (big_kb >= kBigGlslKb)
+        XBEM_INFO("gpu", "compute shader {:016x}: building its pipeline ({} KiB of GLSL)", job->hash, big_kb);
       std::string().swap(raw->shader.glsl);
       if (raw->module) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};

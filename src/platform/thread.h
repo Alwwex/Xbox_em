@@ -14,12 +14,16 @@ using ThreadFn = void (*)(void*);
 
 struct NativeThread {
   uintptr_t handle = 0;
+  uintptr_t id = 0;  // kept after detach_thread (affinity changes)
 };
 
 // Starts a host thread with a stack of at least `stack_size` bytes.
 bool start_thread(size_t stack_size, ThreadFn fn, void* arg, NativeThread& out);
 void join_thread(NativeThread& thread);
 void detach_thread(NativeThread& thread);
+// Restricts a thread to the host processors in `mask` (bit n = processor n;
+// bits past the host's processors are dropped). False when it cannot.
+bool set_thread_affinity(const NativeThread& thread, uint64_t mask);
 
 // Usable stack range of the calling thread: [low, high).
 bool current_stack_bounds(uintptr_t& low, uintptr_t& high);

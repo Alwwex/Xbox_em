@@ -554,7 +554,10 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   // on, and a destination that is not mapped (any more) must fail the
   // request, not the emulator.
   const auto deliver = [&](const uint8_t* data, uint64_t n) {
-    if (!n || platform::safe_write(reinterpret_cast<uint64_t>(dest), data, n)) return true;
+    if (!n || platform::safe_write(reinterpret_cast<uint64_t>(dest), data, n)) {
+      note_io_write(reinterpret_cast<uint64_t>(dest), n, file->guest_path.c_str(), offset);
+      return true;
+    }
     static std::atomic<int> warned{0};
     if (warned.fetch_add(1) < 16)
       XBEM_WARN("dstorage", "{}: destination {} ({:#x} bytes) is not writable - request failed:{}", file->guest_path,

@@ -18,6 +18,8 @@
 // Every call whose decoding is a guess is logged with all arguments and the
 // call site, so a run of a real title shows whether the guess was right.
 
+#include <set>
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -224,7 +226,20 @@ struct PageState {
   const char* written_by = nullptr;
   uint64_t written_offset = 0, written_virtual = 0;
   uint32_t written_how = 0;
+  // For crash reports: when (ms of the run) the page was allocated and last
+  // mapped (and by which code), and the last file read into a virtual
+  // address it is mapped at.
+  uint32_t alloc_ms = 0, map_ms = 0, io_ms = 0;
+  uint64_t map_caller = 0, map_va = 0;
+  const char* io_file = nullptr;
+  uint64_t io_offset = 0, io_va = 0, io_size = 0;
 };
+
+uint32_t run_ms() {
+  static const auto start = std::chrono::steady_clock::now();
+  return static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 // What the title does with its physical pages that may lose data: a page
 // mapped where another one was (without an unmap), mapped at a second address,
@@ -270,6 +285,24 @@ void note_physical_write(uint64_t pfn, const char* file, uint64_t offset, uint64
   st.written_offset = offset;
   st.written_virtual = virt;
   st.written_how = how;
+}
+
+void note_io_write(uint64_t va, uint64_t size, const char* file, uint64_t offset) {
+  if (!size) return;
+  std::lock_guard lock(g_phys.mutex);
+  static std::set<std::string> names;  // kept for the reports
+  file = names.emplace(file).first->c_str();
+  const uint32_t now = run_ms();
+  for (uint64_t at = va & ~(kPhysPageSize - 1); at < va + size; at += kPhysPageSize) {
+    auto it = g_phys.va_pfn.find(at);
+    if (it == g_phys.va_pfn.end() || !g_phys.valid(it->second)) continue;
+    PageState& st = g_phys.state(it->second);
+    st.io_file = file;
+    st.io_offset = offset + (at > va ? at - va : 0);
+    st.io_ms = now;
+    st.io_va = va;
+    st.io_size = size;
+  }
 }
 
 bool write_physical_page(uint64_t pfn, uint64_t offset, const void* data, size_t size) {
@@ -362,6 +395,7 @@ int32_t XBEM_GUEST_ABI hle_XMemAllocatePhysicalPages(uint64_t a0, uint64_t a1, u
         g_phys.pages.emplace_back();
       }
       g_phys.pages[page].allocated = true;
+      g_phys.pages[page].alloc_ms = run_ms();
       pages[k] = pfn_of_page(page);
       ++g_phys.in_use;
     }
@@ -498,6 +532,9 @@ bool map_page(uint64_t va, uint64_t frame, uint64_t caller) {
     return false;
   g_phys.va_pfn[va] = pfn;
   if (!here) st.vas.push_back(va);
+  st.map_ms = run_ms();
+  st.map_caller = caller;
+  st.map_va = va;
   return true;
 }
 
@@ -590,6 +627,26 @@ int physical_views(uint64_t address, uint64_t* out, int max, bool may_block) {
   return n;
 }
 
+void check_gpu_write(uint64_t va, uint64_t size, const char* what) {
+  static const bool on = std::getenv("XBEM_CHECK_GPU_WRITES") != nullptr;
+  if (!on || !size) return;
+  static std::atomic<uint64_t> hits{0}, checked{0};
+  ++checked;
+  for (uint64_t at = va & ~(kPhysPageSize - 1); at < va + size; at += kPhysPageSize) {
+    if (at >= 0x1000000000ull && at < 0x1600000000ull) continue;  // a write in the heap range itself
+    uint64_t views[8];
+    const int n = physical_views(at, views, 8, true);
+    for (int i = 0; i < n; ++i)
+      if (views[i] >= 0x1000000000ull && views[i] < 0x1600000000ull) {
+        const uint64_t h = hits.fetch_add(1) + 1;
+        if (h <= 32 || std::has_single_bit(h))
+          XBEM_WARN("xmem", "{} writes {:#x} bytes at {:#x}: its page is also the CPU heap's {:#x} (#{}, {} writes checked)",
+                    what, size, va, views[i] & ~(kPhysPageSize - 1), h, checked.load());
+        return;
+      }
+  }
+}
+
 bool describe_physical_page(uint64_t address, char* out, size_t out_size) {
   std::unique_lock lock(g_phys.mutex, std::try_to_lock);  // may run in a signal handler: never block
   if (!lock.owns_lock()) return false;
@@ -603,6 +660,17 @@ bool describe_physical_page(uint64_t address, char* out, size_t out_size) {
   for (size_t k = 0; k < st.vas.size() && k < 4 && used + 24 < out_size; ++k)
     used += static_cast<size_t>(std::snprintf(out + used, out_size - used, "%s%#llx", k ? ", " : ": ",
                                               static_cast<unsigned long long>(st.vas[k] + (address - va))));
+  if (used + 96 < out_size)
+    used += static_cast<size_t>(std::snprintf(out + used, out_size - used,
+                                              "; allocated at %u ms, last mapped at %u ms (at %#llx by %#llx), now %u ms",
+                                              st.alloc_ms, st.map_ms, static_cast<unsigned long long>(st.map_va),
+                                              static_cast<unsigned long long>(st.map_caller), run_ms()));
+  if (st.io_file && used + 96 < out_size)
+    used += static_cast<size_t>(std::snprintf(out + used, out_size - used,
+                                              "; last file read into it: %s at %#llx (%#llx bytes to %#llx) at %u ms",
+                                              st.io_file, static_cast<unsigned long long>(st.io_offset),
+                                              static_cast<unsigned long long>(st.io_size),
+                                              static_cast<unsigned long long>(st.io_va), st.io_ms));
   static const char* const kHow[] = {"inflated", "copied", "from a decoded chunk (piece inside it)", "zeros (format not decoded)"};
   if (st.written_by && used + 64 < out_size)
     std::snprintf(out + used, out_size - used, "; last DirectStorage write: %s at %#llx (virtual %#llx), %s",

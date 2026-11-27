@@ -1,6 +1,7 @@
 #include "platform/file_cache.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -28,6 +30,7 @@ constexpr uint64_t kBlock = 256ull << 10;
 struct OpenFile {
   int fd = -1;
   uint32_t id = 0;
+  uint64_t size = 0;  // at open (game files do not change)
 };
 
 struct Block {
@@ -80,13 +83,33 @@ int64_t raw_read(int fd, uint64_t offset, void* out, size_t n) {
                  static_cast<unsigned long long>(g_cache.requested >> 20));
   return r;
 }
+// Reads on WSL's drvfs (/mnt/<drive>) fail now and then (EIO, ENOMEM) or
+// return 0 before the end of the file when memory is short: retried, with a
+// short pause, before a failure is reported (a failed DirectStorage request
+// made GTA VI place a resource over stale bytes and crash).
 int64_t raw_read_uncounted(int fd, uint64_t offset, void* out, size_t n) {
   size_t done = 0;
+  int retries = 0;
   while (done < n) {
     const ssize_t r = ::pread(fd, static_cast<uint8_t*>(out) + done, n - done, static_cast<off_t>(offset + done));
     if (r < 0 && errno == EINTR) continue;  // a signal (thread dumps, faults skipped) - not the end of the data
-    if (r < 0) return done ? static_cast<int64_t>(done) : -1;
-    if (r == 0) break;
+    if (r <= 0) {
+      const int e = r < 0 ? errno : 0;
+      struct stat st {};
+      const bool before_end = ::fstat(fd, &st) == 0 && offset + done < static_cast<uint64_t>(st.st_size);
+      if ((r < 0 || before_end) && retries < 12) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 16)
+          std::fprintf(stderr, "[warn ][files] read of %zu bytes at %#llx %s (%s) - retrying\n", n - done,
+                       static_cast<unsigned long long>(offset + done), r < 0 ? "failed" : "returned 0 before the end",
+                       r < 0 ? std::strerror(e) : "short");
+        ::usleep(2000u << std::min(retries, 6));
+        ++retries;
+        continue;
+      }
+      if (r < 0) return done ? static_cast<int64_t>(done) : -1;
+      break;
+    }
     done += static_cast<size_t>(r);
   }
   return static_cast<int64_t>(done);
@@ -113,6 +136,10 @@ int64_t cached_read(const std::string& host_path, uint64_t offset, void* out, si
       OpenFile o;
       o.fd = open_file(host_path);
       if (o.fd < 0) return -1;
+#if !defined(_WIN32)
+      struct stat st {};
+      if (::fstat(o.fd, &st) == 0) o.size = static_cast<uint64_t>(st.st_size);
+#endif
       o.id = c.next_id++;
       it = c.files.emplace(host_path, o).first;
     }
@@ -142,8 +169,11 @@ int64_t cached_read(const std::string& host_path, uint64_t offset, void* out, si
       const int64_t got = raw_read(f.fd, block * kBlock, b->data.data(), kBlock);
       if (got < 0) return done ? static_cast<int64_t>(done) : -1;
       b->data.resize(static_cast<size_t>(got));
+      // A short block is kept only at the end of the file: a short read in
+      // the middle (a failed read) would otherwise end every later read there.
+      const bool complete = got == static_cast<int64_t>(kBlock) || block * kBlock + got >= f.size;
       std::lock_guard lock(c.mutex);
-      if (c.index.find(key) == c.index.end()) {
+      if (complete && c.index.find(key) == c.index.end()) {
         c.lru.emplace_front(key, b);
         c.index[key] = c.lru.begin();
         c.bytes += b->data.size();

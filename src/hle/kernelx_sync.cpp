@@ -31,6 +31,22 @@ void exit_guest_thread(uint32_t code) {
   std::longjmp(t->exit_jump, 1);  // unwinds to the thread's start frame in Process::thread_main
 }
 
+// XBEM_AFFINITY=1: guest affinity masks restrict the host threads (threads a
+// title pins to one core then take turns there instead of running at once).
+// The first calls are logged either way.
+void apply_thread_affinity(rt::GuestThread& t, const char* how) {
+  static const bool apply = [] {
+    const char* v = std::getenv("XBEM_AFFINITY");
+    return v && *v == '1';
+  }();
+  static std::atomic<int> logged{0};
+  const bool ok = apply && !t.finished && platform::set_thread_affinity(t.native, t.affinity_mask);
+  if (logged.fetch_add(1) < 128)
+    XBEM_INFO("kernelx", "{}: guest thread {} (entry {}) affinity {:#x}{}", how, t.id,
+              describe_code_address(t.start_routine), t.affinity_mask,
+              apply ? (ok ? " - applied to the host thread" : " - NOT applied") : "");
+}
+
 namespace {
 
 using namespace win;
@@ -112,7 +128,7 @@ DWORD_PTR XBEM_GUEST_ABI hle_SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
   }
   const DWORD_PTR old = t->affinity_mask;
   t->affinity_mask = mask;
-  XBEM_TRACE("kernelx", "thread {} affinity {:#x}", t->id, mask);
+  apply_thread_affinity(*t, "SetThreadAffinityMask");
   return old;
 }
 

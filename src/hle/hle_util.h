@@ -57,4 +57,8 @@ uint32_t copy_out_string(std::basic_string_view<Char> s, Char* buffer, uint32_t 
 inline std::string narrow(const char16_t* s) { return s ? utf16_to_utf8(guest_wstr(s)) : std::string(); }
 inline std::string narrow(const char* s) { return std::string(guest_cstr(s)); }
 
+// Records-and-optionally-applies a guest thread's affinity mask (XBEM_AFFINITY=1,
+// kernelx_sync.cpp).
+void apply_thread_affinity(rt::GuestThread& t, const char* how);
+
 }  // namespace xbem::hle

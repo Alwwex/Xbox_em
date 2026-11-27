@@ -1,3 +1,5 @@
+#include <bit>
+#include <cstdio>
 #include "gpu/vk/guest_memory.h"
 
 #include <algorithm>
@@ -217,6 +219,10 @@ void GuestMemory::begin_submission() {
   ++serial_;
   pg::Changes changes;
   pg::collect(changes);
+  changes.remapped.insert(changes.remapped.begin(), pending_.remapped.begin(), pending_.remapped.end());
+  changes.written.insert(changes.written.begin(), pending_.written.begin(), pending_.written.end());
+  pending_.remapped.clear();
+  pending_.written.clear();
   for (const auto& [va, size] : changes.remapped) {
     forget_range(va, size);
     clear_missed(va, size);
@@ -254,6 +260,16 @@ void GuestMemory::end_submission() {
     if (w[kMissWord] > kMaxMisses) stats_.misses_dropped += w[kMissWord] - kMaxMisses;
     w[kMissWord] = 0;
   }
+  // Parts the guest's CPU wrote while the GPU ran: a page copied back whole
+  // would undo those writes (GTA VI keeps CPU objects in pages it also maps
+  // for the GPU; restored stale bytes crashed its worker threads). Without a
+  // snapshot to merge with, the CPU's bytes win there.
+  pg::Changes during;
+  pg::collect(during);
+  std::unordered_map<uint64_t, uint16_t> cpu_wrote;
+  for (const auto& [id, mask] : during.written) cpu_wrote[id] |= mask;
+  pending_.remapped.insert(pending_.remapped.end(), during.remapped.begin(), during.remapped.end());
+  pending_.written.insert(pending_.written.end(), during.written.begin(), during.written.end());
   uint32_t* w = words() + kWrittenWord;
   const size_t n = (pages_.size() + 1) / 2;
   for (size_t i = 0; i < n; ++i) {
@@ -262,6 +278,7 @@ void GuestMemory::end_submission() {
       const auto idx = static_cast<uint32_t>(i * 2 + h);
       const auto mask = static_cast<uint16_t>(w[i] >> (h * 16));
       if (!mask || !idx || idx >= pages_.size() || !pages_[idx].id) continue;
+      if (on_write_back && !pages_[idx].vas.empty()) on_write_back(pages_[idx].vas.front(), mask);
       if (auto it = snapshots_.find(idx); it != snapshots_.end()) {
         // Three-way: the guest's bytes now, with the words the GPU changed.
         const uint8_t* gpu = page_data(idx);
@@ -280,7 +297,16 @@ void GuestMemory::end_submission() {
         if (changed) pg::write_page(pages_[idx].id, scratch_.data(), changed);
         ++stats_.merged;
       } else {
-        pg::write_page(pages_[idx].id, page_data(idx), mask);
+        uint16_t keep = mask;
+        if (auto c = cpu_wrote.find(pages_[idx].id); c != cpu_wrote.end() && (c->second & mask)) {
+          keep = static_cast<uint16_t>(mask & ~c->second);
+          if (++stats_.conflicts <= 16 || std::has_single_bit(stats_.conflicts))
+            std::fprintf(stderr, "[warn ][gpu] page %#llx: parts %#x written by both the GPU and the CPU during a "
+                         "submission - the CPU's bytes kept (#%llu)\n",
+                         static_cast<unsigned long long>(pages_[idx].id), c->second & mask,
+                         static_cast<unsigned long long>(stats_.conflicts));
+        }
+        if (keep) pg::write_page(pages_[idx].id, page_data(idx), keep);
       }
       ++stats_.written_back;
     }
