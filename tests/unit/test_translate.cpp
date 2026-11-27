@@ -137,3 +137,11 @@ TEST(translate_compute_smem_comes_from_the_cpu) {
   CHECK_EQ(words[2], 0xaabbccddu);
   CHECK_EQ(words[3], 0x11223344u);
 }
+
+TEST(translate_compute_vop3_compare_into_an_sgpr_pair) {
+  // v_cmp_gt_u32 s8, 64, v0 (VOP3a: the destination is the vdst field, bits
+  // 0-7, not bits 8-14) ; s_endpgm
+  const TranslatedShader t = translate_cs({0xd4c40008, 0x000200c0, kEndpgm}, 0);
+  CHECK(t.ok);
+  CHECK(has(t, "s8 = subgroupBallot(cmpv).x;"));
+}

@@ -1318,6 +1318,16 @@ class Translator {
 
   // The lane mask of a compare / carry result stored to SGPR(s) or VCC or
   // EXEC: wave32 one word, wave64 both halves (one ballot per half).
+  // Where a compare writes its lane mask: VOPC writes VCC; in the VOP3
+  // encoding (VOP3a) the SGPR pair is the vdst field (bits 0-7 - bits 8-14
+  // are VOP3b's carry-out field, not used by compares); SDWA names it in
+  // its second dword.
+  static uint32_t compare_dst(const rdna2::Instruction& insn, const Vop& v) {
+    if (insn.format == Format::Vop3) return v.dst;
+    if (v.sdwa) return v.sdst;
+    return kVccLo;
+  }
+
   std::string ballot_store(uint32_t dst) {
     const std::string lo = wave64_ ? "subgroupBallot(cmph0).x" : "subgroupBallot(cmpv).x";
     const std::string hi = wave64_ ? "subgroupBallot(cmph1).x" : "0u";
@@ -1883,7 +1893,7 @@ class Translator {
       if (wave_) {
         line("  cmpv = ((m >> cls) & 1u) != 0u; }");
         if (starts(n, "v_cmpx_")) post_.push_back(ballot_store(kExecLo));
-        else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo) post_.push_back(ballot_store(v.sdst));
+        else if (const uint32_t d = compare_dst(insn, v); d != kVccLo) post_.push_back(ballot_store(d));
         else post_.push_back(ballot_store(kVccLo));
       } else {
         line("  vcc = ((m >> cls) & 1u) != 0u; }");
@@ -1905,7 +1915,7 @@ class Translator {
       for (const auto& [k, o] : kOps)
         if (op == k) cmp = o;
       if (!cmp && op != "f" && op != "t" && op != "tru") return fail("");
-      if (!wave_ && insn.format == Format::Vop3 && v.sdst != kVccLo) return fail("compare into an SGPR pair");
+      if (!wave_ && compare_dst(insn, v) != kVccLo) return fail("compare into an SGPR pair");
       if (op == "f" || op == "t" || op == "tru") {
         a = b = "0u";
         cmp = op == "f" ? "!=" : "==";
@@ -1958,7 +1968,7 @@ class Translator {
       }
       line(std::format("cmpv = {};", e));
       if (to_exec) post_.push_back(ballot_store(kExecLo));
-      else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo) post_.push_back(ballot_store(v.sdst));
+      else if (const uint32_t d = compare_dst(insn, v); d != kVccLo) post_.push_back(ballot_store(d));
       else post_.push_back(ballot_store(kVccLo));
       return true;
     }
