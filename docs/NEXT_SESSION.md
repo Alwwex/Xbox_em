@@ -20,28 +20,28 @@ and commits in English.
   game, ideally ~30 fps; they also saw a fully green screen at the start
   (not reproduced in screenshots yet - ask when it appears).
 
-## Where things stand (2026-11-27, evening)
+## Where things stand (2026-11-27, late afternoon)
 
-- `tools/gta6_press_run.sh LOG 600` (synchronous DirectStorage, both
-  watchdog skip-faults, no thread dumps unless XBEM_RUN_DUMPS) gets through
-  the menus into the story load in most runs; the press timing still varies
-  (run 190 stayed on LEGAL TERMS - add a screenshot at ~215 s, black =
-  loading started). Runs 189/192 lasted 600 s without a crash.
-- Fixed today (see docs/HANDOFF.md "SCENE STABILITY"): pieces inside
-  compressed chunks served from the .ttpf chunk table (virtual offset in
-  request word 9); wave64 compute pipelines (dzn) - compute dispatches now
-  run in the game; pread EINTR; word-precise GPU write-back; MRT; XG
-  GetResourceTiling = addrlib 64KB_S (tail first).
-- The scene stays black (draws and dispatches run). No depth buffers; the
-  console pipeline state blobs are not decoded. Menu icons/check marks are
-  BCPack-like formats (2/14) we cannot decode - the "weird menu" without
-  ticks or text bodies.
+- `tools/gta6_press_run.sh LOG SECONDS` gets into the story intro: loading
+  screen (dark red, spinner) -> Bink cutscene -> opening credits (pink neon
+  text renders). The cutscene is GREEN (letterboxed): Bink2Scarlett decodes
+  on the CPU (movies.rpf is read via ReadFile) but the YUV planes the
+  title samples are zero - not found yet why.
+- The 3D world behind the credits is black; ~4 fps; RAM close to the 12 GB
+  WSL limit in the scene (xbem RSS ~7 GB).
+- Fixed today (HANDOFF "SCENE STABILITY"): chunk-table pieces, wave64 dzn
+  pipelines, VOP3 compare destination, loop guard 2^17, V# buffer views
+  (the XBDS encoding was read as an address by culling shaders), depth +
+  blend from console registers, copy commands, graphics shaders in wave
+  mode (pixel shader coverage 18% -> ~93%), image eviction (byte and count
+  budgets; the device allows 4096 allocations), present blit for non-RGBA8
+  display formats (the overflow crashed libgallium at ~450-550 s).
 
 ## Next steps (suggested order)
 
-1. Look at what a loading/scene frame draws (`--capture-commands
-   FILE@440:200`, screenshot) and why the display image is black.
-2. Depth buffers: decode depth state from gfx-state-a/b (or the D3D12 desc
-   of slot 55 variants), create depth images for DSVs.
-3. Async DirectStorage race (then drop XBEM_DSTORAGE_SYNC).
-4. Performance (each submission waits for the GPU).
+1. Why Bink's frames are zero: find the textures the cutscene draw samples
+   (--capture-commands during the green screen) and who writes them.
+2. Why the 3D world is black (capture a scene frame: G-buffer targets,
+   lighting compute, final composite; depth clear value now recorded).
+3. Performance: honour fences asynchronously so submissions need not wait.
+4. Async DirectStorage race (then drop XBEM_DSTORAGE_SYNC).
