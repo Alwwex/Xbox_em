@@ -60,3 +60,27 @@ builds - look for "building (" lines just before the abort).
    lighting compute, final composite; depth clear value now recorded).
 3. Performance: honour fences asynchronously so submissions need not wait.
 4. Async DirectStorage race (then drop XBEM_DSTORAGE_SYNC).
+
+## 2026-11-27 night: moving to native Linux (GTX 1080)
+
+- Thread 340 crash solved: drvfs reads failed with ENOMEM (a stray 9.5 GB
+  test process); reads are retried, short blocks never cached.
+- Streaming: local copy of /mnt reads (~/.cache/xbem/files, XBEM_DISK_CACHE),
+  DirectStorage requests of one Submit run in parallel (locks narrowed).
+  Streaming is no longer the limit: in runs 262-265 all 59 guest threads are
+  mostly blocked; the scene makes ~1.3 frame events/s. The limit is the GPU
+  path through dzn (pipelines take 50-130 s to build, wave-mode draws ~10 ms).
+- Next machine: native Linux with an NVIDIA GTX 1080 (driver 580, the last
+  branch for Pascal; subgroup size 32 matches the translator). Measure first,
+  then try without the dzn workarounds (wave-mode fallback, GLSL size limit
+  XBEM_MAX_GLSL_KB, XBEM_WAVE_SUBMIT_MS splits). Game path differs from
+  /mnt/d/GTAVI/GTAVI (the disk cache only applies to /mnt/ paths).
+- Saves: XGameSave is not implemented, so the title repeats its settings
+  screens every run. QueryApiImpl returns E_NOINTERFACE for
+  {704c3f58-e629-4cc2-b197-30511b996fe2} (20 flat wrappers at
+  +0x55df210..+0x55dfc84, likely XGameSave) and
+  {1b339674-328d-4283-a200-3171f18d3639} (3 wrappers at +0x55dec88,
+  +0x55decf8, +0x55df190, possibly XGameSaveFiles). Wrappers call vtable
+  slots through the CFG thunk +0x56a2070.
+- Open: black display (tonemap ps 2c9c4 never drawn), crash at +0x4e9b578
+  (null vtable, called from +0x2484ac4; runs 252 and 260).
