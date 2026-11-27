@@ -849,6 +849,8 @@ class Renderer {
     e->shader = gpu::translate_shader(code.data(), code.size(), stage);
     if (!e->shader.ok) e->error = e->shader.error;
     else e->module = compile(e->shader.glsl, stage == gpu::ShaderStage::Vertex ? "vert" : "frag", e->error);
+    // The GLSL (megabytes for large wave-mode programs) is not needed any more.
+    std::string().swap(e->shader.glsl);
     if (!e->error.empty())
       XBEM_WARN("gpu", "{} shader {:016x}: {}", stage == gpu::ShaderStage::Vertex ? "vertex" : "pixel", hash,
                 e->error);
@@ -1082,13 +1084,13 @@ class Renderer {
   }
 
   // GPU images of resources unused for a while are dropped when their
-  // memory passes the budget (XBEM_IMAGE_BUDGET_MB, default 3072): resources
+  // memory passes the budget (XBEM_IMAGE_BUDGET_MB, default 1536): resources
   // are never released (probe objects live on), and titles place new ones at
   // reused addresses, so images only accumulated until the device ran out.
   void evict_images() {
     static const uint64_t budget = [] {
       const char* e = std::getenv("XBEM_IMAGE_BUDGET_MB");
-      return (e ? std::strtoull(e, nullptr, 10) : 3072ull) << 20;
+      return (e ? std::strtoull(e, nullptr, 10) : 1536ull) << 20;
     }();
     // Each image is a memory allocation of its own, and the device's count is
     // limited (creation of 1x1 images failed near 4000): a count budget too.
@@ -1912,6 +1914,7 @@ class Renderer {
       }
       if (!raw->shader.ok) raw->error = raw->shader.error;
       else raw->module = compile(raw->shader.glsl, "comp", raw->error);
+      std::string().swap(raw->shader.glsl);
       if (raw->module) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
