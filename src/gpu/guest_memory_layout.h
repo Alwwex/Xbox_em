@@ -50,7 +50,9 @@ constexpr uint32_t kDescMissedBits = 1u << 16;
 // A compute shader whose loop guard ended it writes its tag here (see the
 // translator's block loop); the renderer reports and clears it.
 constexpr uint32_t kGuardWord = kDescMissedWord + kDescMissedBits / 32;
-constexpr uint32_t kTableWords = kGuardWord + 1;
+// The block a loop guard stopped in (next to its tag).
+constexpr uint32_t kGuardBlockWord = kGuardWord + 1;
+constexpr uint32_t kTableWords = kGuardWord + 2;
 // Descriptor kinds in the table (as gpu::SlotKind's Texture / Image).
 constexpr uint32_t kDescTexture = 1, kDescImage = 2;
 

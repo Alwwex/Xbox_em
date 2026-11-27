@@ -3,6 +3,7 @@
 #include <array>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <map>
@@ -324,8 +325,16 @@ class Translator {
     // removed after ~2 s and every later submission fails. The guard ends the
     // program after 2^15 block transitions.
     line("uint blk = 0u, guard = 0u;");
-    line("while (blk != 0xffffffffu && ++guard < 0x8000u) {");
-    line(std::format("if (guard == 0x7fffu) MemT(pc.mem).w[{}u] = {:#x}u;", mem::kGuardWord, out_.tag));
+    // The guard counts blocks run (2^15 by default, XBEM_LOOP_GUARD=n for
+    // 2^n): a loop that never ends would hang the GPU into a device removal.
+    static const uint32_t limit = [] {
+      const char* e = std::getenv("XBEM_LOOP_GUARD");
+      const int n = e ? std::atoi(e) : 15;
+      return 1u << std::clamp(n, 10, 24);
+    }();
+    line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", limit));
+    line(std::format("if (guard == {:#x}u) {{ MemT(pc.mem).w[{}u] = {:#x}u; MemT(pc.mem).w[{}u] = blk; }}", limit - 1,
+                     mem::kGuardWord, out_.tag, mem::kGuardBlockWord));
     line("switch (blk) {");
     bool open = false;
     for (uint32_t k = 0; k < insns.size(); ++k) {
@@ -334,7 +343,7 @@ class Translator {
       const std::string_view n = name_of(insn);
       if (block_at.count(insns[k].pc)) {
         if (open) line(std::format("blk = {}u; break; }}", block_at[insns[k].pc]));
-        line(std::format("case {}u: {{", block_at[insns[k].pc]));
+        line(std::format("case {}u: {{  // +{:#x}", block_at[insns[k].pc], insns[k].pc));
         open = true;
       }
       if (!open) continue;  // unreachable code after an unconditional transfer

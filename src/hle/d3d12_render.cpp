@@ -421,7 +421,8 @@ class Renderer {
       }
     }
     // A compute shader ended by its loop guard (a loop that would not end).
-    if (const uint32_t hit = memory_.take_guard_tag()) {
+    uint32_t guard_block = 0;
+    if (const uint32_t hit = memory_.take_guard_tag(&guard_block)) {
       {
         uint64_t hash = 0;
         {
@@ -430,8 +431,8 @@ class Renderer {
         }
         static int logged = 0;
         if (logged++ < 16)
-          XBEM_WARN("gpu", "compute shader {:016x} (tag {:#x}) ran into its loop guard - a loop that does not end",
-                    hash, hit);
+          XBEM_WARN("gpu", "compute shader {:016x} (tag {:#x}) ran into its loop guard in block {} - a loop that does "
+                    "not end", hash, hit, guard_block);
       }
     }
     submitted_cs_.clear();

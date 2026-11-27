@@ -62,11 +62,12 @@ class GuestMemory {
   const Stats& stats() const { return stats_; }
   // The tag a compute shader left when its loop guard ended it (0: none);
   // cleared. Call after a submission finished.
-  uint32_t take_guard_tag() {
+  uint32_t take_guard_tag(uint32_t* block = nullptr) {
     if (!table_.mapped) return 0;
     uint32_t& w = words()[gpu::mem::kGuardWord];
     const uint32_t tag = w;
     w = 0;
+    if (block) *block = words()[gpu::mem::kGuardBlockWord];
     return tag;
   }
 
