@@ -169,9 +169,24 @@ slot-57 pipelines, MRT.
   (int3 +0x4ffd868) and failed to inflate. DirectStorage now finds the
   chunk start and delivers the piece (dstorage.cpp shifted_chunk_piece).
   Still open: whether our tiling matches the console's at all.
-- Loading screen after Confirm still lasts past 420 s in every run
-  (thread dumps at 300/330/360 s: threads move, the loader is busy - not a
-  deadlock). Next: profile what the host spends time on during loading.
+- LOADING SCREEN -> SCENE: with the DirectStorage chunk recovery on, the
+  story load stopped reading at ~240 s in every run (12 runs). With it off
+  (now the default; XBEM_CHUNK_RECOVERY=1 turns it on) run 13 reached the
+  scene after the loading screen at ~270 s (13495 "+0x4ffd868" piece
+  asserts = world texture streaming, dispatches jump, frames drop), run 14
+  did not (37 asserts, reads stop at 46.8k): the outcome is still
+  nondeterministic (the same as run25 earlier). The status line now shows
+  file reads, fence waits not reached and DirectStorage work not run (none
+  pending when stuck).
+- In the scene: one submission of 22 dispatches (cs 067b93998d4295ba,
+  1a3bfbc46d1a6fbe, a39efb907e979fc8, cb774b95dc5504ff) takes 1.77 s -
+  probably a loop running into the guard; shaders that hit the guard are
+  now logged ("ran into its loop guard"). Draws of many pipelines are
+  skipped ("not a known graphics pipeline", memory now dumped) - the image
+  stays black at ~1 frame/s.
+- Fixed on the way: compute shaders compiled synchronously stalled the main
+  loop (watchdog at ~300 s) - now prepared on worker threads; a GPU hang
+  (TDR, "D3D12: Removing Device") - loop guard; XApu commands acknowledged.
 - The owner reports a fully green screen at the start; not reproduced in
   screenshots at 5/10/15/20/40 s (black, then the menu).
 

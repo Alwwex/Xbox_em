@@ -18,6 +18,7 @@
 // translate are skipped (counted in the log).
 
 #include "hle/d3d12_internal.h"
+#include "hle/discovery.h"
 
 #if defined(XBEM_HAVE_VULKAN)
 
@@ -1036,7 +1037,17 @@ class Renderer {
         state_.pipeline = p;
         state_.pipeline_name = !p && is_probe_object(a[0]) ? reinterpret_cast<ProbeObject*>(a[0])->name.substr(0, 40)
                                                             : std::format("{:#x}", a[0]);
-        if (!p) note(std::format("pipeline {:#x} is not a known graphics pipeline - its draws are skipped", a[0]));
+        if (!p) {
+          // What the title passed: its first words (a vtable / an object of
+          // another kind) tell which creation path is missing.
+          uint64_t w[6] = {};
+          platform::safe_read(a[0], w, sizeof w);
+          std::string words;
+          for (uint64_t x : w) words += std::format(" {:016x}", x);
+          const std::string vt = w[0] ? describe_code_address(w[0]) : std::string();
+          note(std::format("pipeline {:#x} is not a known graphics pipeline - its draws are skipped; memory:{}{}", a[0],
+                           words, vt.empty() ? "" : " (word 0: " + vt + ")"));
+        }
         break;
       }
       case 32:
