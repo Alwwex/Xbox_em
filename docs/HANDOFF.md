@@ -166,13 +166,20 @@ both watchdog skip-faults). Fixed:
 - GPU write-back merges the words a submission changed into the guest's
   current bytes (snapshot of dispatch output pages before the submission).
 - MRT: up to 8 colour targets per pass.
+- Translator: VOP3 compares took their SGPR destination from bits 8-14
+  instead of vdst (bits 0-7) - every `v_cmp_* sN` stored into s0; loops
+  exiting on such masks ran into the loop guard (1a3bfbc46d1a6fbe: 318 ms
+  per scene submission, the main loop nearly stopped).
+- Decoded-chunk cache: LRU, 128 MiB (16 entries thrashed: 2.5 GB re-read).
+- Crash reports name the DirectStorage request that last wrote a physical
+  page (file offset, virtual offset, how).
 Open findings:
-- The title's in-memory chunk table sometimes names chunks the file does not
-  have (requests past the end of ttdb_props_2_3 / lighting / interiors, zlib
-  requests inside type-1 chunks of ttdb_maps_7_7) although its ReadFile of
-  the table returned all bytes - the table memory gets corrupted later.
-  Next: `--watch at:0xf43721?r12=bb2e:rax+0x28d40/64` (maps_7_7, 0xbb2e
-  entries; table pointer in rax at +0xf43721) to catch the writer.
+- Requests past the end of a file / inside other chunks: mostly explained
+  by the read layer's source = chunk offset + virtual distance (larger than
+  the stored size); solved by the virtual-offset lookup. Some format-2
+  requests (ttdb_props_2_3, word 9 0xcfd35000) still do not match the
+  on-disk table - if they persist, `--watch at:0xf43721?r12=COUNT:rax+OFF/64`
+  (table pointer in rax at +0xf43721, COUNT = entries) finds writers.
 - The title's tiling layout (fn 0x1403441f0 / 0x51fb680): per level dword =
   start tile (16 bits) | width tiles << 16 | height tiles << 24; the packed
   mip tail is assumed at tile 0 and smaller mips merge into it (AMD order:
