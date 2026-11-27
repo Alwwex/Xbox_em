@@ -444,7 +444,21 @@ void forget_mapping(uint64_t va, uint64_t pfn) {
 // Maps physical page `pfn` at `va` (64 KiB aligned) and records it. Called
 // with the mutex held.
 bool map_page(uint64_t va, uint64_t frame, uint64_t caller) {
-  if (!g_phys.valid(frame)) return false;
+  if (!g_phys.valid(frame)) {
+    // A frame number no allocation handed out (GTA VI's streaming passes a
+    // few in large scatter batches). Plain memory keeps the address usable -
+    // streaming reads into it must not fail - instead of failing the batch.
+    static std::atomic<uint64_t> invalid{0};
+    const uint64_t n = invalid.fetch_add(1) + 1;
+    if (n <= 8 || std::has_single_bit(n))
+      XBEM_WARN("xmem", "maps frame {:#x} at {:#x}: no such physical page - plain memory there instead (#{}, from {})",
+                frame, va, n, describe_code_address(caller));
+    if (auto it = g_phys.va_pfn.find(va); it != g_phys.va_pfn.end()) {
+      forget_mapping(va, it->second);
+      g_phys.va_pfn.erase(it);
+    }
+    return platform::remap_anonymous(va, kPhysPageSize, platform::Prot::RW);
+  }
   // A frame inside a 64 KiB page maps the whole page (mappings are 64 KiB).
   const uint64_t pfn = frame & ~(kFramesPerPage - 1);
   static uint64_t unaligned = 0;
@@ -520,12 +534,14 @@ int32_t XBEM_GUEST_ABI hle_XMemMapPhysicalPagesScatter(uint64_t a0, uint64_t a1,
     const auto* pages = a2 >= 0x10000 ? reinterpret_cast<const uint64_t*>(a2) : nullptr;
     std::lock_guard lock(g_phys.mutex);
     ok = true;
-    for (uint64_t k = 0; k < a1 && ok; ++k)
+    // Every entry is mapped even when one fails (stopping left the rest of
+    // the batch unmapped - streaming reads into it failed).
+    for (uint64_t k = 0; k < a1; ++k)
       // A 0 entry unmaps its address (MapUserPhysicalPagesScatter): GTA VI
       // maps a few pages, then unmaps them with the same addresses and zeros
       // and asserts (int3) that it worked.
-      ok = (vas[k] % kPhysPageSize) == 0 &&
-           (pages && pages[k] ? map_page(vas[k], pages[k], caller) : unmap_page(vas[k]));
+      ok = ((vas[k] % kPhysPageSize) == 0 &&
+            (pages && pages[k] ? map_page(vas[k], pages[k], caller) : unmap_page(vas[k]))) && ok;
   }
   platform::refresh_watchpoint_views();
   static std::atomic<uint64_t> calls{0};

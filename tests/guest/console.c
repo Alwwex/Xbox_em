@@ -227,6 +227,14 @@ static void test_xmem(void) {
     CHECK(XMemMapPhysicalPagesScatter(vas, 2, zeros) >= 0);
     CHECK(XMemMapPhysicalPagesScatter(vas, 2, frames) >= 0); /* the pages kept their bytes */
     CHECK(vs[0x40] == 0xA1 && vs[0x10040] == 0xB2);
+    /* A frame no allocation handed out: the other entries are still mapped
+       and its address stays writable (plain memory). */
+    const uint64_t bad[2] = {0x7FFFFFF0ull, pg[1] & ~0xFull};
+    (void)XMemMapPhysicalPagesScatter(vas, 2, bad);
+    vs[0x80] = 0xC3;
+    CHECK(vs[0x80] == 0xC3 && vs[0x10040] == 0xB2);
+    CHECK(XMemMapPhysicalPagesScatter(vas, 2, frames) >= 0);
+    CHECK(vs[0x40] == 0xA1);
     CHECK(XMemMapPhysicalPages(sp, 2, 0) == sp);
     CHECK(XMemFreePhysicalPages(2, pg) >= 0);
     CHECK(VirtualFree(sp, 0, MEM_RELEASE));
