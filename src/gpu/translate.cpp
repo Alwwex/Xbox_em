@@ -305,10 +305,10 @@ class Translator {
     // A loop that never ends (a translation mistake or a value the GPU
     // computes differently) must not hang the GPU: on Windows the device is
     // removed after ~2 s and every later submission fails. The guard ends the
-    // program after 2^18 block transitions.
+    // program after 2^15 block transitions.
     line("uint blk = 0u, guard = 0u;");
-    line("while (blk != 0xffffffffu && ++guard < 0x40000u) {");
-    line(std::format("if (guard == 0x3ffffu) MemT(pc.mem).w[{}u] = {:#x}u;", mem::kGuardWord, out_.tag));
+    line("while (blk != 0xffffffffu && ++guard < 0x8000u) {");
+    line(std::format("if (guard == 0x7fffu) MemT(pc.mem).w[{}u] = {:#x}u;", mem::kGuardWord, out_.tag));
     line("switch (blk) {");
     bool open = false;
     for (uint32_t k = 0; k < insns.size(); ++k) {
