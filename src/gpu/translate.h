@@ -38,6 +38,7 @@ struct ComputeInfo {
   uint32_t user_sgprs = 0;           // s0.. hold user data (root parameters from s4)
   bool tgid[3] = {true, true, true};  // workgroup id x/y/z in the SGPRs after the user data
   bool tg_size = false;              // then the thread group info SGPR
+  bool wave64 = false;               // set by the translator: the program treats EXEC as 64 bits
   uint32_t tidig_comps = 2;          // local ids: v0 = x, v1 = y (>= 1), v2 = z (>= 2)
   uint32_t lds_bytes = 0;
   // From the console's compute register state (desc+0x08, 0x1c bytes).

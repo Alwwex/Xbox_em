@@ -277,6 +277,23 @@ class Translator {
   // their addresses to be known on the CPU (see known_sgprs()).
   bool run_wave() {
     auto& insns = out_.program.instructions;
+    // Wave64 or wave32: the dispatch's wave size is not in the state the
+    // title gives; a program that treats EXEC as 64 bits (s_*_b64 on exec,
+    // exec_hi) was built for wave64.
+    for (const DecodedInstruction& d : insns) {
+      const rdna2::Instruction& i = d.insn;
+      const std::string_view n = name_of(i);
+      const uint32_t w0 = i.words[0];
+      if (i.format == Format::Sop1 || i.format == Format::Sop2) {
+        const uint32_t dst = (w0 >> 16) & 0x7f, a = w0 & 0xff, b = (w0 >> 8) & 0xff;
+        const bool b64 = n.ends_with("_b64");
+        if ((b64 && (dst == kExecLo || a == kExecLo || (i.format == Format::Sop2 && b == kExecLo))) || dst == kExecHi ||
+            a == kExecHi || (i.format == Format::Sop2 && b == kExecHi))
+          wave64_ = true;
+      }
+      if (i.format == Format::Vop3 && (n == "v_mbcnt_hi_u32_b32") && ((i.words[1] & 0x1ff) == kExecHi)) wave64_ = true;
+    }
+    out_.compute.wave64 = wave64_;
     if (!known_sgprs()) return false;
     std::map<uint32_t, uint32_t> block_at;  // pc -> block
     std::set<uint32_t> leaders{0};
@@ -328,10 +345,10 @@ class Translator {
         if (n == "s_branch") cond = "true";
         else if (n == "s_cbranch_scc0") cond = "!scc";
         else if (n == "s_cbranch_scc1") cond = "scc";
-        else if (n == "s_cbranch_vccz") cond = "vcc_lo == 0u";
-        else if (n == "s_cbranch_vccnz") cond = "vcc_lo != 0u";
-        else if (n == "s_cbranch_execz") cond = "exec_lo == 0u";
-        else if (n == "s_cbranch_execnz") cond = "exec_lo != 0u";
+        else if (n == "s_cbranch_vccz") cond = wave64_ ? "(vcc_lo | vcc_hi) == 0u" : "vcc_lo == 0u";
+        else if (n == "s_cbranch_vccnz") cond = wave64_ ? "(vcc_lo | vcc_hi) != 0u" : "vcc_lo != 0u";
+        else if (n == "s_cbranch_execz") cond = wave64_ ? "(exec_lo | exec_hi) == 0u" : "exec_lo == 0u";
+        else if (n == "s_cbranch_execnz") cond = wave64_ ? "(exec_lo | exec_hi) != 0u" : "exec_lo != 0u";
         else return fail("");
         if (cond == "true") {
           line(std::format("blk = {}u; break; }}", target));
@@ -360,25 +377,62 @@ class Translator {
     return true;
   }
 
-  // Vector instructions: lane-crossing ones first, then the guarded rest.
+  // Vector instructions. Wave64: the code runs once per half (lanes lane0
+  // and lane0 + 32), except for the lane-crossing ones that handle both
+  // halves themselves; lane-mask results (post_) are stored after both.
   bool emit_vector_wave(const rdna2::Instruction& insn) {
+    const std::string_view n = name_of(insn);
+    post_.clear();
+    const bool both = wave64_ && n != "v_readlane_b32" && n != "v_readfirstlane_b32" && n != "v_writelane_b32" &&
+                      n != "ds_bpermute_b32" && n != "ds_permute_b32";
+    if (both) line("for (wh = 0u; wh < 2u; ++wh) { lane = lane0 + 32u * wh;");
+    if (!emit_vector_lane(insn)) return false;
+    if (both) line("cmph[wh] = cmpv; }");
+    for (const std::string& p : post_) line(p);
+    post_.clear();
+    return true;
+  }
+
+  bool emit_vector_lane(const rdna2::Instruction& insn) {
     const std::string_view n = name_of(insn);
     const Vop v = vop_fields(insn);
     std::string a, b;
+    // Wave64: a lane's value is in half (lane >> 5) of the pair; both
+    // halves are shuffled (uniformly) and the right one taken.
+    const auto from_lane = [&](uint32_t operand, const std::string& index, std::string& e) {
+      if (!wave64_) {
+        if (!src(operand, insn, e)) return false;
+        e = std::format("subgroupShuffle({}, ({}) & 31u)", e, index);
+        return true;
+      }
+      std::string h0, h1;
+      half_ = "0";
+      const bool ok = src(operand, insn, h0);
+      half_ = "1";
+      const bool ok1 = src(operand, insn, h1);
+      half_ = "wh";
+      if (!ok || !ok1) return false;
+      e = std::format("((({2}) & 63u) < 32u ? subgroupShuffle({0}, ({2}) & 31u) : subgroupShuffle({1}, ({2}) & 31u))",
+                      h0, h1, index);
+      return true;
+    };
     if (n == "v_readlane_b32") {
-      if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
-      line(std::format("{} = subgroupShuffle({}, {} & 31u);", sreg(v.dst), a, b));
+      if (!src(v.src[1], insn, b)) return false;
+      if (!from_lane(v.src[0], b, a)) return false;
+      line(std::format("{} = {};", sreg(v.dst), a));
       return true;
     }
     if (n == "v_readfirstlane_b32") {
       const uint32_t dst = (insn.words[0] >> 17) & 0xff;
-      if (!src(insn.words[0] & 0x1ff, insn, a)) return false;
-      line(std::format("{} = subgroupShuffle({}, exec_lo == 0u ? 0u : uint(findLSB(exec_lo)));", sreg(dst), a));
+      const std::string first = "(exec_lo != 0u ? uint(findLSB(exec_lo)) : exec_hi != 0u ? 32u + uint(findLSB(exec_hi)) : 0u)";
+      if (!from_lane(insn.words[0] & 0x1ff, first, a)) return false;
+      line(std::format("{} = {};", sreg(dst), a));
       return true;
     }
     if (n == "v_writelane_b32") {
       if (!src(v.src[0], insn, a) || !src(v.src[1], insn, b)) return false;
-      line(std::format("if (lane == ({} & 31u)) {} = {};", b, vreg(v.dst), a));
+      if (wave64_) line(std::format("{{ uint wl = {} & 63u; {} = {}; }}", b, std::format("v{}[wl >> 5]", v.dst), a)), max_vgpr_ = std::max(max_vgpr_, v.dst + 1);
+      else line(std::format("if (lane == ({} & 31u)) {} = {};", b, vreg(v.dst), a));
       return true;
     }
     if (n == "ds_bpermute_b32" || n == "ds_permute_b32") {
@@ -387,6 +441,18 @@ class Translator {
       const uint32_t offset = insn.words[0] & 0xffff;
       if (n == "ds_permute_b32") return fail("ds_permute_b32");
       // bpermute: each active lane reads lane (addr + offset) / 4 (inactive sources read as 0).
+      if (wave64_) {
+        // Both halves shuffle (uniformly); each lane takes its source's half.
+        max_vgpr_ = std::max({max_vgpr_, addr + 1, data0 + 1, vdst + 1});
+        line("{ uint bsrc[2], bval[2][2];");
+        line(std::format("  for (wh = 0u; wh < 2u; ++wh) bsrc[wh] = ((v{}[wh] + {}u) >> 2) & 63u;", addr, offset));
+        line("  for (wh = 0u; wh < 2u; ++wh) {");
+        line(std::format("    bval[wh][0] = subgroupShuffle(v{}[0], bsrc[wh] & 31u);", data0));
+        line(std::format("    bval[wh][1] = subgroupShuffle(v{}[1], bsrc[wh] & 31u); }}", data0));
+        line("  for (wh = 0u; wh < 2u; ++wh) { lane = lane0 + 32u * wh;");
+        line(std::format("    if (lane_on()) v{}[wh] = lane_active(bsrc[wh]) ? bval[wh][bsrc[wh] >> 5] : 0u; }} }}", vdst));
+        return true;
+      }
       line(std::format("{{ uint src_lane = (({} + {}u) >> 2) & 31u; uint val = subgroupShuffle({}, src_lane);"
                        " bool src_on = ((exec_lo >> src_lane) & 1u) != 0u;",
                        vreg(addr), offset, vreg(data0)));
@@ -403,7 +469,7 @@ class Translator {
       line(std::format("{{ uint i = lane & 15u; uint sel = i < 8u ? ({} >> (i * 4u)) & 15u : ({} >> ((i - 8u) * 4u)) & 15u;", s1, s2));
       line(std::format("  uint from = ((lane & ~15u) ^ {}u) | sel; uint val = subgroupShuffle({}, from & 31u);",
                        n == "v_permlanex16_b32" ? 16 : 0, s0));
-      line(std::format("  bool on = {} || ((exec_lo >> (from & 31u)) & 1u) != 0u;", fi ? "true" : "false"));
+      line(std::format("  bool on = {} || lane_active(from);", fi ? "true" : "false"));
       line(std::format("  if (lane_on()) {} = on ? val : {}; }}", vreg(v.dst), bc ? "0u" : vreg(v.dst)));
       return true;
     }
@@ -425,8 +491,8 @@ class Translator {
       else return fail(std::format("DPP control {:#x}", ctrl));
       const bool shift = (ctrl >= 0x101 && ctrl <= 0x11f);
       line(std::format("{{ uint from = {}; dppv = subgroupShuffle({}, from & 31u);", from, vreg(src0)));
-      line(std::format("  bool valid = {} && ((exec_lo >> (from & 31u)) & 1u) != 0u; if (!valid) dppv = {}; }}",
-                       shift ? "((from & ~15u) == (lane & ~15u)) && from < 32u" : "true",
+      line(std::format("  bool valid = {} && lane_active(from); if (!valid) dppv = {}; }}",
+                       shift ? "((from & ~15u) == (lane & ~15u))" : "true",
                        bound_ctrl ? "0u" : vreg(v.dst)));
       dpp_ = true;
     } else if (insn.extension == rdna2::Instruction::Extension::Dpp8) {
@@ -434,9 +500,9 @@ class Translator {
       // bit 8); operand 234 (FI) also reads inactive lanes, 233 gets 0 there.
       const uint32_t w1 = insn.words[1];
       const bool fi = (insn.words[0] & 0x1ff) == 0xEA || (insn.words[0] & 0xff) == 0xEA;
-      line(std::format("{{ uint from = (lane & ~7u) | (({:#x}u >> ((lane & 7u) * 3u)) & 7u); dppv = subgroupShuffle({}, from);",
+      line(std::format("{{ uint from = (lane & ~7u) | (({:#x}u >> ((lane & 7u) * 3u)) & 7u); dppv = subgroupShuffle({}, from & 31u);",
                        w1 >> 8, vreg(w1 & 0xff)));
-      if (!fi) line("  if (((exec_lo >> from) & 1u) == 0u) dppv = 0u;");
+      if (!fi) line("  if (!lane_active(from)) dppv = 0u;");
       line("}");
       dpp_ = true;
     }
@@ -453,8 +519,6 @@ class Translator {
     }
     if (!ok) return false;
     line("}");
-    for (const std::string& p : post_) line(p);
-    post_.clear();
     return true;
   }
 
@@ -609,6 +673,31 @@ class Translator {
     if (n.find("_saveexec_") != std::string_view::npos || n.find("_wrexec_") != std::string_view::npos) {
       if (!src(s0, insn, a)) return false;
       const std::string_view op = n.substr(2, n.find('_', 2) - 2);
+      if (wave64_ && n.ends_with("_b64")) {
+        // The 64-lane form: exec and the operand as 64-bit masks.
+        std::string a64;
+        if (!src64(s0, insn, a64)) return false;
+        const std::string x = "ex64";
+        std::string e;
+        if (op == "and") e = std::format("{} & {}", a64, x);
+        else if (op == "or") e = std::format("{} | {}", a64, x);
+        else if (op == "xor") e = std::format("{} ^ {}", a64, x);
+        else if (op == "andn1") e = std::format("~{} & {}", a64, x);
+        else if (op == "andn2") e = std::format("{} & ~{}", a64, x);
+        else if (op == "orn1") e = std::format("~{} | {}", a64, x);
+        else if (op == "orn2") e = std::format("{} | ~{}", a64, x);
+        else if (op == "nand") e = std::format("~({} & {})", a64, x);
+        else if (op == "nor") e = std::format("~({} | {})", a64, x);
+        else if (op == "xnor") e = std::format("~({} ^ {})", a64, x);
+        else return fail("");
+        const bool wr = n.find("_wrexec_") != std::string_view::npos;
+        line(std::format("{{ uint64_t ex64 = packUint2x32(uvec2(exec_lo, exec_hi)); uint64_t r64 = ({}) & "
+                         "packUint2x32(uvec2(wave_lanes, wave_lanes_hi)); uvec2 o = unpackUint2x32({});",
+                         e, wr ? "r64" : "ex64"));
+        line(std::format("  exec_lo = uint(r64); exec_hi = uint(r64 >> 32); scc = r64 != uint64_t(0); {} = o.x; {} = o.y; }}",
+                         d, sreg(dst + 1)));
+        return true;
+      }
       std::string e;
       if (op == "and") e = std::format("{} & exec_lo", a);
       else if (op == "or") e = std::format("{} | exec_lo", a);
@@ -1006,9 +1095,12 @@ class Translator {
       // active lanes, every lane gets the value before it.
       lds_words_ = std::max<uint32_t>(lds_words_, ((offset + 4) >> 2) + 1);
       line(std::format("{{ uint idx = (((m0 & 0xffffu) + {}u) >> 2) & LDS_MASK, old = 0u;", offset));
-      line(std::format("  if (subgroupElect()) old = atomicAdd(lds[idx], {}uint(bitCount(exec_lo)));",
+      if (wave64_) line("  if (wh == 0u) {");  // once per wave: the first half's pass
+      line(std::format("  if (subgroupElect()) old = atomicAdd(lds[idx], {}uint(bitCount(exec_lo) + bitCount(exec_hi)));",
                        n == "ds_append" ? "" : "0u - "));
-      line(std::format("  {} = subgroupBroadcastFirst(old); }}", vreg(vdst)));
+      line("  dsapp = subgroupBroadcastFirst(old);");
+      if (wave64_) line("  }");
+      line(std::format("  {} = dsapp; }}", vreg(vdst)));
       return true;
     }
     if (n == "ds_read_b32") return line(std::format("{} = {};", vreg(vdst), at(offset))), true;
@@ -1080,8 +1172,12 @@ class Translator {
                     "#extension GL_KHR_shader_subgroup_ballot : require\n"
                     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
                     "#extension GL_EXT_shader_image_load_formatted : enable\n";
-    g += std::format("layout(local_size_x = {}, local_size_y = {}, local_size_z = {}) in;\n", c.local_size[0],
-                     c.local_size[1], c.local_size[2]);
+    const uint32_t threads = c.local_size[0] * c.local_size[1] * c.local_size[2];
+    if (wave64_)  // two lanes per invocation, one 32-wide subgroup per wave64
+      g += std::format("layout(local_size_x = {}) in;\n", std::max<uint32_t>((threads + 63) / 64, 1) * 32);
+    else
+      g += std::format("layout(local_size_x = {}, local_size_y = {}, local_size_z = {}) in;\n", c.local_size[0],
+                       c.local_size[1], c.local_size[2]);
     g += "layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };\n"
          "layout(push_constant) uniform Push { uint64_t data; uint64_t mem; } pc;\n";
     g += mem::glsl_helpers(true);
@@ -1155,20 +1251,40 @@ class Translator {
       while (pow2 < words) pow2 <<= 1;
       g += std::format("#define LDS_MASK {}u\nshared uint lds[{}];\n", pow2 - 1, pow2);
     }
-    g += "uint lane;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes, dppv;\nbool scc, cmpv;\n";
+    g += "uint lane, lane0, wh;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes, wave_lanes_hi, dppv, dsapp;\n"
+         "bool scc, cmpv;\nbool cmph[2];\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("uint s{};\n", k);
     const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 3);
-    for (uint32_t k = 0; k < vgprs; ++k) g += std::format("uint v{};\n", k);
-    g += "bool lane_on() { return ((exec_lo >> lane) & 1u) != 0u; }\n";
+    for (uint32_t k = 0; k < vgprs; ++k) g += wave64_ ? std::format("uint v{}[2];\n", k) : std::format("uint v{};\n", k);
+    // Lane masks: lanes 0-31 in the low word, 32-63 (wave64) in the high one.
+    g += "bool lane_in(uint lo, uint hi) { return ((((lane < 32u) ? lo : hi) >> (lane & 31u)) & 1u) != 0u; }\n"
+         "bool lane_active(uint l) { return l < 64u && ((((l < 32u) ? exec_lo : exec_hi) >> (l & 31u)) & 1u) != 0u; }\n"
+         "bool lane_on() { return lane_active(lane); }\n";
     g += "void main() {\n"
-         "  lane = gl_SubgroupInvocationID;\n"
-         "  wave_lanes = subgroupBallot(true).x;\n"
-         "  exec_lo = wave_lanes; exec_hi = 0u; vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false;\n";
+         "  lane0 = gl_SubgroupInvocationID; lane = lane0; wh = 0u; dsapp = 0u;\n"
+         "  vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false; cmph[0] = false; cmph[1] = false;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("  s{} = 0u;\n", k);
-    for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{} = 0u;\n", k);
-    g += "  v0 = gl_LocalInvocationID.x;\n";
-    if (c.tidig_comps >= 1) g += "  v1 = gl_LocalInvocationID.y;\n";
-    if (c.tidig_comps >= 2) g += "  v2 = gl_LocalInvocationID.z;\n";
+    if (wave64_) {
+      // Wave w of the workgroup holds threads 64w..64w+63 (x fastest);
+      // invocation lane0 of subgroup w runs lanes lane0 and lane0 + 32.
+      for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{0}[0] = 0u; v{0}[1] = 0u;\n", k);
+      g += std::format("  for (wh = 0u; wh < 2u; ++wh) {{\n"
+                       "    uint t = gl_SubgroupID * 64u + lane0 + 32u * wh;\n"
+                       "    cmph[wh] = t < {3}u;\n"
+                       "    v0[wh] = t % {0}u;\n", c.local_size[0], c.local_size[1], c.local_size[2], threads);
+      if (c.tidig_comps >= 1) g += std::format("    v1[wh] = (t / {0}u) % {1}u;\n", c.local_size[0], c.local_size[1]);
+      if (c.tidig_comps >= 2) g += std::format("    v2[wh] = t / ({0}u * {1}u);\n", c.local_size[0], c.local_size[1]);
+      g += "  }\n"
+           "  wave_lanes = subgroupBallot(cmph[0]).x; wave_lanes_hi = subgroupBallot(cmph[1]).x;\n"
+           "  exec_lo = wave_lanes; exec_hi = wave_lanes_hi; cmph[0] = false; cmph[1] = false; wh = 0u;\n";
+    } else {
+      g += "  wave_lanes = subgroupBallot(true).x; wave_lanes_hi = 0u;\n"
+           "  exec_lo = wave_lanes; exec_hi = 0u;\n";
+      for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{} = 0u;\n", k);
+      g += "  v0 = gl_LocalInvocationID.x;\n";
+      if (c.tidig_comps >= 1) g += "  v1 = gl_LocalInvocationID.y;\n";
+      if (c.tidig_comps >= 2) g += "  v2 = gl_LocalInvocationID.z;\n";
+    }
     g += body_;
     g += "}\n";
     out_.glsl = std::move(g);
@@ -1191,7 +1307,34 @@ class Translator {
 
   std::string vreg(uint32_t n) {
     max_vgpr_ = std::max(max_vgpr_, n + 1);
+    if (wave64_) return std::format("v{}[{}]", n, half_);
     return std::format("v{}", n);
+  }
+  // Wave64 shaders run two lanes per invocation (lane0 and lane0 + 32, see
+  // finish_wave): VGPRs are pairs indexed by the half `wh` the code for one
+  // instruction loops over.
+  bool wave64_ = false;
+  std::string half_ = "wh";
+
+  // The lane mask of a compare / carry result stored to SGPR(s) or VCC or
+  // EXEC: wave32 one word, wave64 both halves (one ballot per half).
+  std::string ballot_store(uint32_t dst) {
+    const std::string lo = wave64_ ? "subgroupBallot(cmph[0]).x" : "subgroupBallot(cmpv).x";
+    const std::string hi = wave64_ ? "subgroupBallot(cmph[1]).x" : "0u";
+    if (dst == kVccLo) return std::format("vcc_lo = {}; vcc_hi = {};", lo, hi);
+    if (dst == kExecLo) return std::format("exec_lo = {}; exec_hi = {};", lo, hi);
+    if (!wave64_) return std::format("{} = {};", sreg(dst), lo);  // wave32: one SGPR
+    return std::format("{} = {}; {} = {};", sreg(dst), lo, sreg(dst + 1), hi);
+  }
+  // Is this lane's bit set in the lane mask of operand `s` (VCC, an SGPR
+  // pair, ...)? `lo` is the operand's expression.
+  std::string mask_bit(uint32_t s, const std::string& lo) {
+    if (!wave64_) return lane_bit(lo);
+    std::string hi = "0u";
+    if (s == kVccLo) hi = "vcc_hi";
+    else if (s == kExecLo) hi = "exec_hi";
+    else if (s < 105) hi = sreg(s + 1);
+    return std::format("lane_in({}, {})", lo, hi);
   }
   // Wave mode: SGPRs are shader variables (every lane computes the same value).
   std::string sreg(uint32_t n) {
@@ -1227,7 +1370,7 @@ class Translator {
         case kNull: return e = "0u", true;
         case kScc: return e = "uint(scc)", true;
         case 251: return e = "uint(vcc_lo == 0u)", true;   // src_vccz
-        case 252: return e = "uint(exec_lo == 0u)", true;  // src_execz
+        case 252: return e = "uint(exec_lo == 0u && exec_hi == 0u)", true;  // src_execz
         case 250: case 233: case 234: return dpp_ ? (e = "dppv", true) : fail("DPP outside wave mode");
         default: return fail(std::format("operand {}", s));
       }
@@ -1389,7 +1532,7 @@ class Translator {
         if (wave_) {
           std::string m = "vcc_lo";
           if (insn.format == Format::Vop3 && !src(v.src[2], insn, m)) return false;
-          cond = lane_bit(m);
+          cond = mask_bit(insn.format == Format::Vop3 ? v.src[2] : kVccLo, m);
           if (insn.format == Format::Vop3) {  // VOP3 abs/neg on the float sources
             if (v.neg & 1) a = std::format("({} ^ 0x80000000u)", a);
             if (v.neg & 2) b = std::format("({} ^ 0x80000000u)", b);
@@ -1597,15 +1740,14 @@ class Translator {
       if (ci) {
         std::string m = "vcc_lo";
         if (insn.format == Format::Vop3 && !src(v.src[2], insn, m)) return false;
-        cin = std::format("uint({})", lane_bit(m));
+        cin = std::format("uint({})", mask_bit(insn.format == Format::Vop3 ? v.src[2] : kVccLo, m));
       }
       if (n.find("subrev") != std::string_view::npos) std::swap(a, b);
       const bool sub = n.find("sub") != std::string_view::npos;
       if (sub) line(std::format("{{ uint64_t w = uint64_t({}) - uint64_t({}) - uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
       else line(std::format("{{ uint64_t w = uint64_t({}) + uint64_t({}) + uint64_t({}); {} = uint(w); cmpv = (w >> 32) != uint64_t(0); }}", a, b, cin, vreg(v.dst)));
       const uint32_t sdst = insn.format == Format::Vop3 ? v.sdst : kVccLo;
-      if (sdst == kVccLo) post_.push_back("vcc_lo = subgroupBallot(cmpv).x; vcc_hi = 0u;");
-      else post_.push_back(std::format("{} = subgroupBallot(cmpv).x;", sreg(sdst)));  // wave32: one SGPR
+      post_.push_back(ballot_store(sdst));
       return true;
     }
     // 64-bit shifts (result in a VGPR pair)
@@ -1659,8 +1801,12 @@ class Translator {
       line(std::format("{} = {};", vreg(v.dst), fresult(v, std::format("ldexp({}, clamp(int({}), -256, 256))", a, b))));
       return true;
     }
-    if (n == "v_mbcnt_lo_u32_b32" && wave_) return u2("uint(bitCount({} & ((1u << lane) - 1u))) + {}");
-    if (n == "v_mbcnt_hi_u32_b32" && wave_) return u2("(0u * {}) + {}");  // wave32: no lanes 32-63
+    if (n == "v_mbcnt_lo_u32_b32" && wave_)
+      return u2(wave64_ ? "uint(bitCount(lane < 32u ? ({0} & ((1u << lane) - 1u)) : {0})) + {1}"
+                        : "uint(bitCount({} & ((1u << lane) - 1u))) + {}");
+    if (n == "v_mbcnt_hi_u32_b32" && wave_)
+      return u2(wave64_ ? "uint(lane < 32u ? 0 : bitCount({0} & ((1u << (lane - 32u)) - 1u))) + {1}"
+                        : "(0u * {}) + {}");  // wave32: no lanes 32-63
     if (n == "v_add_lshl_u32" || n == "v_lshl_add_u32" || n == "v_bfi_b32" || n == "v_alignbit_b32" ||
         n == "v_med3_u32" || n == "v_med3_i32" || n == "v_min3_u32" || n == "v_max3_u32" || n == "v_min3_i32" ||
         n == "v_max3_i32" || n == "v_alignbyte_b32" || n == "v_xad_u32" || n == "v_xor3_b32" || n == "v_bfe_i32" ||
@@ -1736,11 +1882,9 @@ class Translator {
       }
       if (wave_) {
         line("  cmpv = ((m >> cls) & 1u) != 0u; }");
-        const std::string ballot = "subgroupBallot(cmpv).x";
-        if (starts(n, "v_cmpx_")) post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
-        else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo)
-          post_.push_back(std::format("{} = {};", sreg(v.sdst), ballot));
-        else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
+        if (starts(n, "v_cmpx_")) post_.push_back(ballot_store(kExecLo));
+        else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo) post_.push_back(ballot_store(v.sdst));
+        else post_.push_back(ballot_store(kVccLo));
       } else {
         line("  vcc = ((m >> cls) & 1u) != 0u; }");
       }
@@ -1813,11 +1957,9 @@ class Translator {
         return true;
       }
       line(std::format("cmpv = {};", e));
-      const std::string ballot = "subgroupBallot(cmpv).x";
-      if (to_exec) post_.push_back(std::format("exec_lo = {}; exec_hi = 0u;", ballot));
-      else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo)
-        post_.push_back(std::format("{} = {};", sreg(v.sdst), ballot));
-      else post_.push_back(std::format("vcc_lo = {}; vcc_hi = 0u;", ballot));
+      if (to_exec) post_.push_back(ballot_store(kExecLo));
+      else if ((insn.format == Format::Vop3 || v.sdwa) && v.sdst != kVccLo) post_.push_back(ballot_store(v.sdst));
+      else post_.push_back(ballot_store(kVccLo));
       return true;
     }
     return fail("");
