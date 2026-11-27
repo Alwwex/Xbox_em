@@ -41,6 +41,12 @@ struct GraphicsPipeline {
   // root parameter 0 - which the renderer performs as a clear.
   bool stream_clear = false;
   uint8_t blend[0x148] = {};          // its D3D12_BLEND_DESC
+  // Registers found in the console state (state_a): CB_BLEND0-7_CONTROL,
+  // CB_TARGET_MASK follows them (0xffffffff marks the block) and
+  // DB_DEPTH_CONTROL is 6 dwords before (GPU.md "pipeline state blobs").
+  bool has_registers = false;
+  uint32_t cb_blend[8] = {};
+  uint32_t db_depth_control = 0;
 };
 
 // A console compute pipeline (device slot 67, DeserializeComputePipelineStateX):

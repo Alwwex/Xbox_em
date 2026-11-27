@@ -1486,6 +1486,30 @@ std::vector<uint8_t> copy_guest(uint64_t p, uint64_t size) {
   return out;
 }
 
+// Finds GraphicsPipeline::cb_blend / db_depth_control in p.state_a.
+void decode_pipeline_registers(GraphicsPipeline& p) {
+  const std::vector<uint8_t>& d = p.state_a;
+  const size_t n = d.size() / 4;
+  const auto w = [&](size_t i) {
+    uint32_t v;
+    std::memcpy(&v, d.data() + i * 4, 4);
+    return v;
+  };
+  // Measured on GTA VI's 5666 blobs (380-520 bytes): the blend block starts
+  // at 0xd0 or 0x124, the only 8 dwords with bit 30 or 31 each followed by
+  // CB_TARGET_MASK = 0xffffffff.
+  for (size_t i = n >= 9 ? n - 9 : 0; i-- > 6;) {
+    if (w(i + 8) != 0xffffffffu) continue;
+    bool blend = true;
+    for (size_t k = 0; k < 8 && blend; ++k) blend = (w(i + k) & 0xc0000000u) != 0;
+    if (!blend) continue;
+    for (size_t k = 0; k < 8; ++k) p.cb_blend[k] = w(i + k);
+    p.db_depth_control = w(i - 6);
+    p.has_registers = true;
+    return;
+  }
+}
+
 // 57 CreateGraphicsPipelineStateX(desc, riid, ppv): the description's six
 // (pointer, size) parts are copied (see GPU.md). 55 (base pipeline, flags,
 // D3D12_BLEND_DESC, riid, ppv): a variant of a pipeline with another blend
@@ -1508,6 +1532,7 @@ uint64_t XBEM_GUEST_ABI device_graphics_pso_method(ProbeObject* self, uint64_t a
       if (i == 2) pso->ps_hash = h;
       if (i == 4) pso->vs_hash = h;
     }
+    decode_pipeline_registers(*pso);
     out = reinterpret_cast<void**>(a3);
   } else {
     if (is_probe_object(a1) && reinterpret_cast<ProbeObject*>(a1)->vtable == g_graphics_pso_vtable.data())

@@ -894,7 +894,7 @@ class Renderer {
   }
 
   // mode: 0 triangle list, 1 RECTLIST (geometry shader), 2 triangle strip.
-  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry& ps, uint32_t mode) {
+  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry* ps, uint32_t mode) {
     const bool rect = mode == 1;
     // Attachment formats: the bound targets'.
     const uint32_t slots = bound_slots();
@@ -916,10 +916,31 @@ class Renderer {
       uint32_t independent = 0;
       std::memcpy(&independent, p.blend + 8, 4);
       for (uint32_t i = 0; i < 8; ++i) std::memcpy(blend[i], p.blend + 12 + 40 * (independent ? i : 0), 40);
+    } else if (p.has_registers) {
+      // CB_BLENDn_CONTROL (AMD factors and functions) in the D3D12 terms above.
+      static const uint32_t kFactor[21] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 2, 14, 15, 16, 17, 18, 19, 14, 15};
+      static const uint32_t kComb[8] = {1, 2, 4, 5, 3, 1, 1, 1};
+      const auto factor_of = [](uint32_t f) { return f < 21 ? kFactor[f] : 2u; };
+      for (uint32_t i = 0; i < 8; ++i) {
+        const uint32_t c = p.cb_blend[i];
+        const bool separate = (c >> 29) & 1;
+        blend[i][0] = (c >> 30) & 1;
+        blend[i][2] = factor_of(c & 31);
+        blend[i][4] = kComb[(c >> 5) & 7];
+        blend[i][3] = factor_of((c >> 8) & 31);
+        blend[i][5] = separate ? factor_of((c >> 16) & 31) : blend[i][2];
+        blend[i][7] = separate ? kComb[(c >> 21) & 7] : blend[i][4];
+        blend[i][6] = separate ? factor_of((c >> 24) & 31) : blend[i][3];
+        blend[i][9] = 0xf;
+      }
     }
     // Targets the pixel shader does not export are left alone.
     for (uint32_t i = 0; i < slots; ++i)
-      if (!(ps.shader.color_targets & (1u << i)) && slots > 1) blend[i][9] = 0;
+      if (!ps || (!(ps->shader.color_targets & (1u << i)) && slots > 1)) blend[i][9] = 0;
+    // Depth: DB_DEPTH_CONTROL from the console state when a depth target is bound.
+    const VkFormat depth_format = state_.depth ? state_.depth->image.format : VK_FORMAT_UNDEFINED;
+    const uint32_t depth_control = state_.depth && p.has_registers ? p.db_depth_control & 0x77u : 0;
+    format_key = format_key * 1000003u + static_cast<uint64_t>(depth_format) * 131u + depth_control;
     const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof(uint32_t) * 10 * slots), format_key, mode};
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
     VkPipelineShaderStageCreateInfo stages[3]{};
@@ -932,8 +953,10 @@ class Renderer {
       stages[count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT,
                          gs, "main", nullptr};
     }
-    stages[count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
-                       ps.module, "main", nullptr};
+    // (Depth-only pipelines have no pixel shader.)
+    if (ps)
+      stages[count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+                         ps->module, "main", nullptr};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = mode == 2 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -946,6 +969,11 @@ class Renderer {
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    // DB_DEPTH_CONTROL: Z_ENABLE bit 1, Z_WRITE_ENABLE bit 2, ZFUNC bits 4-6
+    // (NEVER, LESS, EQUAL, LEQUAL, GREATER, NOTEQUAL, GEQUAL, ALWAYS - VkCompareOp's order).
+    ds.depthTestEnable = (depth_control >> 1) & 1;
+    ds.depthWriteEnable = (depth_control >> 2) & 1;
+    ds.depthCompareOp = static_cast<VkCompareOp>((depth_control >> 4) & 7);
     static const VkBlendFactor kFactors[] = {
         VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC_COLOR,
         VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -979,6 +1007,7 @@ class Renderer {
     VkPipelineRenderingCreateInfoKHR ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
     ri.colorAttachmentCount = slots;
     ri.pColorAttachmentFormats = formats;
+    ri.depthAttachmentFormat = depth_format;
     VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gci.pNext = &ri;
     gci.stageCount = count;
@@ -1021,6 +1050,7 @@ class Renderer {
     GpuImage* target = nullptr;      // the first bound render target
     GpuImage* targets[8] = {};       // OMSetRenderTargets' slots
     uint32_t target_count = 0;
+    GpuImage* depth = nullptr;       // its depth-stencil view's image (same size as the targets)
     std::vector<uint8_t> vertex_buffers;  // D3D12_VERTEX_BUFFER_VIEW x n
     uint8_t index_buffer[16] = {};
     uint64_t heaps[2] = {};  // resource heap, sampler heap starts
@@ -1028,6 +1058,49 @@ class Renderer {
 
   void note(const std::string& what) {
     if (notes_.insert(what).second && notes_.size() < 64) XBEM_WARN("gpu", "{}", what);
+  }
+
+  static VkImageAspectFlags depth_aspects(VkFormat f) {
+    return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT
+               ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+               : VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
+  }
+
+  // The depth image of a depth-stencil resource (D32/D24S8/D32S8/D16 and
+  // their typeless forms), created on first use. Depth only (D32_SFLOAT):
+  // the stencil test is not emulated yet.
+  GpuImage* depth_of(ResourceState* r) {
+    if (!r) return nullptr;
+    if (auto it = depth_images_.find(r); it != depth_images_.end()) return it->second.get();
+    uint32_t dimension, height, format;
+    uint64_t width;
+    std::memcpy(&dimension, r->desc, 4);
+    std::memcpy(&width, r->desc + 16, 8);
+    std::memcpy(&height, r->desc + 24, 4);
+    std::memcpy(&format, r->desc + 32, 4);
+    const bool depth_format = format == 40 || format == 39 || format == 45 || format == 44 || format == 20 ||
+                              format == 19 || format == 55 || format == 53;
+    std::unique_ptr<GpuImage> g;
+    if (dimension == 3 && depth_format && width && height && width <= 16384 && height <= 16384) {
+      g = std::make_unique<GpuImage>();
+      g->image = core_.create_image(static_cast<uint32_t>(width), height, VK_FORMAT_D32_SFLOAT,
+                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT);
+      if (!g->image.image) g.reset();
+      else transition(g->image.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+    } else {
+      note(std::format("depth-stencil resource format {} dimension {} not supported", format, dimension));
+    }
+    GpuImage* raw = g.get();
+    depth_images_[r] = std::move(g);
+    return raw;
+  }
+
+  GpuImage* depth_from_descriptor(const uint8_t* bytes) {
+    XbemDescriptor d{};
+    std::memcpy(&d, bytes, sizeof d);
+    if (d.magic != kDescriptorMagic) return nullptr;
+    return depth_of(resource_of(d.object));
   }
 
   GpuImage* image_from_descriptor(const uint8_t* bytes, bool for_render) {
@@ -1156,6 +1229,13 @@ class Renderer {
           state_.targets[i] = g;
           if (g && !state_.target) state_.target = g;
         }
+        state_.depth = nullptr;
+        if (c.blob.size() >= (state_.target_count + 1) * kDescriptorSize) {
+          GpuImage* d = depth_from_descriptor(c.blob.data() + state_.target_count * kDescriptorSize);
+          if (d && (!state_.target || (d->image.width == state_.target->image.width &&
+                                       d->image.height == state_.target->image.height)))
+            state_.depth = d;
+        }
         break;
       }
       case 52: {
@@ -1171,6 +1251,19 @@ class Renderer {
         core_.fn().vkCmdClearColorImage(cmd_, g->image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
         full_barrier();
         g->rendered = true;
+        break;
+      }
+      case 51: {
+        // ClearDepthStencilView: the depth value is a float argument (not
+        // recorded); GTA VI's passes test GREATER_EQUAL (reverse Z), cleared to 0.
+        if (c.blob.size() < kDescriptorSize) break;
+        GpuImage* d = depth_from_descriptor(c.blob.data());
+        if (!d) break;
+        end_rendering();
+        VkClearDepthStencilValue v{0.0f, 0};
+        VkImageSubresourceRange range{depth_aspects(d->image.format), 0, 1, 0, 1};
+        core_.fn().vkCmdClearDepthStencilImage(cmd_, d->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        full_barrier();
         break;
       }
       case 12: draw(u32(0), u32(1), u32(2), u32(3), false, 0); break;
@@ -1356,7 +1449,9 @@ class Renderer {
 
   void begin_rendering() {
     const uint32_t n = bound_slots();
-    if (rendering_ && current_count_ == n && std::equal(state_.targets, state_.targets + n, current_targets_)) return;
+    if (rendering_ && current_count_ == n && current_depth_ == state_.depth &&
+        std::equal(state_.targets, state_.targets + n, current_targets_))
+      return;
     end_rendering();
     VkRenderingAttachmentInfoKHR color[8]{};
     for (uint32_t i = 0; i < n; ++i) {
@@ -1369,13 +1464,23 @@ class Renderer {
       current_targets_[i] = state_.targets[i];
     }
     VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
-    ri.renderArea = {{0, 0}, {state_.target->image.width, state_.target->image.height}};
+    const GpuImage* frame = state_.target ? state_.target : state_.depth;
+    ri.renderArea = {{0, 0}, {frame->image.width, frame->image.height}};
     ri.layerCount = 1;
     ri.colorAttachmentCount = n;
     ri.pColorAttachments = color;
+    VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+    if (state_.depth) {
+      depth.imageView = state_.depth->image.view;
+      depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      ri.pDepthAttachment = &depth;
+    }
     core_.fn().vkCmdBeginRendering(cmd_, &ri);
     rendering_ = true;
     current_count_ = n;
+    current_depth_ = state_.depth;
   }
 
   // The DXIL clear pipeline (device slot 86): the colour is the float4 its
@@ -1414,20 +1519,26 @@ class Renderer {
             int32_t base_vertex) {
     GraphicsPipeline* p = state_.pipeline;
     if (!p) return skip(std::format("pipeline {} not from slot 57/55", state_.pipeline_name));
-    if (!state_.target) return skip("no render target");
-    if (p->stream_clear) return stream_clear();
-    if (p->vs_code.empty() || p->ps_code.empty()) return skip("pipeline without shader code");
+    if (!state_.target && !state_.depth) return skip("no render target");
+    if (p->stream_clear) {
+      if (!state_.target) return skip("clear without a render target");
+      return stream_clear();
+    }
+    if (p->vs_code.empty()) return skip("pipeline without shader code");
+    // Without a pixel shader: a depth-only draw (needs a depth target).
+    if (p->ps_code.empty() && !state_.depth) return skip("pipeline without a pixel shader, no depth target");
     ShaderEntry* vs = shader(p->vs_code, p->vs_hash, gpu::ShaderStage::Vertex);
-    ShaderEntry* ps = shader(p->ps_code, p->ps_hash, gpu::ShaderStage::Pixel);
+    ShaderEntry* ps = p->ps_code.empty() ? nullptr : shader(p->ps_code, p->ps_hash, gpu::ShaderStage::Pixel);
     if (!vs->module) return skip(std::format("vs {:016x} not translated", p->vs_hash));
-    if (!ps->module) return skip(std::format("ps {:016x} not translated", p->ps_hash));
+    if (ps && !ps->module) return skip(std::format("ps {:016x} not translated", p->ps_hash));
+    GpuImage* frame = state_.target ? state_.target : state_.depth;
     const bool rect = state_.topology == 0x11;
     const bool strip = state_.topology == 5;
     if (state_.topology != 4 && !rect && !strip) {
       note(std::format("topology {:#x} not supported - draws skipped", state_.topology));
       return skip(std::format("topology {:#x}", state_.topology));
     }
-    VkPipeline pipe = pipeline(*p, *vs, *ps, rect ? 1 : strip ? 2 : 0);
+    VkPipeline pipe = pipeline(*p, *vs, ps, rect ? 1 : strip ? 2 : 0);
     if (!pipe) return skip("pipeline creation failed");
     // Vertex buffer table: one V# per view (base, stride, records).
     std::vector<uint8_t> vb_table(std::max<size_t>(state_.vertex_buffers.size(), 16));
@@ -1449,8 +1560,9 @@ class Renderer {
     Tokens tokens;
     tokens.windows = &windows_;
     std::vector<uint32_t> words[2];
-    gpu::TranslatedShader* stages[2] = {&vs->shader, &ps->shader};
+    gpu::TranslatedShader* stages[2] = {&vs->shader, ps ? &ps->shader : nullptr};
     for (int k = 0; k < 2; ++k) {
+      if (!stages[k]) continue;
       gpu::ScalarRun run;
       user_sgprs(k == 0 ? gpu::ShaderStage::Vertex : gpu::ShaderStage::Pixel, tokens, run.sgpr,
                  indexed ? static_cast<uint32_t>(base_vertex) : start, vb_table);
@@ -1489,7 +1601,7 @@ class Renderer {
       XBEM_INFO("gpu", "draw {}: vs {:016x} ps {:016x} {} {} (start {}, base {}), topology {:#x}, target {}x{}, "
                 "viewport {} {} {}x{}\n  vs words:{}\n  ps words:{}",
                 draws_, p->vs_hash, p->ps_hash, indexed ? "indexed" : "vertices", count, start, base_vertex,
-                state_.topology, state_.target->image.width, state_.target->image.height, state_.viewport.x,
+                state_.topology, frame->image.width, frame->image.height, state_.viewport.x,
                 state_.viewport.y, state_.viewport.width, state_.viewport.height, w[0], w[1]);
     }
     VkDeviceAddress data[2];
@@ -1532,10 +1644,10 @@ class Renderer {
     f.vkCmdPushConstants(cmd_, layout_, kGraphicsStages, 16, 8, &table);
     VkViewport vp = state_.viewport;
     if (vp.width <= 0 || vp.height <= 0)
-      vp = {0, 0, static_cast<float>(state_.target->image.width), static_cast<float>(state_.target->image.height), 0, 1};
+      vp = {0, 0, static_cast<float>(frame->image.width), static_cast<float>(frame->image.height), 0, 1};
     f.vkCmdSetViewport(cmd_, 0, 1, &vp);
     VkRect2D sc = state_.has_scissor ? state_.scissor
-                                     : VkRect2D{{0, 0}, {state_.target->image.width, state_.target->image.height}};
+                                     : VkRect2D{{0, 0}, {frame->image.width, frame->image.height}};
     f.vkCmdSetScissor(cmd_, 0, 1, &sc);
     if (indexed) {
       f.vkCmdBindIndexBuffer(cmd_, ring_.buffer, index_at, index_type);
@@ -1543,9 +1655,9 @@ class Renderer {
     } else {
       f.vkCmdDraw(cmd_, count, std::max(instances, 1u), 0, start_instance);
     }
-    state_.target->rendered = true;
-    state_.target->last_render = ++render_serial_;
-    for (uint32_t i = 0; i < 8; ++i)
+    frame->rendered = true;
+    frame->last_render = ++render_serial_;
+    for (uint32_t i = 0; i < 8 && ps; ++i)
       if (state_.targets[i] && (ps->shader.color_targets & (1u << i))) {
         state_.targets[i]->rendered = true;
         state_.targets[i]->last_render = render_serial_;
@@ -1763,10 +1875,12 @@ class Renderer {
   bool recording_ = false, rendering_ = false;
   GpuImage* current_targets_[8] = {};
   uint32_t current_count_ = 0;
+  GpuImage* current_depth_ = nullptr;
 
   // Attachment slots of the current pass: up to the last bound target (one
   // when only slot 0 - or a target set by a clear - is bound).
   uint32_t bound_slots() const {
+    if (!state_.target) return 0;  // a depth-only pass
     uint32_t n = 0;
     for (uint32_t i = 0; i < state_.target_count && i < 8; ++i)
       if (state_.targets[i]) n = i + 1;
@@ -1786,6 +1900,7 @@ class Renderer {
   Image white_, white_volume_;
   uint32_t next_texture_ = 0, next_array_ = 0, next_volume_ = 0;
   std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> images_;
+  std::unordered_map<const ResourceState*, std::unique_ptr<GpuImage>> depth_images_;
   std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> shaders_;
   std::map<uint32_t, VkShaderModule> rect_gs_;
   std::map<PipelineKey, VkPipeline> pipelines_;
