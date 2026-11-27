@@ -23,6 +23,8 @@
 // and size before it. The first requests are logged in full.
 
 #include <atomic>
+#include <functional>
+#include <deque>
 #include <condition_variable>
 #include <fstream>
 #include <cstdlib>
@@ -784,8 +786,91 @@ HRESULT XBEM_GUEST_ABI queue_enqueue_set_event(ProbeObject* self, uint64_t handl
   return S_OK;
 }
 
+// Requests between two status / fence / event entries do not depend on each
+// other: a run of them is spread over a few threads (file reads on WSL's
+// drvfs wait milliseconds each, decompression is CPU work), and the entry
+// after them waits until all are done. GTA VI's frame waited for its
+// synchronous Submit of hundreds of requests on one thread.
+// XBEM_DSTORAGE_THREADS (default 6; 1 = one at a time).
+class RequestPool {
+ public:
+  explicit RequestPool(unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+      std::thread([this] {
+        for (;;) {
+          std::function<void()> job;
+          {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [this] { return !jobs_.empty(); });
+            job = std::move(jobs_.front());
+            jobs_.pop_front();
+          }
+          job();
+        }
+      }).detach();
+  }
+  // Runs fn(i) for i in [0, n) and returns when all are done (the caller
+  // takes part). A helper that starts after the batch is done only sees the
+  // shared counters, which it keeps alive.
+  void run(size_t n, const std::function<void(size_t)>& fn) {
+    struct Batch {
+      std::atomic<size_t> next{0}, done{0};
+      size_t n = 0;
+      const std::function<void(size_t)>* fn = nullptr;
+      std::mutex m;
+      std::condition_variable finished;
+    };
+    auto batch = std::make_shared<Batch>();
+    batch->n = n;
+    batch->fn = &fn;
+    const auto work = [batch] {
+      for (size_t i; (i = batch->next.fetch_add(1)) < batch->n;) {
+        (*batch->fn)(i);
+        if (batch->done.fetch_add(1) + 1 == batch->n) {
+          std::lock_guard lock(batch->m);
+          batch->finished.notify_all();
+        }
+      }
+    };
+    const size_t helpers = std::min<size_t>(n - 1, threads());
+    {
+      std::lock_guard lock(mutex_);
+      for (size_t k = 0; k < helpers; ++k) jobs_.push_back(work);
+    }
+    cv_.notify_all();
+    work();
+    std::unique_lock lock(batch->m);
+    batch->finished.wait(lock, [&] { return batch->done.load() == n; });
+  }
+  static unsigned threads() {
+    static const unsigned n = [] {
+      const char* v = std::getenv("XBEM_DSTORAGE_THREADS");
+      const unsigned x = v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 6u;
+      return x ? x : 1u;
+    }();
+    return n;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> jobs_;
+};
+
 void run_work(QueueState* q, const std::vector<QueueState::Pending>& work) {
-  for (const QueueState::Pending& p : work) {
+  static RequestPool* pool = RequestPool::threads() > 1 ? new RequestPool(RequestPool::threads() - 1) : nullptr;
+  for (size_t i = 0; i < work.size();) {
+    size_t end = i;
+    while (end < work.size() && work[end].kind == QueueState::Pending::Request) ++end;
+    if (pool && end - i >= 2) {
+      pool->run(end - i, [&](size_t k) {
+        const QueueState::Pending& p = work[i + k];
+        run_request(q, reinterpret_cast<const uint8_t*>(p.words), p.caller);
+      });
+      i = end;
+      continue;
+    }
+    const QueueState::Pending& p = work[i++];
     switch (p.kind) {
       case QueueState::Pending::Request:
         run_request(q, reinterpret_cast<const uint8_t*>(p.words), p.caller);

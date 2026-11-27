@@ -61,4 +61,7 @@ inline std::string narrow(const char* s) { return std::string(guest_cstr(s)); }
 // kernelx_sync.cpp).
 void apply_thread_affinity(rt::GuestThread& t, const char* how);
 
+// Thread dumps: the object(s) the calling thread waits for (kernelx_sync.cpp).
+void print_wait_state(void (*write)(const char*));
+
 }  // namespace xbem::hle

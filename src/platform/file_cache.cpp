@@ -25,7 +25,10 @@
 namespace xbem::platform {
 namespace {
 
-constexpr uint64_t kBlock = 256ull << 10;
+// Block size: GTA VI's scene reads are mostly 16-512 KiB at random offsets;
+// 256 KiB blocks read 4.2x the requested bytes from the disk (run 254:
+// 8961 MiB for 2123 MiB). Reads of a block or more go straight to the file.
+constexpr uint64_t kBlock = 64ull << 10;
 
 struct OpenFile {
   int fd = -1;
@@ -151,7 +154,7 @@ int64_t cached_read(const std::string& host_path, uint64_t offset, void* out, si
     c.requested += n;
   }
   // Large reads and a disabled cache go straight to the file.
-  if (!c.budget || n >= kBlock * 2) return raw_read(f.fd, offset, out, n);
+  if (!c.budget || n >= kBlock) return raw_read(f.fd, offset, out, n);
   size_t done = 0;
   while (done < n) {
     const uint64_t at = offset + done, block = at / kBlock, key = (uint64_t{f.id} << 40) | block;

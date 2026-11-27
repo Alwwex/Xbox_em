@@ -8,6 +8,7 @@
 #else
 #include <asm/prctl.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -90,6 +91,8 @@ void join_thread(NativeThread& t) {
   t.handle = 0;
 }
 
+void lower_current_thread_priority() { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+
 bool set_thread_affinity(const NativeThread& t, uint64_t mask) {
   return t.handle && SetThreadAffinityMask(reinterpret_cast<HANDLE>(t.handle), static_cast<DWORD_PTR>(mask)) != 0;
 }
@@ -163,6 +166,8 @@ void join_thread(NativeThread& t) {
   pthread_join(static_cast<pthread_t>(t.handle), nullptr);
   t.handle = 0;
 }
+
+void lower_current_thread_priority() { setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 15); }
 
 bool set_thread_affinity(const NativeThread& t, uint64_t mask) {
   if (!t.id) return false;

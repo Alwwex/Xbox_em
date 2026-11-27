@@ -19,6 +19,7 @@
 #include "hle/file_log.h"
 #include "hle/heap.h"
 #include "hle/probe_com.h"
+#include "hle/hle_util.h"
 #include "hle/registry.h"
 #include "platform/file_cache.h"
 #include "platform/crash.h"
@@ -53,6 +54,7 @@ void describe_address(uint64_t address, char* out, size_t out_size) {
 void print_thread_context(void (*write)(const char*)) {
   TrampolinePool::print_call_history(write);
   hle::print_probe_history(write);
+  hle::print_wait_state(write);
 }
 
 // Allocations, plus the emulator's probe COM objects (a title storing or

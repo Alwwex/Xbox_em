@@ -51,6 +51,7 @@
 #include "gpu/vk/vk_core.h"
 #include "hle/hle_util.h"
 #include "hle/texture_layout.h"
+#include "platform/thread.h"
 #include "platform/memory.h"
 #include "platform/window.h"
 #include "runtime/process.h"
@@ -135,6 +136,9 @@ class CompilePool {
   explicit CompilePool(unsigned workers) {
     for (unsigned i = 0; i < workers; ++i)
       std::thread([this] {
+        // Below the title's threads: pipeline builds take whole cores for
+        // minutes, and the frame waits for game threads and file reads.
+        platform::lower_current_thread_priority();
         for (;;) {
           std::function<void()> job;
           {
@@ -565,6 +569,7 @@ class Renderer {
     submitted_ps_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
     wave_draws_ = 0;
+    learn_wave_cost(static_cast<double>(ms));
     gpu_output_.clear();
     // Every ~10 s: how much of the time went into waiting for the GPU.
     gpu_wait_us_ += static_cast<uint64_t>(
@@ -2109,7 +2114,14 @@ class Renderer {
     // of a few instances, each part its own submission.
     const uint32_t total = std::max(instances, 1u);
     const bool slow = (ps && ps->shader.wave) || vs->shader.wave;
-    const uint32_t part = slow ? wave_instances_per_submit() : total;
+    const uint64_t cost_key = p->ps_hash ^ (p->vs_hash << 1);
+    const bool instanced = total > 1;
+    WaveCost& cost = wave_cost_[cost_key];
+    uint32_t part = total;
+    if (slow && instanced) {
+      part = fixed_wave_split() ? wave_instances_per_submit()
+                                : static_cast<uint32_t>(std::clamp(wave_budget_ms() / cost.instance_ms, 1.0, 65536.0));
+    }
     for (uint32_t first = 0; first < total; first += part) {
       if (first) {
         // The draw's data (push constants, indices) stays in the ring.
@@ -2120,6 +2132,8 @@ class Renderer {
         ring_offset_ = keep;
       }
       const uint32_t n = std::min(part, total - first);
+      if (slow) note_wave_work(cost_key, instanced ? 0 : 1, instanced ? n : 0,
+                               instanced ? cost.instance_ms * n : cost.draw_ms);
       begin_rendering();
       f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
       f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set_, 0, nullptr);
@@ -2155,11 +2169,61 @@ class Renderer {
     // Wave-mode pixel shaders can run for tens of milliseconds per draw:
     // dozens of them in one submission pass Windows' 2 s GPU timeout and
     // the device is removed. Run what is recorded every few such draws.
-    if (ps && ps->shader.wave && ++wave_draws_ >= wave_draws_per_submit()) {
+    const bool split = fixed_wave_split() ? (ps && ps->shader.wave && ++wave_draws_ >= wave_draws_per_submit())
+                                          : (slow && pending_wave_ms_ >= wave_budget_ms());
+    if (split) {
       end_rendering();
       submit();
       begin();
     }
+  }
+
+  // Wave-mode draws are split across submissions so none passes Windows'
+  // 2 s GPU timeout. The cost of a draw (or of one instance) is learned per
+  // shader pair from submissions that ran only its draws; a submission is
+  // made when the estimate reaches XBEM_WAVE_SUBMIT_MS (default 600). New
+  // pairs start at 400 ms per draw / 12.5 ms per instance (the old fixed
+  // splits: 2 draws, 32 instances). XBEM_WAVE_DRAWS_PER_SUBMIT or
+  // XBEM_WAVE_INSTANCES_PER_SUBMIT set: the old fixed splits.
+  struct WaveCost {
+    double draw_ms = 400.0, instance_ms = 12.5;
+  };
+  std::unordered_map<uint64_t, WaveCost> wave_cost_;
+  double pending_wave_ms_ = 0;
+  uint64_t pending_key_ = 0;  // the only pair in the submission, ~0 when mixed
+  uint32_t pending_draws_ = 0, pending_instances_ = 0;
+
+  static bool fixed_wave_split() {
+    static const bool fixed =
+        std::getenv("XBEM_WAVE_DRAWS_PER_SUBMIT") != nullptr || std::getenv("XBEM_WAVE_INSTANCES_PER_SUBMIT") != nullptr;
+    return fixed;
+  }
+  static double wave_budget_ms() {
+    static const double ms = [] {
+      const char* v = std::getenv("XBEM_WAVE_SUBMIT_MS");
+      const double x = v ? std::strtod(v, nullptr) : 600.0;
+      return x > 1 ? x : 600.0;
+    }();
+    return ms;
+  }
+  void note_wave_work(uint64_t key, uint32_t draws, uint32_t instances, double estimate_ms) {
+    if (!pending_draws_ && !pending_instances_) pending_key_ = key;
+    else if (pending_key_ != key) pending_key_ = ~0ull;
+    pending_draws_ += draws;
+    pending_instances_ += instances;
+    pending_wave_ms_ += estimate_ms;
+  }
+  void learn_wave_cost(double ms) {
+    if ((pending_draws_ || pending_instances_) && pending_key_ != ~0ull) {
+      WaveCost& c = wave_cost_[pending_key_];
+      // Both kinds in one submission (a pair drawn with and without
+      // instances): attributed to the instances.
+      if (pending_instances_) c.instance_ms = std::max(0.02, 0.5 * c.instance_ms + 0.5 * ms / pending_instances_);
+      else c.draw_ms = std::max(0.2, 0.5 * c.draw_ms + 0.5 * ms / pending_draws_);
+    }
+    pending_wave_ms_ = 0;
+    pending_draws_ = pending_instances_ = 0;
+    pending_key_ = 0;
   }
 
   static uint32_t wave_instances_per_submit() {
@@ -2453,6 +2517,14 @@ class Renderer {
   void skip(const std::string& reason) {
     ++skipped_;
     ++skip_reasons_[reason];
+    // XBEM_TRACE_PS: why draws with that pixel shader are skipped.
+    static const uint64_t trace_ps = [] {
+      const char* t = std::getenv("XBEM_TRACE_PS");
+      return t ? std::strtoull(t, nullptr, 16) : 0ull;
+    }();
+    static uint64_t traced_skips = 0;
+    if (trace_ps && state_.pipeline && state_.pipeline->ps_hash == trace_ps && std::has_single_bit(++traced_skips))
+      XBEM_INFO("gpu", "draw with ps {:016x} skipped (#{}): {}", trace_ps, traced_skips, reason);
   }
 
   std::string top_skip_reasons() const {

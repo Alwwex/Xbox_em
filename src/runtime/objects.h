@@ -23,6 +23,9 @@ class KernelObject {
   // Both called with sync_mutex() held.
   virtual bool is_signaled(uint32_t thread_id) const { return false; }
   virtual void acquire(uint32_t thread_id) {}
+  // For thread dumps: the guest code that created the object and that last
+  // signalled it (events: SetEvent), 0 when unknown.
+  uint64_t created_by = 0, signalled_by = 0;
 };
 
 class EventObject final : public KernelObject {

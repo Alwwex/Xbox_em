@@ -6,8 +6,8 @@
 // under /mnt is reached through 9P, where every read is a round trip. Titles
 // stream thousands of small reads (DirectStorage requests, ReadFile on .rpf
 // archives); GTA VI's story load issued them faster than 9P answered and its
-// loading watchdog fired. Reads go through 256 KiB blocks kept in an LRU cache
-// (XBEM_READ_CACHE_MB, default 128; 0 disables it).
+// loading watchdog fired. Reads smaller than 64 KiB go through 64 KiB blocks
+// kept in an LRU cache (XBEM_READ_CACHE_MB, default 128; 0 disables it).
 
 #include <cstddef>
 #include <cstdint>

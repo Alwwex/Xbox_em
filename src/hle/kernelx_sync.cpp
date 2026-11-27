@@ -31,6 +31,33 @@ void exit_guest_thread(uint32_t code) {
   std::longjmp(t->exit_jump, 1);  // unwinds to the thread's start frame in Process::thread_main
 }
 
+struct WaitState {
+  uint32_t count = 0, ms = 0;
+  bool all = false;
+  uint64_t handle[4] = {}, created_by[4] = {}, signalled_by[4] = {};
+  const char* type[4] = {};
+};
+thread_local WaitState t_wait_state;
+
+void print_wait_state(void (*write)(const char*)) {
+  const WaitState& ws = t_wait_state;
+  if (!ws.count) return;
+  char line[256];
+  std::snprintf(line, sizeof line, "Blocked in a wait (%s, %u object(s)%s):\n",
+                ws.ms == win::INFINITE ? "no timeout" : "with a timeout", ws.count,
+                ws.count > 1 ? (ws.all ? ", all" : ", any") : "");
+  write(line);
+  rt::Process* p = rt::Process::current_or_null();
+  for (uint32_t i = 0; i < ws.count && i < 4; ++i) {
+    char made[160] = "?", set[160] = "-";
+    if (p && ws.created_by[i]) p->loader().describe(ws.created_by[i], made, sizeof made);
+    if (p && ws.signalled_by[i]) p->loader().describe(ws.signalled_by[i], set, sizeof set);
+    std::snprintf(line, sizeof line, "  %s %#llx, created by %s, last signalled by %s\n", ws.type[i] ? ws.type[i] : "?",
+                  static_cast<unsigned long long>(ws.handle[i]), made, set);
+    write(line);
+  }
+}
+
 // XBEM_AFFINITY=1: guest affinity masks restrict the host threads (threads a
 // title pins to one core then take turns there instead of running at once).
 // The first calls are logged either way.
@@ -187,7 +214,20 @@ DWORD wait_multiple(DWORD count, const HANDLE* handles, BOOL wait_all, DWORD ms)
     }
     objs.push_back(std::move(o));
   }
-  return rt::wait_for_objects(objs, wait_all != FALSE, ms, current_tid());
+  // Thread dumps say what a thread blocks on (print_wait_state).
+  WaitState& ws = t_wait_state;
+  ws.count = static_cast<uint32_t>(objs.size());
+  ws.ms = ms;
+  ws.all = wait_all != FALSE;
+  for (size_t i = 0; i < objs.size() && i < 4; ++i) {
+    ws.handle[i] = handles[i];
+    ws.type[i] = objs[i]->type_name();
+    ws.created_by[i] = objs[i]->created_by;
+    ws.signalled_by[i] = objs[i]->signalled_by;
+  }
+  const uint32_t r = rt::wait_for_objects(objs, wait_all != FALSE, ms, current_tid());
+  ws.count = 0;
+  return r;
 }
 
 DWORD XBEM_GUEST_ABI hle_WaitForSingleObject(HANDLE h, DWORD ms) { return wait_multiple(1, &h, TRUE, ms); }
@@ -225,21 +265,25 @@ void trace_handle(uint64_t h, const char* what, uint64_t caller) {
 HANDLE XBEM_GUEST_ABI hle_CreateEventA(void*, BOOL manual, BOOL initial, LPCSTR name) {
   const HANDLE h = make_event(manual, initial, narrow(name));
   trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  if (auto o = lookup_handle(h)) o->created_by = XBEM_RETURN_ADDRESS();
   return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventW(void*, BOOL manual, BOOL initial, LPCWSTR name) {
   const HANDLE h = make_event(manual, initial, narrow(name));
   trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  if (auto o = lookup_handle(h)) o->created_by = XBEM_RETURN_ADDRESS();
   return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventExW(void*, LPCWSTR name, DWORD flags, DWORD) {
   const HANDLE h = make_event(flags & 1 /*MANUAL_RESET*/, flags & 2 /*INITIAL_SET*/, narrow(name));
   trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  if (auto o = lookup_handle(h)) o->created_by = XBEM_RETURN_ADDRESS();
   return h;
 }
 HANDLE XBEM_GUEST_ABI hle_CreateEventExA(void*, LPCSTR name, DWORD flags, DWORD) {
   const HANDLE h = make_event(flags & 1, flags & 2, narrow(name));
   trace_handle(h, "CreateEvent", XBEM_RETURN_ADDRESS());
+  if (auto o = lookup_handle(h)) o->created_by = XBEM_RETURN_ADDRESS();
   return h;
 }
 
@@ -250,6 +294,7 @@ BOOL XBEM_GUEST_ABI hle_SetEvent(HANDLE h) {
     return FALSE;
   }
   trace_handle(h, "SetEvent", XBEM_RETURN_ADDRESS());
+  e->signalled_by = XBEM_RETURN_ADDRESS();
   e->set();
   return TRUE;
 }
@@ -269,7 +314,9 @@ HANDLE XBEM_GUEST_ABI hle_CreateSemaphoreW(void*, LONG initial, LONG maximum, LP
     set_last_error(ERROR_INVALID_PARAMETER);
     return 0;
   }
-  const HANDLE h = proc().handles().insert(std::make_shared<rt::SemaphoreObject>(initial, maximum));
+  auto sem = std::make_shared<rt::SemaphoreObject>(initial, maximum);
+  sem->created_by = XBEM_RETURN_ADDRESS();
+  const HANDLE h = proc().handles().insert(sem);
   trace_handle(h, "CreateSemaphore", XBEM_RETURN_ADDRESS());
   return h;
 }
@@ -287,6 +334,7 @@ BOOL XBEM_GUEST_ABI hle_ReleaseSemaphore(HANDLE h, LONG count, LONG* previous) {
     return FALSE;
   }
   trace_handle(h, "ReleaseSemaphore", XBEM_RETURN_ADDRESS());
+  s->signalled_by = XBEM_RETURN_ADDRESS();
   if (!s->release(count, previous)) {
     set_last_error(ERROR_TOO_MANY_POSTS);
     return FALSE;
