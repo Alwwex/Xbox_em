@@ -270,12 +270,27 @@ const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t comp
   return &g_chunks.back();
 }
 
-// Whether `offset` lies inside a compressed chunk of the file's table, past
-// its start (such pieces are taken from the decoded chunk, not inflated).
-bool inside_chunk(FileState* file, uint64_t offset) {
+// Whether the piece at `offset` (virtual offset `virt`, request word 9)
+// starts inside a compressed chunk of the file's table rather than at one
+// (such pieces are taken from the decoded chunk, not inflated - their source
+// offset can even be another chunk's start).
+bool inside_chunk(FileState* file, uint64_t offset, uint64_t virt) {
   std::lock_guard lock(g_chunk_mutex);
   const ChunkTable& t = chunk_table(file);
   if (t.entries.size() < 2) return false;
+  if (virt) {
+    size_t lo = 0, n = t.entries.size() - 1;
+    while (lo < n) {
+      const size_t mid = (lo + n) / 2;
+      if ((t.first_page(mid) << 12) <= virt) lo = mid + 1;
+      else n = mid;
+    }
+    if (lo > 0) {
+      const size_t i = lo - 1;
+      const uint64_t delta = virt - (t.first_page(i) << 12);
+      if (delta < t.virtual_size(i) && t.file_offset(i) + delta == offset) return delta != 0;
+    }
+  }
   auto it = std::upper_bound(t.entries.begin(), t.entries.end() - 1, offset,
                              [](uint64_t o, uint64_t e) { return o < ((e & 0x3ffffff) << 8); });
   if (it == t.entries.begin()) return false;
@@ -287,10 +302,33 @@ bool inside_chunk(FileState* file, uint64_t offset) {
 // `compressed`, the whole chunk's) into out[skip...]; false when the file's
 // chunk table has no compressed chunk the piece lies in.
 bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, uint64_t skip, uint64_t size,
-                         std::vector<uint8_t>& out, size_t& produced) {
+                         std::vector<uint8_t>& out, size_t& produced, uint64_t virt) {
   std::lock_guard lock(g_chunk_mutex);
   const ChunkTable& t = chunk_table(file);
   if (t.entries.size() < 2) return false;
+  const DecodedChunk* c = nullptr;
+  uint64_t shift = 0;
+  // The request's word 9 is the piece's virtual offset in the file: the
+  // chunk whose virtual range holds it, when the title's source offset is
+  // that chunk's start plus the piece's distance from the chunk's virtual
+  // start (which can run past the chunk's stored bytes - into the next
+  // chunks, or past the end of the file).
+  if (virt) {
+    size_t lo = 0, n = t.entries.size() - 1;
+    while (lo < n) {  // first entry with a virtual start past `virt`
+      const size_t mid = (lo + n) / 2;
+      if ((t.first_page(mid) << 12) <= virt) lo = mid + 1;
+      else n = mid;
+    }
+    if (lo > 0) {
+      const size_t i = lo - 1;
+      const uint64_t delta = virt - (t.first_page(i) << 12);
+      if (delta < t.virtual_size(i) && t.file_offset(i) + delta == offset && ((t.entries[i] >> 26) & 0xf) != 0) {
+        c = decoded_chunk(file, t.file_offset(i), t.stored_size(i), t.virtual_size(i));
+        shift = delta;
+      }
+    }
+  }
   // The last chunk starting at or before `offset` whose stored size is the
   // request's and whose virtual range holds the piece's start.
   size_t hi = 0, lo = 0, n = t.entries.size() - 1;
@@ -300,8 +338,6 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
     else n = mid;
   }
   hi = lo;
-  const DecodedChunk* c = nullptr;
-  uint64_t shift = 0;
   for (size_t i = hi; i-- > 0 && !c;) {
     const uint64_t start = t.file_offset(i), delta = offset - start;
     if (delta >= 0x100000) break;
@@ -321,8 +357,8 @@ bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, 
   }
   if (!c) {
     if (g_shifted_failed.fetch_add(1) < 4)
-      XBEM_WARN("dstorage", "{}: no compressed chunk in the table holds the piece at {:#x} ({:#x} bytes)",
-                file->guest_path, offset, compressed);
+      XBEM_WARN("dstorage", "{}: no compressed chunk in the table holds the piece at {:#x} ({:#x} bytes, virtual {:#x})",
+                file->guest_path, offset, compressed, virt);
     return false;
   }
   const uint64_t from = shift + skip;
@@ -436,7 +472,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   std::vector<uint8_t> buffer(source_size);
   // (A piece inside a compressed chunk is taken from the decoded chunk; its
   // "source" may even lie past the end of the file.)
-  if (!file->read(offset, buffer.data(), source_size) && !(compression == 1 && inside_chunk(file, offset))) {
+  if (!file->read(offset, buffer.data(), source_size) && !(compression == 1 && inside_chunk(file, offset, w[9]))) {
     static std::atomic<int> warned{0};
     if (warned.fetch_add(1) < 24)
       XBEM_WARN("dstorage", "{}: read of {:#x} bytes at {:#x} failed (file size {:#x}), from {}:{}", file->guest_path,
@@ -468,14 +504,14 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       produced = whole.size();
     } else {
       whole.resize(skip + dest_size);
-      if (compression == 1 && inside_chunk(file, offset) &&
-          shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced)) {
+      if (compression == 1 && inside_chunk(file, offset, w[9]) &&
+          shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9])) {
         r = InflateResult::Ok;
       } else {
         r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
         if (r == InflateResult::OutputFull) r = InflateResult::Ok;
         if (r != InflateResult::Ok && compression == 1 &&
-            shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+            shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9]))
           r = InflateResult::Ok;
       }
     }
@@ -514,8 +550,8 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   InflateResult r;
   {
     std::vector<uint8_t> whole(skip + dest_size);
-    if (compression == 1 && inside_chunk(file, offset) &&
-        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced)) {
+    if (compression == 1 && inside_chunk(file, offset, w[9]) &&
+        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9])) {
       r = InflateResult::Ok;
     } else {
       r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
@@ -524,7 +560,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
     // rest of the chunk is not wanted.
     if (r == InflateResult::OutputFull) r = InflateResult::Ok;
     if ((r == InflateResult::BadData || r == InflateResult::Truncated) && compression == 1 &&
-        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced, w[9]))
       r = InflateResult::Ok;
     // (A physical destination only gets here with an undecodable format: its
     // `dest` is the frame number array, which is never written.)
