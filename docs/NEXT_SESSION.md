@@ -28,7 +28,8 @@ and commits in English.
   ~60 % of runs get past it (a race; the status-array fix 82c36f7 did not
   remove it); with XBEM_DSTORAGE_SYNC=1 4 of 4 runs started the world
   streaming but the main loop then stalls into the title's watchdog -
-  `--skip-fault 0x23cf683:11` skips its deliberate crash.
+  `--skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11` skip its two
+  deliberate crashes.
 - In the scene the streaming worker (guest thread 340, fn 0x2592c50 ->
   0x2593560) crashes in varying places (+0x2593e91 callees, +0xf6349):
   most likely corrupt streamed data - texture pieces that start inside a
@@ -42,7 +43,7 @@ and commits in English.
 ## Next steps (suggested order)
 
 1. Run `XBEM_DSTORAGE_SYNC=1 tools/gta6_press_run.sh ~/xbem-runs/runN.log 540
-   --skip-fault 0x23cf683:11` (try with/without XBEM_CHUNK_RECOVERY=1) and
+   --skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11` (try with/without XBEM_CHUNK_RECOVERY=1) and
    fix the streaming-worker crashes; the real fix is console-accurate
    GetResourceTiling / layouts (docs/HANDOFF.md "Texture layout still
    disagrees with the files").

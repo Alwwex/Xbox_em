@@ -9,7 +9,13 @@ cd "$(dirname "$0")/.."
 LOG=$1; SECONDS_TOTAL=${2:-430}; shift; shift || true
 GAME=${XBEM_GAME_DIR:-/mnt/d/GTAVI/GTAVI}
 P="A@45,A@95,A@105,A@115,A@125,A@135,A@150,DOWN@158,A@161,DOWN@168,DOWN@170,A@172,A@185,DOWN@188,A@191,DOWN@194,A@197"
-timeout -s INT "$SECONDS_TOTAL" ./build/bin/xbem run "$GAME" --continue-after-breakpoint --press "$P" "$@" > "$LOG" 2>&1 &
+# Synchronous DirectStorage queues: with the asynchronous ones ~40 % of runs
+# stay on the story loading screen (a race not found yet). The title's
+# watchdog crashes deliberately when its main loop stalls 30 s, which the
+# emulator's heavy streaming causes: both crash instructions are skipped.
+export XBEM_DSTORAGE_SYNC=${XBEM_DSTORAGE_SYNC:-1}
+timeout -s INT "$SECONDS_TOTAL" ./build/bin/xbem run "$GAME" --continue-after-breakpoint --press "$P" \
+  --skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11 "$@" > "$LOG" 2>&1 &
 RUN=$!
 sleep 2
 PID=$(pgrep -f "^./build/bin/xbem run" | head -1)
