@@ -387,7 +387,7 @@ class Translator {
                       n != "ds_bpermute_b32" && n != "ds_permute_b32";
     if (both) line("for (wh = 0u; wh < 2u; ++wh) { lane = lane0 + 32u * wh;");
     if (!emit_vector_lane(insn)) return false;
-    if (both) line("cmph[wh] = cmpv; }");
+    if (both) line("if (wh == 0u) cmph0 = cmpv; else cmph1 = cmpv; }");
     for (const std::string& p : post_) line(p);
     post_.clear();
     return true;
@@ -1252,7 +1252,7 @@ class Translator {
       g += std::format("#define LDS_MASK {}u\nshared uint lds[{}];\n", pow2 - 1, pow2);
     }
     g += "uint lane, lane0, wh;\nuint exec_lo, exec_hi, vcc_lo, vcc_hi, m0, sink, wave_lanes, wave_lanes_hi, dppv, dsapp;\n"
-         "bool scc, cmpv;\nbool cmph[2];\n";
+         "bool scc, cmpv;\n// (two scalars: dzn fails to build pipelines that ballot elements of a local bool array)\nbool cmph0, cmph1;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("uint s{};\n", k);
     const uint32_t vgprs = std::max<uint32_t>(max_vgpr_, 3);
     for (uint32_t k = 0; k < vgprs; ++k) g += wave64_ ? std::format("uint v{}[2];\n", k) : std::format("uint v{};\n", k);
@@ -1262,7 +1262,7 @@ class Translator {
          "bool lane_on() { return lane_active(lane); }\n";
     g += "void main() {\n"
          "  lane0 = gl_SubgroupInvocationID; lane = lane0; wh = 0u; dsapp = 0u;\n"
-         "  vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false; cmph[0] = false; cmph[1] = false;\n";
+         "  vcc_lo = 0u; vcc_hi = 0u; m0 = 0u; scc = false; cmpv = false; cmph0 = false; cmph1 = false;\n";
     for (uint32_t k = 0; k < max_sgpr_; ++k) g += std::format("  s{} = 0u;\n", k);
     if (wave64_) {
       // Wave w of the workgroup holds threads 64w..64w+63 (x fastest);
@@ -1270,13 +1270,13 @@ class Translator {
       for (uint32_t k = 0; k < vgprs; ++k) g += std::format("  v{0}[0] = 0u; v{0}[1] = 0u;\n", k);
       g += std::format("  for (wh = 0u; wh < 2u; ++wh) {{\n"
                        "    uint t = gl_SubgroupID * 64u + lane0 + 32u * wh;\n"
-                       "    cmph[wh] = t < {3}u;\n"
+                       "    if (wh == 0u) cmph0 = t < {3}u; else cmph1 = t < {3}u;\n"
                        "    v0[wh] = t % {0}u;\n", c.local_size[0], c.local_size[1], c.local_size[2], threads);
       if (c.tidig_comps >= 1) g += std::format("    v1[wh] = (t / {0}u) % {1}u;\n", c.local_size[0], c.local_size[1]);
       if (c.tidig_comps >= 2) g += std::format("    v2[wh] = t / ({0}u * {1}u);\n", c.local_size[0], c.local_size[1]);
       g += "  }\n"
-           "  wave_lanes = subgroupBallot(cmph[0]).x; wave_lanes_hi = subgroupBallot(cmph[1]).x;\n"
-           "  exec_lo = wave_lanes; exec_hi = wave_lanes_hi; cmph[0] = false; cmph[1] = false; wh = 0u;\n";
+           "  wave_lanes = subgroupBallot(cmph0).x; wave_lanes_hi = subgroupBallot(cmph1).x;\n"
+           "  exec_lo = wave_lanes; exec_hi = wave_lanes_hi; cmph0 = false; cmph1 = false; wh = 0u;\n";
     } else {
       g += "  wave_lanes = subgroupBallot(true).x; wave_lanes_hi = 0u;\n"
            "  exec_lo = wave_lanes; exec_hi = 0u;\n";
@@ -1319,8 +1319,8 @@ class Translator {
   // The lane mask of a compare / carry result stored to SGPR(s) or VCC or
   // EXEC: wave32 one word, wave64 both halves (one ballot per half).
   std::string ballot_store(uint32_t dst) {
-    const std::string lo = wave64_ ? "subgroupBallot(cmph[0]).x" : "subgroupBallot(cmpv).x";
-    const std::string hi = wave64_ ? "subgroupBallot(cmph[1]).x" : "0u";
+    const std::string lo = wave64_ ? "subgroupBallot(cmph0).x" : "subgroupBallot(cmpv).x";
+    const std::string hi = wave64_ ? "subgroupBallot(cmph1).x" : "0u";
     if (dst == kVccLo) return std::format("vcc_lo = {}; vcc_hi = {};", lo, hi);
     if (dst == kExecLo) return std::format("exec_lo = {}; exec_hi = {};", lo, hi);
     if (!wave64_) return std::format("{} = {};", sreg(dst), lo);  // wave32: one SGPR

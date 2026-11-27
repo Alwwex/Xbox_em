@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <map>
@@ -242,7 +243,14 @@ HRESULT computer_get_tiling(ProbeObject* self, uint32_t* num_tiles, uint8_t* pac
     }
     *num_subresources = n;
   }
-  if (log_now())
+  static const bool log_all = std::getenv("XBEM_XG_LOG") != nullptr;
+  if (log_all) {
+    std::string mips;
+    for (uint32_t m = 0; m < standard; ++m) mips += std::format(" {}x{}@{}", wide[m], high[m], start[m]);
+    XBEM_INFO("xg", "tiling {}x{}x{} dim {} format {} mips {} slices {} -> {} tiles/slice, std{} packed {} in {} @{}",
+              l.mip[0].width, l.mip[0].height, l.mip[0].depth, l.dimension, l.format, l.mips, slices, per_slice,
+              mips, l.mips - standard, packed_tiles, packed_start);
+  } else if (log_now())
     XBEM_INFO("xg", "GetResourceTiling({}x{} format {}, {} mips) -> {} tiles, {} standard mips, {} packed in {} tiles",
               l.mip[0].width, l.mip[0].height, l.format, l.mips, per_slice * slices, standard, l.mips - standard,
               packed_tiles);

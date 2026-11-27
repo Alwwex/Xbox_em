@@ -206,132 +206,132 @@ std::string hex_qwords(const uint64_t* q, int n) {
   return s;
 }
 
-// Executes one request; returns its HRESULT.
 // Requests into the middle of a compressed chunk. GTA VI's read layer (fn
-// 0x4ffd520) maps a texture's pieces onto the .ttpf chunk table; when a
-// piece does not start at a chunk (its own int3 at +0x4ffd868 - our tiling
-// answers cut textures into smaller pieces than the files were chunked for)
-// it still enqueues the chunk's compressed size from "chunk start + offset of
-// the piece in the chunk", which is not the start of a DEFLATE stream. The
-// piece's data is bytes [shift, shift + size) of the chunk that starts
-// `shift` bytes earlier: find that start (4 KiB steps back, the stream must
-// decode completely) and keep the last chunks decoded, since the pieces of
-// one chunk arrive one after another.
+// 0x4ffd520) maps the virtual range a texture level occupies onto the .ttpf
+// chunk table; when a piece does not start at a chunk (its own int3 at
+// +0x4ffd868 - our tiling answers cut textures into other pieces than the
+// files were chunked for) it still enqueues the chunk's compressed size from
+// "chunk start + offset of the piece in the chunk", which is not the start of
+// a DEFLATE stream. The piece's data is bytes [shift, shift + size) of that
+// chunk: the file's own chunk table (below) says which chunk it is.
+//
+// .ttpf ("RDS5") layout: u32 magic, u32 entry count, u32 virtual size, u32;
+// from offset 0x10 one u64 per chunk - bits 0-25 file offset >> 8, 26-29
+// compression, 30-51 first virtual 4 KiB page, 52-63 padding bytes at the
+// end of its stored data; the last entry is the end of the file.
+struct ChunkTable {
+  bool loaded = false;
+  std::vector<uint64_t> entries;
+  uint64_t file_offset(size_t i) const { return (entries[i] & 0x3ffffff) << 8; }
+  uint64_t first_page(size_t i) const { return (entries[i] >> 30) & 0x3fffff; }
+  uint64_t stored_size(size_t i) const { return file_offset(i + 1) - file_offset(i) - (entries[i] >> 52); }
+  uint64_t virtual_size(size_t i) const { return (first_page(i + 1) - first_page(i)) << 12; }
+};
 struct DecodedChunk {
   const FileState* file = nullptr;
-  uint64_t start = 0, compressed = 0;
+  uint64_t start = 0;
   std::vector<uint8_t> data;
 };
 std::mutex g_chunk_mutex;
+std::map<const FileState*, ChunkTable> g_tables;
 std::vector<DecodedChunk> g_chunks;  // most recent last
-std::map<std::pair<const FileState*, uint64_t>, uint64_t> g_chunk_start;  // (file, bad offset) -> chunk start
 std::atomic<uint64_t> g_shifted_ok{0}, g_shifted_failed{0};
-// Offsets where compressed requests decoded from their first byte: chunk
-// starts, tried first for a piece inside a chunk.
-std::map<const FileState*, std::set<uint64_t>> g_chunk_starts;
 
-void note_chunk_start(const FileState* file, uint64_t offset) {
-  std::lock_guard lock(g_chunk_mutex);
-  g_chunk_starts[file].insert(offset);
+const ChunkTable& chunk_table(FileState* file) {
+  ChunkTable& t = g_tables[file];
+  if (t.loaded) return t;
+  t.loaded = true;
+  uint32_t header[4] = {};
+  if (!file->read(0, reinterpret_cast<uint8_t*>(header), sizeof header) || std::memcmp(header, "RDS5", 4) != 0 ||
+      header[1] < 2 || header[1] > (1u << 24))
+    return t;
+  t.entries.resize(header[1]);
+  if (!file->read(0x10, reinterpret_cast<uint8_t*>(t.entries.data()), t.entries.size() * 8)) t.entries.clear();
+  return t;
 }
 
-constexpr uint64_t kMaxChunkShift = 0x40000, kMaxChunkBytes = 0x100000;
-
-const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t compressed) {
+const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t compressed, uint64_t expected) {
   for (const DecodedChunk& c : g_chunks)
-    if (c.file == file && c.start == start && c.compressed == compressed) return &c;
+    if (c.file == file && c.start == start) return &c;
   std::vector<uint8_t> in(compressed);
   if (!file->read(start, in.data(), in.size())) return nullptr;
-  DecodedChunk c{file, start, compressed, std::vector<uint8_t>(kMaxChunkBytes)};
+  DecodedChunk c{file, start, std::vector<uint8_t>(expected)};
   size_t produced = 0;
-  if (inflate_auto(in.data(), in.size(), c.data.data(), c.data.size(), produced) != InflateResult::Ok) return nullptr;
+  const InflateResult r = inflate_auto(in.data(), in.size(), c.data.data(), c.data.size(), produced);
+  if (r != InflateResult::Ok && r != InflateResult::OutputFull) return nullptr;
   c.data.resize(produced);
-  if (g_chunks.size() >= 8) g_chunks.erase(g_chunks.begin());
+  if (g_chunks.size() >= 16) g_chunks.erase(g_chunks.begin());
   g_chunks.push_back(std::move(c));
   return &g_chunks.back();
 }
 
+// Whether `offset` lies inside a compressed chunk of the file's table, past
+// its start (such pieces are taken from the decoded chunk, not inflated).
+bool inside_chunk(FileState* file, uint64_t offset) {
+  std::lock_guard lock(g_chunk_mutex);
+  const ChunkTable& t = chunk_table(file);
+  if (t.entries.size() < 2) return false;
+  auto it = std::upper_bound(t.entries.begin(), t.entries.end() - 1, offset,
+                             [](uint64_t o, uint64_t e) { return o < ((e & 0x3ffffff) << 8); });
+  if (it == t.entries.begin()) return false;
+  const size_t i = static_cast<size_t>(it - t.entries.begin()) - 1;
+  return t.file_offset(i) != offset;
+}
+
 // Bytes [skip, skip + size) of the piece at `offset` (compressed size
-// `compressed`, the whole chunk's) into out[skip...]; false when no chunk
-// start before `offset` decodes.
+// `compressed`, the whole chunk's) into out[skip...]; false when the file's
+// chunk table has no compressed chunk the piece lies in.
 bool shifted_chunk_piece(FileState* file, uint64_t offset, uint64_t compressed, uint64_t skip, uint64_t size,
                          std::vector<uint8_t>& out, size_t& produced) {
-  // Off by default: with it GTA VI's story load never left the loading
-  // screen (reads stopped at ~240 s in every run), without it - the pieces
-  // failing - the title reaches the scene after it (2026-11-27, runs 12/13).
-  static const bool enabled = [] {
-    const char* v = std::getenv("XBEM_CHUNK_RECOVERY");
-    return v && *v && *v != '0';
-  }();
-  if (!enabled) return false;
   std::lock_guard lock(g_chunk_mutex);
-  const auto key = std::make_pair(static_cast<const FileState*>(file), offset);
-  uint64_t start = UINT64_MAX;
-  if (auto it = g_chunk_start.find(key); it != g_chunk_start.end()) {
-    if (it->second == UINT64_MAX - 1) return false;  // searched before, nothing found
-    start = it->second;
+  const ChunkTable& t = chunk_table(file);
+  if (t.entries.size() < 2) return false;
+  // The last chunk starting at or before `offset` whose stored size is the
+  // request's and whose virtual range holds the piece's start.
+  size_t hi = 0, lo = 0, n = t.entries.size() - 1;
+  while (lo < n) {  // first entry with file offset > offset
+    const size_t mid = (lo + n) / 2;
+    if (t.file_offset(mid) <= offset) lo = mid + 1;
+    else n = mid;
   }
+  hi = lo;
   const DecodedChunk* c = nullptr;
-  if (start == UINT64_MAX) {
-    // The nearest chunk start seen before.
-    if (auto f = g_chunk_starts.find(file); f != g_chunk_starts.end()) {
-      auto it = f->second.lower_bound(offset);
-      if (it != f->second.begin() && offset - *std::prev(it) <= kMaxChunkShift) {
-        const uint64_t candidate = *std::prev(it);
-        c = decoded_chunk(file, candidate, compressed);
-        // (The title asks for the chunk's full size even from inside it: the
-        // piece gets what the chunk still holds.)
-        if (c && c->data.size() > offset - candidate + skip) g_chunk_start[key] = start = candidate;
-        else c = nullptr;
-      }
-    }
+  uint64_t shift = 0;
+  for (size_t i = hi; i-- > 0 && !c;) {
+    const uint64_t start = t.file_offset(i), delta = offset - start;
+    if (delta >= 0x100000) break;
+    if (((t.entries[i] >> 26) & 0xf) == 0 || t.stored_size(i) != compressed || delta >= t.virtual_size(i)) continue;
+    c = decoded_chunk(file, start, compressed, t.virtual_size(i));
+    shift = delta;
   }
-  if (c) {
-  } else if (start != UINT64_MAX) {
-    c = decoded_chunk(file, start, compressed);
-  } else {
-    // Chunk starts are 256-byte aligned (the chunk table stores offsets >>
-    // 8). One read of the window before the piece; only candidates with a
-    // zlib header (CMF method 8, (CMF << 8 | FLG) % 31 == 0) are inflated.
-    const uint64_t back = std::min<uint64_t>(kMaxChunkShift, offset & ~uint64_t{0xff});
-    std::vector<uint8_t> window(back + 2);
-    if (back && file->read(offset - back, window.data(), window.size())) {
-      for (uint64_t shift = 0x100; shift <= back && !c; shift += 0x100) {
-        const uint8_t* h = window.data() + (back - shift);
-        if ((h[0] & 0x0f) != 8 || ((h[0] << 8) | h[1]) % 31 != 0) continue;
-        c = decoded_chunk(file, offset - shift, compressed);
-        if (c && c->data.size() <= shift + skip) c = nullptr;  // decodes, but ends before the piece
-        if (c) g_chunk_start[key] = start = offset - shift;
-      }
+  // Pieces of small resources start inside a page, and their size need not
+  // be the chunk's: the compressed chunk whose stored bytes hold `offset`.
+  if (!c && hi > 0) {
+    const size_t i = hi - 1;
+    const uint64_t start = t.file_offset(i), delta = offset - start;
+    if (((t.entries[i] >> 26) & 0xf) != 0 && delta < t.stored_size(i) && delta < t.virtual_size(i)) {
+      c = decoded_chunk(file, start, t.stored_size(i), t.virtual_size(i));
+      shift = delta;
     }
-    // Raw DEFLATE chunks have no header to test: 4 KiB steps, as pieces are
-    // page-aligned there.
-    for (uint64_t shift = 0x1000; shift <= back && !c; shift += 0x1000) {
-      const uint8_t* h = window.data() + (back - shift);
-      if ((h[0] & 0x0f) == 8 && ((h[0] << 8) | h[1]) % 31 == 0) continue;  // tried above
-      c = decoded_chunk(file, offset - shift, compressed);
-      if (c && c->data.size() <= shift + skip) c = nullptr;
-      if (c) g_chunk_start[key] = start = offset - shift;
-    }
-    // Remember failures too: the title retries such requests.
-    if (!c) g_chunk_start[key] = UINT64_MAX - 1;
   }
   if (!c) {
     if (g_shifted_failed.fetch_add(1) < 4)
-      XBEM_WARN("dstorage", "{}: no compressed chunk before {:#x} holds the piece", file->guest_path, offset);
+      XBEM_WARN("dstorage", "{}: no compressed chunk in the table holds the piece at {:#x} ({:#x} bytes)",
+                file->guest_path, offset, compressed);
     return false;
   }
-  const uint64_t from = offset - start + skip;
+  const uint64_t from = shift + skip;
   produced = from < c->data.size() ? std::min<uint64_t>(size, c->data.size() - from) : 0;
   out.assign(skip + size, 0);
   std::memcpy(out.data() + skip, c->data.data() + from, produced);
   produced += skip;
   if (g_shifted_ok.fetch_add(1) < 4)
     XBEM_INFO("dstorage", "{}: piece at {:#x} is {:#x} bytes into the compressed chunk at {:#x} - delivered from it",
-              file->guest_path, offset, offset - start, start);
+              file->guest_path, offset, shift, c->start);
   return true;
 }
 
+// Executes one request; returns its HRESULT.
 HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) {
   uint64_t w[12] = {};
   if (!request || !platform::safe_read(reinterpret_cast<uint64_t>(request), w, sizeof w)) return E_POINTER;
@@ -428,9 +428,13 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   if (!dest || !source_size || source_size > (256u << 20) || skip + dest_size > (1ull << 30)) return E_INVALIDARG;
 
   std::vector<uint8_t> buffer(source_size);
-  if (!file->read(offset, buffer.data(), source_size)) {
-    XBEM_WARN("dstorage", "{}: read of {:#x} bytes at {:#x} failed (file size {:#x})", file->guest_path, source_size,
-              offset, file->size);
+  // (A piece inside a compressed chunk is taken from the decoded chunk; its
+  // "source" may even lie past the end of the file.)
+  if (!file->read(offset, buffer.data(), source_size) && !(compression == 1 && inside_chunk(file, offset))) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1) < 24)
+      XBEM_WARN("dstorage", "{}: read of {:#x} bytes at {:#x} failed (file size {:#x}), from {}:{}", file->guest_path,
+                source_size, offset, file->size, describe_code_address(caller), hex_qwords(w, 12));
     return HRESULT(0x80070026);  // HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)
   }
   std::lock_guard lock(q->mutex);
@@ -458,12 +462,16 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
       produced = whole.size();
     } else {
       whole.resize(skip + dest_size);
-      r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
-      if (r == InflateResult::OutputFull) r = InflateResult::Ok;
-      if (r == InflateResult::Ok && compression == 1) note_chunk_start(file, offset);
-      if (r != InflateResult::Ok && compression == 1 &&
-          shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+      if (compression == 1 && inside_chunk(file, offset) &&
+          shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced)) {
         r = InflateResult::Ok;
+      } else {
+        r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
+        if (r == InflateResult::OutputFull) r = InflateResult::Ok;
+        if (r != InflateResult::Ok && compression == 1 &&
+            shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
+          r = InflateResult::Ok;
+      }
     }
     if (r == InflateResult::Ok) {
       // An uncompressed source shorter than the window holds just the window.
@@ -500,11 +508,15 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
   InflateResult r;
   {
     std::vector<uint8_t> whole(skip + dest_size);
-    r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
+    if (compression == 1 && inside_chunk(file, offset) &&
+        shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced)) {
+      r = InflateResult::Ok;
+    } else {
+      r = inflate_auto(buffer.data(), buffer.size(), whole.data(), whole.size(), produced);
+    }
     // A piece shorter than its chunk (the title's int3 at +0x4ffd879): the
     // rest of the chunk is not wanted.
     if (r == InflateResult::OutputFull) r = InflateResult::Ok;
-    if (r == InflateResult::Ok && compression == 1) note_chunk_start(file, offset);
     if ((r == InflateResult::BadData || r == InflateResult::Truncated) && compression == 1 &&
         shifted_chunk_piece(file, offset, source_size, skip, dest_size, whole, produced))
       r = InflateResult::Ok;

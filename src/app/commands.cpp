@@ -473,12 +473,97 @@ int gpu_translate_coverage(const std::filesystem::path& dir, bool validate) {
   return 0;
 }
 
+// Compiles a translated compute shader and creates its pipeline on the
+// renderer's Vulkan device with the renderer's compute layout (dzn can
+// reject valid SPIR-V when it builds DXIL - "compute pipeline creation
+// failed" in a run).
+int compute_pipeline_check(const std::string& glsl) {
+#if defined(XBEM_HAVE_VULKAN)
+  namespace fs = std::filesystem;
+  const fs::path tmp = fs::temp_directory_path() / std::format("xbem-pipe-{}", static_cast<long>(::getpid()));
+  fs::create_directories(tmp);
+  std::ofstream(tmp / "s.comp") << glsl;
+  const std::string cmd = std::format("glslangValidator -V --target-env vulkan1.2 -o {} {} > {} 2>&1",
+                                      (tmp / "s.spv").string(), (tmp / "s.comp").string(), (tmp / "log.txt").string());
+  if (std::system(cmd.c_str()) != 0) {
+    out("GLSL compile failed (see {})\n", (tmp / "log.txt").string());
+    return 1;
+  }
+  gpu::vk::Core core;
+  std::string reason;
+  if (!core.init(reason)) {
+    out("Vulkan: not usable - {}\n", reason);
+    return 1;
+  }
+  const auto& f = core.fn();
+  std::ifstream in(tmp / "s.spv", std::ios::binary);
+  std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  mci.codeSize = bytes.size();
+  mci.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
+  VkShaderModule module = VK_NULL_HANDLE;
+  if (f.vkCreateShaderModule(core.device(), &mci, nullptr, &module) != VK_SUCCESS) {
+    out("vkCreateShaderModule failed\n");
+    return 1;
+  }
+  // The renderer's set: 0 2D textures, 1 samplers, 2 2D arrays, 3 3D, 4-6 storage images.
+  VkDescriptorSetLayoutBinding b[7]{};
+  const uint32_t counts[7] = {4096, 8, 1024, 256, 2048, 512, 256};
+  for (uint32_t i = 0; i < 7; ++i) {
+    b[i].binding = i;
+    b[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER
+                          : i >= 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                   : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b[i].descriptorCount = counts[i];
+    b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  const VkDescriptorBindingFlags bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+  VkDescriptorBindingFlags bflags[7] = {bound, 0, bound, bound, bound, bound, bound};
+  VkDescriptorSetLayoutBindingFlagsCreateInfo bfi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  bfi.bindingCount = 7;
+  bfi.pBindingFlags = bflags;
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.pNext = &bfi;
+  lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  lci.bindingCount = 7;
+  lci.pBindings = b;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  f.vkCreateDescriptorSetLayout(core.device(), &lci, nullptr, &set_layout);
+  VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1;
+  plci.pSetLayouts = &set_layout;
+  plci.pushConstantRangeCount = 1;
+  plci.pPushConstantRanges = &push;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  f.vkCreatePipelineLayout(core.device(), &plci, nullptr, &layout);
+  VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main",
+              nullptr};
+  ci.layout = layout;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  const VkResult r = f.vkCreateComputePipelines(core.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline);
+  out("compute pipeline on {}: {} (VkResult {}), SPIR-V {} bytes in {}\n", core.device_name(),
+      r == VK_SUCCESS ? "created" : "FAILED", static_cast<int>(r), bytes.size(), (tmp / "s.spv").string());
+  return r == VK_SUCCESS ? 0 : 1;
+#else
+  (void)glsl;
+  out("this xbem was built without the Vulkan renderer\n");
+  return 1;
+#endif
+}
+
 int cmd_gpu_translate(const Args& args) {
+  if (args.size() >= 2 && args[0] == "--pipeline-glsl") {
+    std::ifstream in(args[1]);
+    return compute_pipeline_check(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
+  }
   if (args.size() >= 2 && args[0] == "--coverage")
     return gpu_translate_coverage(args[1], args.size() >= 3 && args[2] == "--validate");
   if (args.size() < 2 || (args[1] != "vs" && args[1] != "ps" && args[1] != "cs")) {
-    out("usage: xbem gpu-translate <shader.bin> vs|ps|cs [cs-info.bin]\n"
-        "       xbem gpu-translate --coverage <dump dir> [--validate]\n");
+    out("usage: xbem gpu-translate <shader.bin> vs|ps|cs [cs-info.bin [--pipeline]]\n"
+        "       xbem gpu-translate --coverage <dump dir> [--validate]\n"
+        "       xbem gpu-translate --pipeline-glsl <shader.comp>\n");
     return 2;
   }
   const auto bytes = read_file(args[0]);
@@ -496,6 +581,7 @@ int cmd_gpu_translate(const Args& args) {
     out("translation failed: {}\n", shader.error);
     return 1;
   }
+  if (args.size() >= 4 && args[3] == "--pipeline") return compute_pipeline_check(shader.glsl);
   out("{}", shader.glsl);
   out("// {} slots, {} words:", shader.slots.size(), shader.slot_words);
   static const char* kKinds[] = {"sgpr", "buffer", "texture", "image", "sampler", "blocks"};
