@@ -31,6 +31,7 @@ void unregister_dump_thread() {}
 #include <execinfo.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -1188,6 +1189,16 @@ void crash_handler(int sig, siginfo_t* info, void* ctx_raw) {
   const uint64_t rsp = static_cast<uint64_t>(g[REG_RSP]);
   where[0] = 0;
   if (g_describer) g_describer(rip, where, sizeof where);
+  if (!where[0]) {
+    // Host code (a driver, the emulator): its library and symbol. dladdr is
+    // not async-signal-safe, but the process is ending anyway.
+    Dl_info di{};
+    if (dladdr(reinterpret_cast<void*>(rip), &di) && di.dli_fname)
+      std::snprintf(where, sizeof where, "host %s+%#llx (%s+%#llx)", di.dli_fname,
+                    static_cast<unsigned long long>(rip - reinterpret_cast<uint64_t>(di.dli_fbase)),
+                    di.dli_sname ? di.dli_sname : "?",
+                    static_cast<unsigned long long>(di.dli_saddr ? rip - reinterpret_cast<uint64_t>(di.dli_saddr) : 0));
+  }
   std::snprintf(line, sizeof line, "RIP=%016llx  %s\n", static_cast<unsigned long long>(rip), where);
   write_str(line);
 
