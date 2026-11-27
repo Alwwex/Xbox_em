@@ -37,7 +37,15 @@ and commits in English.
   budgets; the device allows 4096 allocations), present blit for non-RGBA8
   display formats (the overflow crashed libgallium at ~450-550 s).
 
+Evening (HANDOFF "GPU TIMEOUTS + SHADER BUILD TIME"): no more device
+removals (slow wave draws split across submissions), faster wave codegen,
+async graphics pipelines, GLSL size limit. The display is black from ~450 s
+(the final composite now runs); scene progress is limited by dzn pipeline
+builds (seconds each).
+
 ## Next steps (suggested order)
+
+0. Black display: capture the draws into the display resource at ~560 s.
 
 1. Why Bink's frames are zero: find the textures the cutscene draw samples
    (--capture-commands during the green screen) and who writes them.

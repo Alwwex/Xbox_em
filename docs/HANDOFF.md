@@ -147,7 +147,39 @@ the UI samples via ps 736a6b6841007e1e). Needed:
 Also missing: mip chains (only mip 0 uploaded), depth test, blend state of
 slot-57 pipelines, MRT.
 
-## SCENE STABILITY (2026-11-27, later) - read first
+## GPU TIMEOUTS + SHADER BUILD TIME (2026-11-27, evening) - read first
+
+- The black screen at ~1300 s (owner) was a device removal: wave-mode pixel
+  shaders made single submissions take >2 s. GTA VI's light pass
+  (vs fef683bb3ab130c5, ps 5bc43bec3577a62b: 144 indices x 459 instances
+  over 2560x1440, 34 M pixel invocations) took 2.2 s for ONE draw.
+  Fixes: wave-mode draws run XBEM_WAVE_INSTANCES_PER_SUBMIT (32) instances
+  per submission, every XBEM_WAVE_DRAWS_PER_SUBMIT (2) wave draws end a
+  submission; no device removal since (runs 224-229).
+- Wave codegen: blocks in program order (`if (blk == k)`), a loop only
+  around backward branches (XBEM_WAVE_SWITCH=1: old dispatch switch);
+  consecutive vector instructions share one active-lane guard; compare
+  results are masked at the ballot. The light pass got ~2.3x faster.
+- XBEM_PS_STATS=1: slow submissions report blocks per invocation (max /
+  mean / count) and name the last draw (vs, ps, counts, viewport).
+- Shader build time is the scene's real stall: dzn takes ~1.5-4 s per
+  pipeline, minutes for the largest compute programs; e45616a4accd3409
+  (3.4 MiB GLSL) aborts dzn with "stack smashing detected" (run 227) -
+  programs over XBEM_MAX_GLSL_KB (1536) are refused. Graphics pipelines
+  are now built on the compile pool (draws skipped until ready;
+  XBEM_SYNC_PIPELINES=1 for the old way). A VkPipelineCache persists in
+  ~/.cache/xbem/spirv/pipelines.bin but helps little (the driver's DXIL
+  compile is not cached). Every codegen change invalidates the SPIR-V
+  cache (GLSL hash) - the next run is cold.
+- Intermittent guest crash in worker thread 340 (entry +0x2215ea0):
+  +0x4da63f8 (pointer read from 0x1421750008, a page aliased at
+  0x1dc4f40000 = the GPU view of the CPU heap) and +0x22bfc0 (16-byte copy
+  from null). Seen before in runs 18, 20, 188, 192 - not new; cause unknown.
+- The display is black from ~450 s now (before: green Bink frame + pink
+  credits). Wave pixel shaders now draw the final composite; next: capture
+  (--capture-commands) the last draws into the display resource.
+
+## SCENE STABILITY (2026-11-27, later)
 
 Runs 185-192 (`tools/gta6_press_run.sh LOG 600`, synchronous DirectStorage,
 both watchdog skip-faults). Fixed:
