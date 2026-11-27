@@ -358,7 +358,14 @@ HRESULT XBEM_GUEST_ABI hle_XApuDequeueResult(void* handle, void* result) {
   return S_OK;
 }
 
-XBEM_DISCOVERY_FAIL("chad", XDspActivate)
+// The audio DSP is not emulated. XDspActivate fails explicitly: GTA VI's
+// wrapper (+0x11d4750) turns a non-zero result into -1 and drops the stream;
+// "success" left its two outputs (stream state pointers) zero and the title
+// dereferenced them in the story scene (+0x4e5ad4d).
+HRESULT XBEM_GUEST_ABI hle_XDspActivate(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  XBEM_LOG_CALL("chad", "E_NOTIMPL (no audio DSP)", a, b, c, d);
+  return E_NOTIMPL;
+}
 XBEM_DISCOVERY_FAIL("chad", XDspConnectWithMaximumStreamLimit)
 XBEM_DISCOVERY_FAIL("chad", XDspDeactivate)
 XBEM_DISCOVERY_FAIL("chad", XDspDisconnect)
@@ -380,9 +387,9 @@ std::vector<ModuleDef> make_console_modules() {
        XBEM_HLE(ApuAlloc), XBEM_HLE(ApuCreateHeap), XBEM_HLE(ApuFree), XBEM_HLE(ApuIsVirtualAddressValid),
        XBEM_HLE(ApuMapApuAddress), XBEM_HLE(ApuMapVirtualAddress)});
   add("chad.dll", "Audio DSP interface (not emulated: calls are logged and fail)",
-      {XBEM_HLE_STUB(XDspActivate), XBEM_HLE_STUB(XDspConnectWithMaximumStreamLimit), XBEM_HLE_STUB(XDspDeactivate),
+      {XBEM_HLE(XDspActivate), XBEM_HLE_STUB(XDspConnectWithMaximumStreamLimit), XBEM_HLE_STUB(XDspDeactivate),
        XBEM_HLE_STUB(XDspDisconnect), XBEM_HLE_STUB(XDspSubmitCommand)});
-  add("xapu.dll", "Audio processing unit queues (commands accepted, no results)",
+  add("xapu.dll", "Audio processing unit queues (commands acknowledged with results)",
       {XBEM_HLE(XApuConnect), XBEM_HLE(XApuDequeueResult), XBEM_HLE(XApuDisconnect), XBEM_HLE(XApuEnqueueCommand),
        XBEM_HLE(XApuGetResultCount)});
   return out;

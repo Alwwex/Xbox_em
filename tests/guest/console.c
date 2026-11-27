@@ -93,6 +93,7 @@ IMP HRESULT XApuConnect(const void* params, uint64_t* shared, void** handle);
 IMP HRESULT XApuEnqueueCommand(void* handle, const void* command, uint32_t flags);
 IMP uint32_t XApuGetResultCount(void* handle, uint32_t kind);
 IMP HRESULT XApuDequeueResult(void* handle, void* result);
+IMP HRESULT XDspActivate(void* dsp, const void* desc, void** out0, void** out1);
 IMP HRESULT XApuDisconnect(void* handle);
 
 /* combase (through kernelx.dll) */
@@ -640,6 +641,13 @@ static void test_audio(void) {
   CHECK(XApuEnqueueCommand(queue, command, 0) == 0 && XApuGetResultCount(queue, 0) == 1);
   CHECK(XApuDequeueResult(queue, result) == 0 && result[0] == 1 && result[1] == 7);
   CHECK(XApuGetResultCount(queue, 0) == 0);
+  /* No audio DSP: activating a stream fails (GTA VI then drops the stream). */
+  {
+    const uint32_t desc[4] = {1, 0, 0x40000, 1};
+    void* out0 = 0;
+    void* out1 = 0;
+    CHECK(XDspActivate(0, desc, &out0, &out1) < 0);
+  }
   CHECK(XApuDisconnect(queue) == 0);
 }
 
