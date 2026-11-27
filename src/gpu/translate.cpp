@@ -339,22 +339,59 @@ class Translator {
     // subgroup operations on D3D12 and can circle in waterfall loops forever:
     // they stop after 2^9 blocks.
     const uint32_t stage_limit = out_.stage == ShaderStage::Compute ? limit : std::min<uint32_t>(limit, 1u << 13);
-    if (out_.stage == ShaderStage::Pixel)
-      line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u && !(gl_HelperInvocation && guard > 512u)) {{",
-                       stage_limit));
-    else
-      line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", stage_limit));
-    line(std::format("if (guard == {:#x}u) {{ MemT(pc.mem).w[{}u] = {:#x}u; MemT(pc.mem).w[{}u] = blk; }}", stage_limit - 1,
-                     mem::kGuardWord, out_.tag, mem::kGuardBlockWord));
-    line("switch (blk) {");
+    static const uint32_t helper_limit = [] {
+      const char* e = std::getenv("XBEM_HELPER_GUARD");
+      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 512u;
+    }();
+    // Blocks are emitted in program order, each as `if (blk == k)`: a
+    // forward branch only sets blk (the blocks in between are skipped), a
+    // backward one also restarts the loop around them. Without backward
+    // branches there is no loop at all. GPU compilers handle this far
+    // better than a dispatch switch inside a loop (registers stay in
+    // registers; a light pass of GTA VI took 2 s per draw that way).
+    // XBEM_WAVE_SWITCH=1 emits the old dispatch loop.
+    static const bool use_switch = [] {
+      const char* e = std::getenv("XBEM_WAVE_SWITCH");
+      return e && *e == '1';
+    }();
+    bool backward = false;
+    for (uint32_t k = 0; k < insns.size(); ++k)
+      if (is_branch(insns[k].insn)) {
+        uint32_t t, here = 0;
+        for (const auto& [pc, b] : block_at)
+          if (pc <= insns[k].pc) here = b;
+        if (block_of(branch_target(insns[k]), t) && t <= here) backward = true;
+      }
+    const bool looped = use_switch || backward;
+    const char* stop = use_switch ? " break;" : "";
+    if (looped) {
+      if (out_.stage == ShaderStage::Pixel)
+        line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u && !(gl_HelperInvocation && guard > {}u)) {{",
+                         stage_limit, helper_limit));
+      else
+        line(std::format("while (blk != 0xffffffffu && ++guard < {:#x}u) {{", stage_limit));
+      line(std::format("if (guard == {:#x}u) {{ MemT(pc.mem).w[{}u] = {:#x}u; MemT(pc.mem).w[{}u] = blk; }}",
+                       stage_limit - 1, mem::kGuardWord, out_.tag, mem::kGuardBlockWord));
+    }
+    if (use_switch) line("switch (blk) {");
     bool open = false;
+    uint32_t current = 0;
+    // A transfer to block t from block `current`.
+    const auto go = [&](uint32_t t) {
+      if (use_switch) return std::format("blk = {}u; break;", t);
+      if (t <= current) return std::format("blk = {}u; continue;", t);
+      return std::format("blk = {}u;", t);
+    };
     for (uint32_t k = 0; k < insns.size(); ++k) {
       index_ = k;
       const rdna2::Instruction& insn = insns[k].insn;
       const std::string_view n = name_of(insn);
       if (block_at.count(insns[k].pc)) {
-        if (open) line(std::format("blk = {}u; break; }}", block_at[insns[k].pc]));
-        line(std::format("case {}u: {{  // +{:#x}", block_at[insns[k].pc], insns[k].pc));
+        const uint32_t b = block_at[insns[k].pc];
+        if (open) line(go(b) + " }");
+        current = b;
+        line(use_switch ? std::format("case {}u: {{  // +{:#x}", b, insns[k].pc)
+                        : std::format("if (blk == {}u) {{  // +{:#x}", b, insns[k].pc));
         open = true;
       }
       if (!open) continue;  // unreachable code after an unconditional transfer
@@ -371,15 +408,22 @@ class Translator {
         else if (n == "s_cbranch_execnz") cond = wave64_ ? "(exec_lo | exec_hi) != 0u" : "exec_lo != 0u";
         else return fail("");
         if (cond == "true") {
-          line(std::format("blk = {}u; break; }}", target));
+          line(go(target) + " }");
           open = false;
+        } else if (use_switch) {
+          line(std::format("if ({}) {{ {} }}", cond, go(target)));
         } else {
-          line(std::format("if ({}) {{ blk = {}u; break; }}", cond, target));
+          // The fall-through is the next block (a leader follows every branch).
+          uint32_t next_block = 0xffffffffu;
+          if (k + 1 < insns.size()) block_of(insns[k + 1].pc, next_block);
+          line(std::format("if ({}) {{ {} }} else {{ {} }} }}", cond, go(target),
+                           next_block == 0xffffffffu ? "blk = 0xffffffffu;" : go(next_block)));
+          open = false;
         }
         continue;
       }
       if (n == "s_endpgm") {
-        line("blk = 0xffffffffu; break; }");
+        line(std::format("blk = 0xffffffffu;{} }}", stop));
         open = false;
         continue;
       }
@@ -389,10 +433,25 @@ class Translator {
       }
       if (!emit_vector_wave(insn)) return false;
     }
-    if (open) line("blk = 0xffffffffu; break; }");
-    line("default: blk = 0xffffffffu; break;");
-    line("}");
-    line("}");
+    if (open) line(std::format("blk = 0xffffffffu;{} }}", stop));
+    if (use_switch) {
+      line("default: blk = 0xffffffffu; break;");
+      line("}");
+    } else if (looped) {
+      line("blk = 0xffffffffu;");  // past the last block
+    }
+    if (looped) line("}");
+    static const bool stats = std::getenv("XBEM_PS_STATS") != nullptr;
+    if (stats && out_.stage != ShaderStage::Compute) {
+      // Reduced per subgroup first: one atomic per wave, not per pixel.
+      const char* helper = out_.stage == ShaderStage::Pixel ? "gl_HelperInvocation" : "false";
+      line(std::format("{{ bool sth = {0}; uint stg = sth ? 0u : guard; uint stm = subgroupMax(stg), sts = subgroupAdd(stg), "
+                       "stc = subgroupAdd(sth ? 0u : 1u);", helper));
+      line(std::format("  if (!sth && gl_SubgroupInvocationID == subgroupBallotFindLSB(subgroupBallot(!sth))) {{ MemT st = "
+                       "MemT(pc.mem); uint was = atomicMax(st.w[{}u], stm); atomicAdd(st.w[{}u], sts); atomicAdd(st.w[{}u], "
+                       "stc); if (stm > was) st.w[{}u] = {:#x}u; }} }}",
+                       mem::kStatWord, mem::kStatWord + 1, mem::kStatWord + 2, mem::kStatWord + 3, out_.tag));
+    }
     finish_wave();
     return true;
   }
@@ -1192,6 +1251,7 @@ class Translator {
                     "#extension GL_KHR_shader_subgroup_ballot : require\n"
                     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
                     "#extension GL_EXT_shader_image_load_formatted : enable\n";
+    if (std::getenv("XBEM_PS_STATS")) g += "#extension GL_KHR_shader_subgroup_arithmetic : require\n";
     const uint32_t threads = c.local_size[0] * c.local_size[1] * c.local_size[2];
     const bool graphics = out_.stage != ShaderStage::Compute;
     if (graphics)

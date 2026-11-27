@@ -52,7 +52,10 @@ constexpr uint32_t kDescMissedBits = 1u << 16;
 constexpr uint32_t kGuardWord = kDescMissedWord + kDescMissedBits / 32;
 // The block a loop guard stopped in (next to its tag).
 constexpr uint32_t kGuardBlockWord = kGuardWord + 1;
-constexpr uint32_t kTableWords = kGuardWord + 2;
+// XBEM_PS_STATS: graphics shaders add the blocks each (non-helper)
+// invocation ran: max, sum, count, tag of the max.
+constexpr uint32_t kStatWord = kGuardWord + 2;
+constexpr uint32_t kTableWords = kStatWord + 4;
 // Descriptor kinds in the table (as gpu::SlotKind's Texture / Image).
 constexpr uint32_t kDescTexture = 1, kDescImage = 2;
 

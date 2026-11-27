@@ -104,7 +104,9 @@ TEST(translate_compute_divergent_branch) {
   CHECK(has(t, "local_size_x = 64"));
   CHECK(has(t, "vcc_lo = subgroupBallot(cmpv).x;"));         // the compare becomes a lane mask
   CHECK(has(t, "exec_lo = (vcc_lo & exec_lo) & wave_lanes;")); // saveexec narrows exec
-  CHECK(has(t, "if (exec_lo == 0u) { blk = 2u; break; }"));   // execz skips the block
+  CHECK(has(t, "if (exec_lo == 0u) { blk = 2u; } else { blk = 1u; } }"));  // execz skips the block
+  CHECK(has(t, "if (blk == 2u) {"));                          // blocks in program order, no loop
+  CHECK(!has(t, "while (blk"));
   CHECK(has(t, "if (lane_on()) {"));                          // vector work only in active lanes
   CHECK(has(t, "s0 = gl_WorkGroupID.x;"));                    // no user data: the group id is s0 (then the saved exec)
   CHECK(has(t, "{ uint r = exec_lo | s0; scc = r != 0u; exec_lo = r; }"));  // exec restored after the block
@@ -152,5 +154,6 @@ TEST(translate_pixel_loop_falls_back_to_wave_mode) {
   const TranslatedShader t = translate({0xbf82ffff, kEndpgm}, ShaderStage::Pixel);
   CHECK(t.ok);
   CHECK(t.wave);
-  CHECK(has(t, "switch (blk)"));
+  CHECK(has(t, "while (blk != 0xffffffffu"));  // a backward branch: the blocks run in a loop
+  CHECK(has(t, "blk = 0u; continue;"));
 }

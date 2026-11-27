@@ -460,14 +460,25 @@ class Renderer {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     if (r != VK_SUCCESS || ms > 250) {
       static int logged = 0;
-      if (logged++ < 20) {
+      if (logged++ < 80) {
         std::string list;
         for (uint64_t h : submitted_cs_) list += std::format(" {:016x}", h);
         std::string ps;
         for (const auto& [h, wave] : submitted_ps_) ps += std::format(" {:016x}{}", h, wave ? "(wave)" : "");
-        XBEM_WARN("gpu", "submission {} after {} ms ({} draws, {} dispatches); compute shaders:{}; pixel shaders:{}",
+        uint32_t st[4];
+        memory_.take_block_stats(st);
+        uint64_t st_hash = 0;
+        if (st[3]) {
+          std::lock_guard lock(tags_mutex_);
+          if (auto it = shader_tags_.find(st[3]); it != shader_tags_.end()) st_hash = it->second;
+        }
+        XBEM_WARN("gpu", "submission {} after {} ms ({} draws, {} dispatches); compute shaders:{}; pixel shaders:{}; "
+                  "last draw: {}{}",
                   r == VK_SUCCESS ? "done" : std::format("FAILED ({})", static_cast<int>(r)), ms, submitted_draws_,
-                  submitted_dispatches_, list.empty() ? " none" : list, ps.empty() ? " none" : ps);
+                  submitted_dispatches_, list.empty() ? " none" : list, ps.empty() ? " none" : ps, last_draw_,
+                  st[2] ? std::format("; blocks per invocation: max {} ({:016x}), mean {:.1f} over {}", st[0], st_hash,
+                                      double(st[1]) / st[2], st[2])
+                        : std::string());
       }
     }
     // A compute shader ended by its loop guard (a loop that would not end).
@@ -488,6 +499,7 @@ class Renderer {
     submitted_cs_.clear();
     submitted_ps_.clear();
     submitted_draws_ = submitted_dispatches_ = 0;
+    wave_draws_ = 0;
     gpu_output_.clear();
     // Every ~10 s: how much of the time went into waiting for the GPU.
     gpu_wait_us_ += static_cast<uint64_t>(
@@ -1882,25 +1894,43 @@ class Renderer {
         return;
       }
     }
-    begin_rendering();
-    f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set_, 0, nullptr);
-    f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8, &data[0]);
-    f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 8, 8, &data[1]);
-    const VkDeviceAddress table = memory_.table_address();
-    f.vkCmdPushConstants(cmd_, layout_, kGraphicsStages, 16, 8, &table);
     VkViewport vp = state_.viewport;
     if (vp.width <= 0 || vp.height <= 0)
       vp = {0, 0, static_cast<float>(frame->image.width), static_cast<float>(frame->image.height), 0, 1};
-    f.vkCmdSetViewport(cmd_, 0, 1, &vp);
     VkRect2D sc = state_.has_scissor ? state_.scissor
                                      : VkRect2D{{0, 0}, {frame->image.width, frame->image.height}};
-    f.vkCmdSetScissor(cmd_, 0, 1, &sc);
-    if (indexed) {
-      f.vkCmdBindIndexBuffer(cmd_, ring_.buffer, index_at, index_type);
-      f.vkCmdDrawIndexed(cmd_, count, std::max(instances, 1u), 0, 0, start_instance);
-    } else {
-      f.vkCmdDraw(cmd_, count, std::max(instances, 1u), 0, start_instance);
+    const VkDeviceAddress table = memory_.table_address();
+    // Wave-mode shaders are slow: an instanced draw of them (GTA VI's light
+    // volumes: 459 instances over 2560x1440, 34 million pixels) can take
+    // longer than Windows' 2 s GPU timeout alone. Such draws run in parts
+    // of a few instances, each part its own submission.
+    const uint32_t total = std::max(instances, 1u);
+    const bool slow = (ps && ps->shader.wave) || vs->shader.wave;
+    const uint32_t part = slow ? wave_instances_per_submit() : total;
+    for (uint32_t first = 0; first < total; first += part) {
+      if (first) {
+        // The draw's data (push constants, indices) stays in the ring.
+        const VkDeviceSize keep = ring_offset_;
+        end_rendering();
+        submit();
+        begin();
+        ring_offset_ = keep;
+      }
+      const uint32_t n = std::min(part, total - first);
+      begin_rendering();
+      f.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+      f.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set_, 0, nullptr);
+      f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8, &data[0]);
+      f.vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 8, 8, &data[1]);
+      f.vkCmdPushConstants(cmd_, layout_, kGraphicsStages, 16, 8, &table);
+      f.vkCmdSetViewport(cmd_, 0, 1, &vp);
+      f.vkCmdSetScissor(cmd_, 0, 1, &sc);
+      if (indexed) {
+        f.vkCmdBindIndexBuffer(cmd_, ring_.buffer, index_at, index_type);
+        f.vkCmdDrawIndexed(cmd_, count, n, 0, 0, start_instance + first);
+      } else {
+        f.vkCmdDraw(cmd_, count, n, 0, start_instance + first);
+      }
     }
     frame->rendered = true;
     frame->last_render = ++render_serial_;
@@ -1911,11 +1941,40 @@ class Renderer {
       }
     ++draws_;
     ++submitted_draws_;
+    last_draw_ = std::format("vs {:016x}{} ps {:016x}, {} {} x {} instances, viewport {}x{}, target {}x{}", p->vs_hash,
+                             vs->shader.wave ? "(wave)" : "", p->ps_hash, count, indexed ? "indices" : "vertices",
+                             std::max(instances, 1u), vp.width, vp.height, frame->image.width, frame->image.height);
     if (ps && submitted_ps_.size() < 32) submitted_ps_[p->ps_hash] = ps->shader.wave;
     if (is_display_target()) {
       display_ = state_.target;
       display_format_ = 28;
     }
+    // Wave-mode pixel shaders can run for tens of milliseconds per draw:
+    // dozens of them in one submission pass Windows' 2 s GPU timeout and
+    // the device is removed. Run what is recorded every few such draws.
+    if (ps && ps->shader.wave && ++wave_draws_ >= wave_draws_per_submit()) {
+      end_rendering();
+      submit();
+      begin();
+    }
+  }
+
+  static uint32_t wave_instances_per_submit() {
+    static const uint32_t n = [] {
+      const char* v = std::getenv("XBEM_WAVE_INSTANCES_PER_SUBMIT");
+      const uint32_t x = v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 32u;
+      return x ? x : 1u;
+    }();
+    return n;
+  }
+
+  static uint32_t wave_draws_per_submit() {
+    static const uint32_t n = [] {
+      const char* v = std::getenv("XBEM_WAVE_DRAWS_PER_SUBMIT");
+      const uint32_t x = v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 2u;
+      return x ? x : 1u;
+    }();
+    return n;
   }
 
   // ---------------------------------------------------------- compute
@@ -2108,7 +2167,8 @@ class Renderer {
   // What the command buffer being recorded runs (for slow / failed submissions).
   std::set<uint64_t> submitted_cs_;
   std::map<uint64_t, bool> submitted_ps_;  // pixel shaders of the submission's draws (wave mode or not)
-  uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0;
+  uint32_t submitted_draws_ = 0, submitted_dispatches_ = 0, wave_draws_ = 0;
+  std::string last_draw_;
   uint64_t gpu_wait_us_ = 0, gpu_submissions_ = 0;
   std::mutex tags_mutex_;
   std::map<uint32_t, uint64_t> shader_tags_;  // translated code tag -> compute shader hash

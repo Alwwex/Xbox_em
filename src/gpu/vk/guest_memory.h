@@ -71,6 +71,13 @@ class GuestMemory {
     return tag;
   }
 
+  // XBEM_PS_STATS counters (max, sum, count of blocks, tag of the max); cleared.
+  void take_block_stats(uint32_t out[4]) {
+    for (int i = 0; i < 4; ++i) out[i] = 0;
+    if (!table_.mapped) return;
+    for (int i = 0; i < 4; ++i) out[i] = words()[gpu::mem::kStatWord + i], words()[gpu::mem::kStatWord + i] = 0;
+  }
+
  private:
   struct Page {
     uint64_t id = 0;  // platform::pages id; 0 = free

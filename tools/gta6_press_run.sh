@@ -40,7 +40,7 @@ print(bright * 1000 * 7 // max(1, n))' "$1" 2>/dev/null || echo 1000
 }
 for try in $(seq 1 "${XBEM_RUN_TRIES:-3}"); do
   rm -f "$CHECK"
-  timeout -s INT "$SECONDS_TOTAL" ./build/bin/xbem run "$GAME" --continue-after-breakpoint --press "$P" \
+  timeout -s INT -k 30 "$SECONDS_TOTAL" ./build/bin/xbem run "$GAME" --continue-after-breakpoint --press "$P" \
     --skip-fault 0x23cf683:11 --skip-fault 0x2215c35:11 --screenshot "$CHECK@215" "$@" > "$LOG" 2>&1 &
   RUN=$!
   sleep 2
