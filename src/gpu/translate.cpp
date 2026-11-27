@@ -1249,6 +1249,29 @@ class Translator {
            "  bool ints = kind == 2u || kind == 3u;\n"
            "  uvec4 r = uvec4(0u, 0u, 0u, ints ? 1u : 0x3f800000u);\n"
            "  if (!inb) return r;\n"
+           // Packed: 2_10_10_10 (R10G10B10A2: unorm 50, snorm 51, uint 54,
+           // sint 55) and 10_11_11_FLOAT (36: R11G11B10F).
+           "  if (f == 50u || f == 51u || f == 54u || f == 55u) {\n"
+           "    uint w = ld32(a);\n"
+           "    uvec4 c = uvec4(w & 1023u, (w >> 10) & 1023u, (w >> 20) & 1023u, w >> 30);\n"
+           "    if (f == 54u) return c;\n"
+           "    if (f == 55u) return uvec4(ivec4(bitfieldExtract(int(w), 0, 10), bitfieldExtract(int(w), 10, 10), bitfieldExtract(int(w), 20, 10), int(w) >> 30));\n"
+           "    if (f == 50u) return floatBitsToUint(vec4(c) / vec4(1023.0, 1023.0, 1023.0, 3.0));\n"
+           "    ivec4 sv = ivec4(bitfieldExtract(int(w), 0, 10), bitfieldExtract(int(w), 10, 10), bitfieldExtract(int(w), 20, 10), int(w) >> 30);\n"
+           "    return floatBitsToUint(max(vec4(sv) / vec4(511.0, 511.0, 511.0, 1.0), vec4(-1.0)));\n"
+           "  }\n"
+           "  if (f == 36u) {\n"
+           "    uint w = ld32(a);\n"
+           "    uint e[3] = uint[3]((w >> 6) & 31u, (w >> 17) & 31u, (w >> 27) & 31u);\n"
+           "    uint m[3] = uint[3](w & 63u, (w >> 11) & 63u, (w >> 22) & 31u);\n"
+           "    uint bits_m[3] = uint[3](6u, 6u, 5u);\n"
+           "    for (int i = 0; i < 3; ++i) {\n"
+           "      float v = e[i] == 0u ? float(m[i]) / float(1u << bits_m[i]) * exp2(-14.0)\n"
+           "              : (1.0 + float(m[i]) / float(1u << bits_m[i])) * exp2(float(e[i]) - 15.0);\n"
+           "      r[i] = floatBitsToUint(v);\n"
+           "    }\n"
+           "    return r;\n"
+           "  }\n"
            "  for (uint i = 0u; i < n; ++i) {\n"
            "    uint raw;\n"
            "    if (bits == 32u) raw = ld32(a + uint64_t(i * 4u));\n"
@@ -2206,7 +2229,8 @@ class Translator {
       if (f.id == format) fmt = &f;
     static const std::set<uint32_t> kFetchFormats = {1,  2,  5,  6,  7,  8,  11, 12, 13, 14, 15, 18, 19,
                                                      20, 21, 22, 23, 24, 27, 28, 29, 56, 57, 60, 61, 62,
-                                                     63, 64, 65, 66, 69, 70, 71, 72, 73, 74, 75, 76, 77};
+                                                     63, 64, 65, 66, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+                                                     36, 50, 51, 54, 55};
     if (wave_ && kFetchFormats.count(format)) {
       // Every gfx10 format through the typed-load helper.
       std::string d3, addr, bound;
