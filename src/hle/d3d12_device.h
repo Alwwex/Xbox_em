@@ -62,5 +62,7 @@ std::string d3d12_wait_report();
 // DirectStorage queues with work not run yet and incomplete status entries
 // (hle/dstorage.cpp) - empty when none.
 std::string dstorage_report();
+// Bytes the title read with ReadFile (for the status line).
+void count_readfile_bytes(uint64_t n);
 
 }  // namespace xbem::hle

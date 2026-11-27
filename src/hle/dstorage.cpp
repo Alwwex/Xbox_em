@@ -236,6 +236,9 @@ std::mutex g_chunk_mutex;
 std::map<const FileState*, ChunkTable> g_tables;
 std::vector<DecodedChunk> g_chunks;  // most recent last
 std::atomic<uint64_t> g_shifted_ok{0}, g_shifted_failed{0};
+// For the status line: bytes read by the title (ReadFile), by requests, and by
+// chunk decodes for pieces inside chunks.
+std::atomic<uint64_t> g_readfile_bytes{0}, g_request_bytes{0}, g_decode_bytes{0}, g_decodes{0};
 
 const ChunkTable& chunk_table(FileState* file) {
   ChunkTable& t = g_tables[file];
@@ -255,6 +258,8 @@ const DecodedChunk* decoded_chunk(FileState* file, uint64_t start, uint64_t comp
     if (c.file == file && c.start == start) return &c;
   std::vector<uint8_t> in(compressed);
   if (!file->read(start, in.data(), in.size())) return nullptr;
+  ++g_decodes;
+  g_decode_bytes += compressed;
   DecodedChunk c{file, start, std::vector<uint8_t>(expected)};
   size_t produced = 0;
   const InflateResult r = inflate_auto(in.data(), in.size(), c.data.data(), c.data.size(), produced);
@@ -427,6 +432,7 @@ HRESULT execute_request(QueueState* q, const uint8_t* request, uint64_t caller) 
               dest_size);
   if (!dest || !source_size || source_size > (256u << 20) || skip + dest_size > (1ull << 30)) return E_INVALIDARG;
 
+  g_request_bytes += source_size;
   std::vector<uint8_t> buffer(source_size);
   // (A piece inside a compressed chunk is taken from the decoded chunk; its
   // "source" may even lie past the end of the file.)
@@ -886,8 +892,12 @@ HRESULT XBEM_GUEST_ABI hle_DStorageGetFactory(const void*, void** out) {
 
 }  // namespace
 
+void count_readfile_bytes(uint64_t n) { g_readfile_bytes += n; }
+
 std::string dstorage_report() {
-  std::string out;
+  std::string out = std::format("read so far: ReadFile {} MiB, requests {} MiB, {} chunks decoded for pieces ({} MiB)",
+                                g_readfile_bytes.load() >> 20, g_request_bytes.load() >> 20, g_decodes.load(),
+                                g_decode_bytes.load() >> 20);
   std::lock_guard lock(g_queues_mutex);
   for (size_t i = 0; i < g_queues.size(); ++i) {
     QueueState* q = g_queues[i];

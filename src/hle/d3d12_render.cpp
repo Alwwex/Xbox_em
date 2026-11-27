@@ -160,7 +160,8 @@ CompilePool& compile_pool() {
 
 struct PipelineKey {
   uint64_t vs, ps, blend;
-  uint32_t format, rect;
+  uint64_t format;  // the bound targets' formats (8 bits each), slot 0 lowest
+  uint32_t rect;
   bool operator<(const PipelineKey& o) const {
     return std::tie(vs, ps, blend, format, rect) < std::tie(o.vs, o.ps, o.blend, o.format, o.rect);
   }
@@ -891,12 +892,33 @@ class Renderer {
   }
 
   // mode: 0 triangle list, 1 RECTLIST (geometry shader), 2 triangle strip.
-  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry& ps, VkFormat format, uint32_t mode) {
+  VkPipeline pipeline(const GraphicsPipeline& p, ShaderEntry& vs, ShaderEntry& ps, uint32_t mode) {
     const bool rect = mode == 1;
-    // Blend: the variant's D3D12_BLEND_DESC (render target 0 at dword 3), else alpha blending.
-    uint32_t blend[10] = {1, 0, 5, 6, 1, 2, 6, 1, 4, 0xf};
-    if (p.blend_override) std::memcpy(blend, p.blend + 12, sizeof blend);
-    const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof blend), static_cast<uint32_t>(format), mode};
+    // Attachment formats: the bound targets'.
+    const uint32_t slots = bound_slots();
+    VkFormat formats[8]{};
+    uint64_t format_key = slots;
+    for (uint32_t i = 0; i < slots; ++i) {
+      GpuImage* g = slots == 1 ? state_.target : state_.targets[i];
+      formats[i] = g ? g->image.format : VK_FORMAT_UNDEFINED;
+      format_key = format_key * 1000003u + static_cast<uint64_t>(formats[i]);
+    }
+    // Blend: the variant's D3D12_BLEND_DESC (render target 0 at dword 3, its
+    // IndependentBlendEnable at dword 2), else alpha blending.
+    uint32_t blend[8][10];
+    for (auto& b : blend) {
+      const uint32_t dflt[10] = {1, 0, 5, 6, 1, 2, 6, 1, 4, 0xf};
+      std::memcpy(b, dflt, sizeof dflt);
+    }
+    if (p.blend_override) {
+      uint32_t independent = 0;
+      std::memcpy(&independent, p.blend + 8, 4);
+      for (uint32_t i = 0; i < 8; ++i) std::memcpy(blend[i], p.blend + 12 + 40 * (independent ? i : 0), 40);
+    }
+    // Targets the pixel shader does not export are left alone.
+    for (uint32_t i = 0; i < slots; ++i)
+      if (!(ps.shader.color_targets & (1u << i)) && slots > 1) blend[i][9] = 0;
+    const PipelineKey key{p.vs_hash, p.ps_hash, fnv1a(blend, sizeof(uint32_t) * 10 * slots), format_key, mode};
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
     VkPipelineShaderStageCreateInfo stages[3]{};
     uint32_t count = 0;
@@ -934,25 +956,27 @@ class Renderer {
                                      VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX};
     const auto factor = [&](uint32_t v) { return v < 20 ? kFactors[v] : VK_BLEND_FACTOR_ONE; };
     const auto op = [&](uint32_t v) { return v < 6 ? kOps[v] : VK_BLEND_OP_ADD; };
-    VkPipelineColorBlendAttachmentState att{};
-    att.blendEnable = blend[0] ? VK_TRUE : VK_FALSE;
-    att.srcColorBlendFactor = factor(blend[2]);
-    att.dstColorBlendFactor = factor(blend[3]);
-    att.colorBlendOp = op(blend[4]);
-    att.srcAlphaBlendFactor = factor(blend[5]);
-    att.dstAlphaBlendFactor = factor(blend[6]);
-    att.alphaBlendOp = op(blend[7]);
-    att.colorWriteMask = blend[9] & 0xf;
+    VkPipelineColorBlendAttachmentState att[8]{};
+    for (uint32_t i = 0; i < slots; ++i) {
+      att[i].blendEnable = blend[i][0] ? VK_TRUE : VK_FALSE;
+      att[i].srcColorBlendFactor = factor(blend[i][2]);
+      att[i].dstColorBlendFactor = factor(blend[i][3]);
+      att[i].colorBlendOp = op(blend[i][4]);
+      att[i].srcAlphaBlendFactor = factor(blend[i][5]);
+      att[i].dstAlphaBlendFactor = factor(blend[i][6]);
+      att[i].alphaBlendOp = op(blend[i][7]);
+      att[i].colorWriteMask = formats[i] == VK_FORMAT_UNDEFINED ? 0 : blend[i][9] & 0xf;
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1;
-    cb.pAttachments = &att;
+    cb.attachmentCount = slots;
+    cb.pAttachments = att;
     const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = 2;
     dy.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfoKHR ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachmentFormats = &format;
+    ri.colorAttachmentCount = slots;
+    ri.pColorAttachmentFormats = formats;
     VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gci.pNext = &ri;
     gci.stageCount = count;
@@ -992,7 +1016,9 @@ class Renderer {
     VkViewport viewport{};
     VkRect2D scissor{};
     bool has_scissor = false;
-    GpuImage* target = nullptr;
+    GpuImage* target = nullptr;      // the first bound render target
+    GpuImage* targets[8] = {};       // OMSetRenderTargets' slots
+    uint32_t target_count = 0;
     std::vector<uint8_t> vertex_buffers;  // D3D12_VERTEX_BUFFER_VIEW x n
     uint8_t index_buffer[16] = {};
     uint64_t heaps[2] = {};  // resource heap, sampler heap starts
@@ -1114,7 +1140,20 @@ class Renderer {
       }
       case 50: {
         end_rendering();
-        state_.target = c.blob.size() >= kDescriptorSize && u32(0) ? image_from_descriptor(c.blob.data(), true) : nullptr;
+        // Render target descriptors (one per slot), then the DSV's.
+        state_.target = nullptr;
+        state_.target_count = std::min<uint32_t>(u32(0), 8);
+        for (uint32_t i = 0; i < 8; ++i) {
+          GpuImage* g = i < state_.target_count && c.blob.size() >= (i + 1) * kDescriptorSize
+                            ? image_from_descriptor(c.blob.data() + i * kDescriptorSize, true)
+                            : nullptr;
+          // (Every bound target has the first one's size, as dynamic rendering needs.)
+          if (g && state_.target && (g->image.width != state_.target->image.width ||
+                                     g->image.height != state_.target->image.height || !g->image.view))
+            g = nullptr;
+          state_.targets[i] = g;
+          if (g && !state_.target) state_.target = g;
+        }
         break;
       }
       case 52: {
@@ -1314,21 +1353,27 @@ class Renderer {
   }
 
   void begin_rendering() {
-    if (rendering_ && current_target_ == state_.target) return;
+    const uint32_t n = bound_slots();
+    if (rendering_ && current_count_ == n && std::equal(state_.targets, state_.targets + n, current_targets_)) return;
     end_rendering();
-    VkRenderingAttachmentInfoKHR color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-    color.imageView = state_.target->image.view;
-    color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfoKHR color[8]{};
+    for (uint32_t i = 0; i < n; ++i) {
+      color[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+      GpuImage* g = n == 1 ? state_.target : state_.targets[i];
+      color[i].imageView = g ? g->image.view : VK_NULL_HANDLE;
+      color[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      current_targets_[i] = state_.targets[i];
+    }
     VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
     ri.renderArea = {{0, 0}, {state_.target->image.width, state_.target->image.height}};
     ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &color;
+    ri.colorAttachmentCount = n;
+    ri.pColorAttachments = color;
     core_.fn().vkCmdBeginRendering(cmd_, &ri);
     rendering_ = true;
-    current_target_ = state_.target;
+    current_count_ = n;
   }
 
   // The DXIL clear pipeline (device slot 86): the colour is the float4 its
@@ -1380,7 +1425,7 @@ class Renderer {
       note(std::format("topology {:#x} not supported - draws skipped", state_.topology));
       return skip(std::format("topology {:#x}", state_.topology));
     }
-    VkPipeline pipe = pipeline(*p, *vs, *ps, state_.target->image.format, rect ? 1 : strip ? 2 : 0);
+    VkPipeline pipe = pipeline(*p, *vs, *ps, rect ? 1 : strip ? 2 : 0);
     if (!pipe) return skip("pipeline creation failed");
     // Vertex buffer table: one V# per view (base, stride, records).
     std::vector<uint8_t> vb_table(std::max<size_t>(state_.vertex_buffers.size(), 16));
@@ -1498,6 +1543,11 @@ class Renderer {
     }
     state_.target->rendered = true;
     state_.target->last_render = ++render_serial_;
+    for (uint32_t i = 0; i < 8; ++i)
+      if (state_.targets[i] && (ps->shader.color_targets & (1u << i))) {
+        state_.targets[i]->rendered = true;
+        state_.targets[i]->last_render = render_serial_;
+      }
     ++draws_;
     ++submitted_draws_;
     if (is_display_target()) {
@@ -1709,7 +1759,17 @@ class Renderer {
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
   bool recording_ = false, rendering_ = false;
-  GpuImage* current_target_ = nullptr;
+  GpuImage* current_targets_[8] = {};
+  uint32_t current_count_ = 0;
+
+  // Attachment slots of the current pass: up to the last bound target (one
+  // when only slot 0 - or a target set by a clear - is bound).
+  uint32_t bound_slots() const {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < state_.target_count && i < 8; ++i)
+      if (state_.targets[i]) n = i + 1;
+    return std::max<uint32_t>(n, 1);
+  }
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE, compute_layout_ = VK_NULL_HANDLE;
   Image scratch_storage_, scratch_storage_volume_;

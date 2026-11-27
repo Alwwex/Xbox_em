@@ -12,6 +12,7 @@
 #include <optional>
 #include <vector>
 
+#include "hle/d3d12_device.h"
 #include "hle/discovery.h"
 #include "hle/file_log.h"
 #include "hle/heap.h"
@@ -281,6 +282,7 @@ BOOL XBEM_GUEST_ABI hle_ReadFile(HANDLE h, void* buffer, DWORD count, DWORD* rea
     }
   }
   if (ov) complete_overlapped(ov, got);
+  count_readfile_bytes(got);
   // A synchronous handle keeps its file pointer after the bytes read, also
   // when the read gave an offset in an OVERLAPPED (Windows semantics).
   if (!f->overlapped) f->position = offset + got;

@@ -1,6 +1,7 @@
 #include "platform/file_cache.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +84,7 @@ int64_t raw_read_uncounted(int fd, uint64_t offset, void* out, size_t n) {
   size_t done = 0;
   while (done < n) {
     const ssize_t r = ::pread(fd, static_cast<uint8_t*>(out) + done, n - done, static_cast<off_t>(offset + done));
+    if (r < 0 && errno == EINTR) continue;  // a signal (thread dumps, faults skipped) - not the end of the data
     if (r < 0) return done ? static_cast<int64_t>(done) : -1;
     if (r == 0) break;
     done += static_cast<size_t>(r);

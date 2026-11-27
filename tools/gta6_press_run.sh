@@ -2,8 +2,10 @@
 # One GTA VI run with the press script that reaches the story load (see
 # docs/HANDOFF.md "How far the title gets"). Usage:
 #   tools/gta6_press_run.sh LOG [SECONDS] [extra xbem run options...]
-# Writes the log to LOG; at 300 s and 330 s a guest thread dump (SIGQUIT)
-# lands in the log. Logs belong in ~/xbem-runs, never in the repository.
+# Writes the log to LOG. XBEM_RUN_DUMPS="300 330" puts guest thread dumps
+# (SIGQUIT) into the log at those seconds - off by default: in runs 187/188
+# the title's main loop stopped right after the dump at 330 s. Logs belong
+# in ~/xbem-runs, never in the repository.
 set -u
 cd "$(dirname "$0")/.."
 LOG=$1; SECONDS_TOTAL=${2:-430}; shift; shift || true
@@ -19,7 +21,7 @@ timeout -s INT "$SECONDS_TOTAL" ./build/bin/xbem run "$GAME" --continue-after-br
 RUN=$!
 sleep 2
 PID=$(pgrep -f "^./build/bin/xbem run" | head -1)
-for t in 300 330; do
+for t in ${XBEM_RUN_DUMPS:-}; do
   until grep -q "running for $t s" "$LOG" 2>/dev/null; do sleep 2; kill -0 "$PID" 2>/dev/null || break 2; done
   kill -QUIT "$PID" 2>/dev/null
 done
