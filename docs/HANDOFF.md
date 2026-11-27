@@ -173,6 +173,15 @@ both watchdog skip-faults). Fixed:
 - Decoded-chunk cache: LRU, 128 MiB (16 entries thrashed: 2.5 GB re-read).
 - Crash reports name the DirectStorage request that last wrote a physical
   page (file offset, virtual offset, how).
+- Depth buffers + blend from the console registers (gfx state a: CB_BLEND0-7
+  then CB_TARGET_MASK 0xffffffff, DB_DEPTH_CONTROL 6 dwords before);
+  ClearDepthStencilView's depth (xmm3) recorded by its own thunk.
+- Buffer SRV/UAV views are written as V# (the XBDS encoding was read by
+  console shaders as an address: 1a3bfbc46d1a6fbe looped forever, 1.3 s per
+  submission). Since then no loop-guard hits in the scene (run 204).
+- Run 204 at 450 s: GREEN screen with letterbox bars = a Bink cutscene with
+  empty (zero) YUV frames - the owner's "green screen". movies.rpf is opened
+  through DirectStorage but no reads of it appear; next: --log-reads movies.
 Open findings:
 - Requests past the end of a file / inside other chunks: mostly explained
   by the read layer's source = chunk offset + virtual distance (larger than
