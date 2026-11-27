@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace xbem::gpu {
@@ -55,5 +56,11 @@ struct D3d12Counters {
   uint64_t frames, command_lists, draws, dispatches;
 };
 D3d12Counters d3d12_counters();
+// Fences someone waits on (SetEventOnCompletion) whose value is not reached
+// yet: "name at value waited for N (k waiters); ..." - empty when none.
+std::string d3d12_wait_report();
+// DirectStorage queues with work not run yet and incomplete status entries
+// (hle/dstorage.cpp) - empty when none.
+std::string dstorage_report();
 
 }  // namespace xbem::hle

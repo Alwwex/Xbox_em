@@ -149,7 +149,11 @@ struct FenceState {
   std::mutex mutex;
   uint64_t value = 0;
   std::vector<std::pair<uint64_t, HANDLE>> waiters;
+  std::string name;
 };
+// Every fence, for the status report of waits that have not been reached.
+std::mutex g_fences_mutex;
+std::vector<FenceState*> g_fences;
 
 void fence_signal(FenceState* f, uint64_t value) {
   std::vector<HANDLE> fire;
@@ -209,6 +213,11 @@ const ProbeVtable g_fence_vtable = make_vtable({{8, fn(&fence_get_completed_valu
 void* new_fence(const std::string& name, uint64_t initial) {
   auto* state = new FenceState;
   state->value = initial;
+  state->name = name;
+  {
+    std::lock_guard lock(g_fences_mutex);
+    g_fences.push_back(state);
+  }
   return make_probe_object(name, &g_fence_vtable, state);
 }
 
@@ -1825,6 +1834,20 @@ const gpu::RootSignature* root_signature_of(uint64_t p) {
   return o->vtable == g_root_signature_vtable.data() ? &static_cast<RootSignatureState*>(o->state)->rs : nullptr;
 }
 }  // namespace d3d12
+
+std::string d3d12_wait_report() {
+  std::string out;
+  std::lock_guard lock(g_fences_mutex);
+  for (FenceState* f : g_fences) {
+    std::lock_guard fl(f->mutex);
+    if (f->waiters.empty()) continue;
+    uint64_t lowest = UINT64_MAX;
+    for (const auto& [v, h] : f->waiters) lowest = std::min(lowest, v);
+    out += std::format("{}{} at {} waited for {} ({} waiters)", out.empty() ? "" : "; ", f->name, f->value, lowest,
+                       f->waiters.size());
+  }
+  return out;
+}
 
 D3d12Counters d3d12_counters() {
   return {g_frame_token.load() - 1, g_command_lists.load(), g_draws.load(), g_dispatches.load()};

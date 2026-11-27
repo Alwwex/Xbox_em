@@ -190,6 +190,11 @@ struct QueueState {
   bool worker_started = false;
 };
 
+// Every queue and status array, for the status report.
+std::mutex g_queues_mutex;
+std::vector<QueueState*> g_queues;
+std::vector<StatusState*> g_status_arrays;
+
 std::string hex_qwords(const uint64_t* q, int n) {
   std::string s;
   for (int i = 0; i < n; ++i) s += std::format(" {:016x}", q[i]);
@@ -813,6 +818,10 @@ HRESULT XBEM_GUEST_ABI factory_open_file(ProbeObject* self, const void* path, co
 HRESULT XBEM_GUEST_ABI factory_create_status_array(ProbeObject* self, uint32_t capacity, const char*, const void*,
                                                    void** out) {
   auto* state = new StatusState;
+  {
+    std::lock_guard lock(g_queues_mutex);
+    g_status_arrays.push_back(state);
+  }
   state->complete.assign(std::min<uint32_t>(capacity, 1 << 20), 0);
   state->result.assign(state->complete.size(), S_OK);
   probe_log(self, 5, std::format("CreateStatusArray({})", capacity), XBEM_RETURN_ADDRESS());
@@ -824,7 +833,12 @@ HRESULT XBEM_GUEST_ABI factory_create_queue(ProbeObject* self, const uint8_t* de
   uint64_t d[4] = {};
   if (desc) platform::safe_read(reinterpret_cast<uint64_t>(desc), d, sizeof d);
   probe_log(self, 10, std::format("CreateQueue(desc:{})", hex_qwords(d, 4)), XBEM_RETURN_ADDRESS());
-  return out_object(out, make_probe_object("dstorage.queue", &queue_vtable(), new QueueState));
+  auto* q = new QueueState;
+  {
+    std::lock_guard lock(g_queues_mutex);
+    g_queues.push_back(q);
+  }
+  return out_object(out, make_probe_object("dstorage.queue", &queue_vtable(), q));
 }
 
 const ProbeVtable& factory_vtable() {
@@ -841,6 +855,26 @@ HRESULT XBEM_GUEST_ABI hle_DStorageGetFactory(const void*, void** out) {
 }
 
 }  // namespace
+
+std::string dstorage_report() {
+  std::string out;
+  std::lock_guard lock(g_queues_mutex);
+  for (size_t i = 0; i < g_queues.size(); ++i) {
+    QueueState* q = g_queues[i];
+    std::lock_guard ql(q->mutex);
+    if (q->pending.empty() && q->ready.empty()) continue;
+    out += std::format("{}queue {}: {} waiting for Submit, {} not run yet", out.empty() ? "" : "; ", i,
+                       q->pending.size(), q->ready.size());
+  }
+  for (size_t i = 0; i < g_status_arrays.size(); ++i) {
+    StatusState* st = g_status_arrays[i];
+    std::lock_guard sl(st->mutex);
+    uint32_t open = 0;
+    for (uint8_t c : st->complete) open += c ? 0 : 1;
+    if (open) out += std::format("{}status array {}: {} of {} incomplete", out.empty() ? "" : "; ", i, open, st->complete.size());
+  }
+  return out;
+}
 
 ModuleDef make_dstorage_module() {
   ModuleDef m;

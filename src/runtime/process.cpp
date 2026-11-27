@@ -523,7 +523,8 @@ std::vector<std::string> window_status_lines() {
   platform::file_read_totals(read_requests, read_bytes);
   lines.push_back(std::format("frame events {}, command lists {}, draws {}, dispatches {}; file reads {} ({} MiB)",
                               c.frames, c.command_lists, c.draws, c.dispatches, read_requests, read_bytes >> 20));
-  lines.push_back("GPU: headless D3D12.X - there is no renderer yet, so nothing is drawn");
+  if (const std::string waits = hle::d3d12_wait_report(); !waits.empty()) lines.push_back("fence waits: " + waits);
+  if (const std::string ds = hle::dstorage_report(); !ds.empty()) lines.push_back("DirectStorage: " + ds);
   lines.push_back("log: the terminal or the file the output goes to; crash reports end the run");
   return lines;
 }
