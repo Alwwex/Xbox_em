@@ -1062,6 +1062,82 @@ class Renderer {
     if (notes_.insert(what).second && notes_.size() < 64) XBEM_WARN("gpu", "{}", what);
   }
 
+  // Copies between resources happen in guest memory (unified memory, as on
+  // the console): the renderer re-reads textures whose memory changed. The
+  // CPU does them when the command list runs, in order with the rest.
+  void copy_buffer_region(ResourceState* dst, uint64_t dst_offset, ResourceState* src, uint64_t src_offset,
+                          uint64_t bytes) {
+    if (!dst || !src || !dst->gpu_va || !src->gpu_va || !bytes || bytes > (256ull << 20)) return;
+    if (dst_offset + bytes > std::max<uint64_t>(dst->size, 1) || src_offset + bytes > std::max<uint64_t>(src->size, 1))
+      return;
+    std::vector<uint8_t> tmp(bytes);
+    if (platform::safe_read(src->gpu_va + src_offset, tmp.data(), bytes))
+      platform::safe_write(dst->gpu_va + dst_offset, tmp.data(), bytes);
+    ++copies_;
+  }
+
+  // CopyTextureRegion with the two D3D12_TEXTURE_COPY_LOCATIONs (pResource,
+  // Type 0 subresource index / 1 placed footprint {Offset u64, Format, Width,
+  // Height, Depth, RowPitch}) and the source box: buffer -> linear texture
+  // (uploads, e.g. video frames) and linear texture -> buffer (readbacks).
+  void copy_texture_region(const uint8_t* blob, uint32_t dst_x, uint32_t dst_y, uint32_t dst_z, bool has_box) {
+    struct Location {
+      uint64_t resource;
+      uint32_t type, pad;
+      uint64_t offset;  // footprint offset, or the subresource index (first 4 bytes)
+      uint32_t format, width, height, depth, row_pitch, pad2;
+    };
+    static_assert(sizeof(Location) == 48);
+    Location d{}, sl{};
+    std::memcpy(&d, blob, 40);
+    std::memcpy(&sl, blob + 40, 40);
+    uint32_t box[6] = {};
+    std::memcpy(box, blob + 80, 24);
+    ResourceState* dr = resource_of(d.resource);
+    ResourceState* sr = resource_of(sl.resource);
+    if (!dr || !sr || !dr->gpu_va || !sr->gpu_va) return;
+    // One side a texture subresource, the other a placed footprint.
+    const bool upload = d.type == 0 && sl.type == 1, readback = d.type == 1 && sl.type == 0;
+    if (!upload && !readback) return;
+    ResourceState* tex = upload ? dr : sr;
+    const Location& fp = upload ? sl : d;
+    const uint32_t sub = static_cast<uint32_t>(upload ? d.offset : sl.offset);
+    if (tex->swizzle != 0) {
+      note("CopyTextureRegion into a swizzled texture - not done");
+      return;
+    }
+    const TextureLayout l = linear_layout(tex->desc);
+    if (l.mip.empty() || !l.mips) return;
+    const uint32_t mip = sub % l.mips, slice = (sub / l.mips) % std::max<uint32_t>(l.slices, 1);
+    const MipLayout& m = l.mip[mip];
+    const uint32_t e = std::max<uint32_t>(l.element.bytes, 1), block = l.element.block ? 4 : 1;
+    // The region in elements: the box (source) or the whole footprint.
+    uint32_t x0 = 0, y0 = 0, w = fp.width, h = fp.height;
+    if (upload && has_box) {
+      x0 = box[0];
+      y0 = box[1];
+      w = box[3] - box[0];
+      h = box[4] - box[1];
+    }
+    const uint32_t tx = upload ? dst_x : (has_box ? box[0] : 0), ty = upload ? dst_y : (has_box ? box[1] : 0);
+    const uint32_t ew = (w + block - 1) / block, eh = (h + block - 1) / block;
+    const uint64_t row_bytes = uint64_t{ew} * e;
+    const uint64_t tex_base = tex->gpu_va + slice * l.slice_stride + m.offset + uint64_t{dst_z} * m.slice_2d;
+    if (row_bytes == 0 || row_bytes > fp.row_pitch || row_bytes > m.pitch_bytes) return;
+    std::vector<uint8_t> row(row_bytes);
+    for (uint32_t r = 0; r < eh && ty / block + r < m.height_elements; ++r) {
+      const uint64_t tex_at = tex_base + uint64_t{ty / block + r} * m.pitch_bytes + uint64_t{tx / block} * e;
+      const uint64_t buf_at = (upload ? sr : dr)->gpu_va + fp.offset + uint64_t{y0 / block + r} * fp.row_pitch +
+                              uint64_t{x0 / block} * e;
+      if (upload) {
+        if (platform::safe_read(buf_at, row.data(), row_bytes)) platform::safe_write(tex_at, row.data(), row_bytes);
+      } else if (platform::safe_read(tex_at, row.data(), row_bytes)) {
+        platform::safe_write(buf_at, row.data(), row_bytes);
+      }
+    }
+    ++copies_;
+  }
+
   static VkImageAspectFlags depth_aspects(VkFormat f) {
     return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT
                ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -1268,6 +1344,19 @@ class Renderer {
         VkImageSubresourceRange range{depth_aspects(d->image.format), 0, 1, 0, 1};
         core_.fn().vkCmdClearDepthStencilImage(cmd_, d->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
         full_barrier();
+        break;
+      }
+      case 15:  // CopyBufferRegion(dst, dst offset, src, src offset, bytes)
+        copy_buffer_region(resource_of(a[0]), a[1], resource_of(a[2]), a[3], a[4]);
+        break;
+      case 16:
+        if (c.blob.size() >= 104) copy_texture_region(c.blob.data(), u32(1), u32(2), u32(3), a[5] != 0);
+        break;
+      case 17: {  // CopyResource(dst, src): buffers and linear textures are plain memory
+        ResourceState* dst = resource_of(a[0]);
+        ResourceState* src = resource_of(a[1]);
+        if (dst && src && dst->size == src->size && dst->swizzle == src->swizzle)
+          copy_buffer_region(dst, 0, src, 0, dst->size);
         break;
       }
       case 12: draw(u32(0), u32(1), u32(2), u32(3), false, 0); break;
@@ -1901,6 +1990,7 @@ class Renderer {
   GpuImage* current_targets_[8] = {};
   uint32_t current_count_ = 0;
   GpuImage* current_depth_ = nullptr;
+  uint64_t copies_ = 0;
 
   // Attachment slots of the current pass: up to the last bound target (one
   // when only slot 0 - or a target set by a clear - is bound).

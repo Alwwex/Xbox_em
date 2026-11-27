@@ -698,6 +698,11 @@ void snapshot_command(RecordedCommand& c) {
     case 21: copy(a[1], std::min<uint32_t>(u32(0), 16) * 24); break;  // viewports
     case 22: copy(a[1], std::min<uint32_t>(u32(0), 16) * 16); break;  // scissor rects
     case 23: copy(a[0], 16); break;                                   // blend factor
+    case 16:  // CopyTextureRegion(dst location, x, y, z, src location, src box)
+      copy(a[0], 40);
+      copy(a[4], 40);
+      copy(a[5], 24);
+      break;
     case 39:
     case 40: copy(a[2], std::min<uint32_t>(u32(1), 64) * 4); break;    // root constants
     case 47: copy(a[0], 16); break;                                   // index buffer view
